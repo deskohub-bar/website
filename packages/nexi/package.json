@@ -1,0 +1,19 @@
+{
+  "name": "@deskohub/nexi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "generate": "mkdir -p ./src/generated && openapigen --spec ./openapi/nexi-api.yaml --name NexiClient --format httpclient > ./src/generated/effect.gen.ts",
+    "typecheck": "bun run generate && tsc --project tsconfig.json"
+  },
+  "dependencies": {
+    "effect": "4.0.0-beta.85"
+  },
+  "devDependencies": {
+    "typescript": "^5"
+  }
+}

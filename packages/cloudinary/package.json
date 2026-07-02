@@ -1,0 +1,19 @@
+{
+  "name": "@deskohub/cloudinary",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./server": "./src/server.ts",
+    "./cache-tags": "./src/cache-tags.ts",
+    "./errors": "./src/errors.ts",
+    "./expression": "./src/expression.ts",
+    "./schema": "./src/schema.ts"
+  },
+  "dependencies": {
+    "cloudinary": "^2.10.0",
+    "effect": "4.0.0-beta.85",
+    "server-only": "^0.0.1"
+  }
+}

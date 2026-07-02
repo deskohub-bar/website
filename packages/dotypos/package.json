@@ -1,0 +1,24 @@
+{
+  "name": "@deskohub/dotypos",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./table-map": "./src/table-map.tsx",
+    "./generated": "./src/generated/index.ts",
+    "./generated/*": "./src/generated/*.ts"
+  },
+  "scripts": {
+    "generate": "openapigen --spec ./openapi/dotypos-api.yaml --name DotyposClient --format httpclient > ./src/generated/effect.gen.ts"
+  },
+  "dependencies": {
+    "@types/react": "^19.1.0",
+    "effect": "4.0.0-beta.85",
+    "libphonenumber-js": "^1.12.10",
+    "react": "^19.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5"
+  }
+}
