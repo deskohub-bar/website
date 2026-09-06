@@ -1,0 +1,74 @@
+"use client";
+
+import type { StandardSchemaV1 } from "@standard-schema/spec";
+import {
+  type HookBaseOptions,
+  type SingleInputActionFn,
+  type UseActionHookReturn,
+  useAction,
+} from "next-safe-action/hooks";
+
+type WorkspaceActionTransportErrorInput<
+  Schema extends StandardSchemaV1 | undefined,
+> = Schema extends StandardSchemaV1
+  ? StandardSchemaV1.InferInput<Schema>
+  : undefined;
+
+type UseWorkspaceActionOptions<
+  ServerError,
+  Schema extends StandardSchemaV1 | undefined,
+  ShapedErrors,
+  Data,
+> = HookBaseOptions<ServerError, Schema, ShapedErrors, Data> & {
+  readonly actionName: string;
+  readonly onTransportError?: (args: {
+    readonly error: unknown;
+    readonly input: WorkspaceActionTransportErrorInput<Schema>;
+  }) => void;
+};
+
+export function useWorkspaceAction<
+  ServerError,
+  Schema extends StandardSchemaV1 | undefined,
+  ShapedErrors,
+  Data,
+>(
+  safeActionFn: SingleInputActionFn<ServerError, Schema, ShapedErrors, Data>,
+  opts: UseWorkspaceActionOptions<ServerError, Schema, ShapedErrors, Data>
+): UseActionHookReturn<ServerError, Schema, ShapedErrors, Data> {
+  const { actionName: _actionName, onTransportError, ...hookOptions } = opts;
+  const action = useAction(safeActionFn, hookOptions);
+
+  const handleTransportError = (
+    cause: unknown,
+    input: WorkspaceActionTransportErrorInput<Schema>
+  ) => {
+    try {
+      onTransportError?.({ error: cause, input });
+    } catch {}
+  };
+
+  const executeAsync = async (
+    input: Parameters<typeof action.executeAsync>[0]
+  ) => {
+    try {
+      return await action.executeAsync(input);
+    } catch (error) {
+      handleTransportError(
+        error,
+        input as WorkspaceActionTransportErrorInput<Schema>
+      );
+      throw error;
+    }
+  };
+
+  const execute = (input: Parameters<typeof action.execute>[0]) => {
+    void executeAsync(input).catch(() => undefined);
+  };
+
+  return {
+    ...action,
+    execute,
+    executeAsync,
+  };
+}

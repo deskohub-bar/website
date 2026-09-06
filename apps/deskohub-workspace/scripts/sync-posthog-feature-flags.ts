@@ -1,0 +1,58 @@
+import {
+  generatePostHogFeatureFlagContract,
+  PostHogFeatureFlagError,
+} from "@deskohub/posthog/feature-flags/codegen";
+import { PostHogProjectId } from "@deskohub/posthog/identifiers";
+import { Effect, Schema } from "effect";
+import { runStandaloneWorkspaceEffect } from "@/shared/backend/standalone-workspace-effect";
+
+const PostHogFeatureFlagGenerationEnv = Schema.Struct({
+  POSTHOG_API_KEY: Schema.NonEmptyString,
+  POSTHOG_API_HOST: Schema.URLFromString,
+  POSTHOG_PROJECT_ID: PostHogProjectId,
+});
+
+const loadPostHogFeatureFlagGenerationEnv = Schema.decodeUnknownEffect(
+  PostHogFeatureFlagGenerationEnv
+)({
+  POSTHOG_API_KEY: process.env.POSTHOG_API_KEY,
+  POSTHOG_API_HOST: process.env.POSTHOG_API_HOST,
+  POSTHOG_PROJECT_ID: process.env.POSTHOG_PROJECT_ID,
+}).pipe(
+  Effect.mapError(
+    (cause) =>
+      new PostHogFeatureFlagError({
+        message:
+          "Invalid Workspace PostHog feature flag generation environment.",
+        cause,
+      })
+  )
+);
+
+const syncPostHogFeatureFlags = Effect.Do.pipe(
+  Effect.bind("env", () => loadPostHogFeatureFlagGenerationEnv),
+  Effect.bind("result", ({ env }) =>
+    generatePostHogFeatureFlagContract({
+      apiKey: env.POSTHOG_API_KEY,
+      host: env.POSTHOG_API_HOST,
+      outputFile: new URL(
+        "../features/feature-flags/generated/contract.ts",
+        import.meta.url
+      ),
+      projectId: env.POSTHOG_PROJECT_ID,
+    })
+  ),
+  Effect.tap(({ result }) =>
+    Effect.logInfo("Workspace PostHog feature flags synchronized", {
+      flagCount: result.flagCount,
+      status: result.status,
+    })
+  ),
+  Effect.map(({ result }) => result)
+);
+
+if (import.meta.main) {
+  await syncPostHogFeatureFlags.pipe(
+    runStandaloneWorkspaceEffect("feature-flags.sync")
+  );
+}

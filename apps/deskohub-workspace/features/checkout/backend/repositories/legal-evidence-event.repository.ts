@@ -1,0 +1,116 @@
+import "server-only";
+
+import type { EffectDrizzleQueryError } from "drizzle-orm/effect-core";
+import { Context, Data, Effect, Layer, Schema } from "effect";
+import { WorkspaceDatabase } from "@/db/database.service";
+import { type LegalEvidenceEvent, legalEvidenceEvents } from "@/db/schema";
+import { postgresUuidV7 } from "@/db/uuid-v7";
+import { legalEvidenceSchema } from "@/features/checkout/legal-evidence";
+import { workspaceReservationIdSchema } from "@/features/reservation/persistence-contracts";
+
+const legalEvidenceEventInputSchema = Schema.Struct({
+  workspaceReservationId: Schema.optional(workspaceReservationIdSchema),
+  evidence: legalEvidenceSchema,
+});
+
+export class LegalEvidenceEventInputError extends Data.TaggedError(
+  "LegalEvidenceEventInputError"
+)<{
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
+
+export type LegalEvidenceEventInput =
+  typeof legalEvidenceEventInputSchema.Encoded;
+
+export interface ILegalEvidenceEventRepository {
+  readonly record: (
+    input: LegalEvidenceEventInput
+  ) => Effect.Effect<
+    LegalEvidenceEvent,
+    EffectDrizzleQueryError | LegalEvidenceEventInputError
+  >;
+  readonly recordMany: (
+    input: readonly LegalEvidenceEventInput[]
+  ) => Effect.Effect<
+    readonly LegalEvidenceEvent[],
+    EffectDrizzleQueryError | LegalEvidenceEventInputError
+  >;
+}
+
+const getLegalEvidenceEventRecord = (
+  parsed: typeof legalEvidenceEventInputSchema.Type
+) => ({
+  workspaceReservationId: parsed.workspaceReservationId,
+  documentKey: parsed.evidence.documentKey,
+  documentPath: parsed.evidence.document.path,
+  documentHash: parsed.evidence.documentHash,
+  hashAlgorithm: parsed.evidence.document.hashAlgorithm,
+  accepted: parsed.evidence.accepted,
+  acceptedAt: Temporal.Instant.from(parsed.evidence.acceptedAt),
+  locale: parsed.evidence.locale,
+  source: parsed.evidence.source,
+});
+
+export class LegalEvidenceEventRepository extends Context.Service<
+  LegalEvidenceEventRepository,
+  ILegalEvidenceEventRepository
+>()("LegalEvidenceEventRepository") {
+  static Default = Layer.effect(
+    this,
+    Effect.gen(function* () {
+      const { db } = yield* WorkspaceDatabase;
+
+      const record = Effect.fn("legalEvidenceEvents.record")(
+        function* (input: LegalEvidenceEventInput) {
+          const parsed = yield* Schema.decodeUnknownEffect(
+            legalEvidenceEventInputSchema,
+            { onExcessProperty: "error" }
+          )(input).pipe(
+            Effect.mapError(
+              (cause) =>
+                new LegalEvidenceEventInputError({
+                  message: "Legal evidence event input is invalid.",
+                  cause,
+                })
+            )
+          );
+          const event = getLegalEvidenceEventRecord(parsed);
+
+          const [inserted] = yield* db
+            .insert(legalEvidenceEvents)
+            .values({ id: postgresUuidV7, ...event })
+            .returning();
+
+          if (!inserted) {
+            return yield* Effect.die(
+              "Legal evidence event insert returned no row."
+            );
+          }
+
+          return inserted;
+        },
+        (effect, input) =>
+          effect.pipe(
+            Effect.annotateLogs({
+              workspaceReservationId: input.workspaceReservationId,
+              documentKey: input.evidence.documentKey,
+            })
+          )
+      );
+
+      return LegalEvidenceEventRepository.of({
+        record,
+        recordMany: Effect.fn("legalEvidenceEvents.recordMany")(
+          function* (input) {
+            const inserted: LegalEvidenceEvent[] = [];
+            for (const event of input) inserted.push(yield* record(event));
+            return inserted;
+          }
+        ),
+      });
+    })
+  );
+
+  static Live = this.Default.pipe(Layer.provide(WorkspaceDatabase.Default));
+}

@@ -1,0 +1,103 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.3.11/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "ignoreUnknown": false,
+    "includes": [
+      "**/*.js",
+      "**/*.jsx",
+      "**/*.ts",
+      "**/*.tsx",
+      "**/*.json",
+      "!**/.vercel",
+      "!**/.turbo",
+      "!.taskmaster",
+      "!**/generated",
+      "!**/db/migrations/**/snapshot.json"
+    ]
+  },
+  "formatter": {
+    "indentStyle": "space"
+  },
+  "plugins": [
+    "./lint/no-chained-type-assertions.grit",
+    "./lint/no-conditional-empty-object-spread.grit",
+    "./lint/no-direct-effect-runs.grit",
+    "./lint/no-direct-next-effect-imports.grit",
+    "./lint/no-direct-process-env.grit",
+    "./lint/no-known-value-widening.grit",
+    "./lint/no-object-parameters.grit",
+    "./lint/no-repeated-computed-conditional-operand.grit",
+    "./lint/no-runtime-typeof.grit",
+    "./lint/no-shape-in-symbol-names.grit",
+    "./lint/no-throw-in-workspace-effect-modules.grit",
+    "./lint/no-unknown-parameters.grit",
+    "./lint/no-unknown-type-aliases.grit",
+    "./lint/no-unsafe-dictionary-type.grit",
+    "./lint/no-widen-then-assert.grit",
+    "./lint/no-wildcard-reexport.grit",
+    "./lint/prefer-effect-when.grit",
+    "./lint/prefer-effect-fn.grit",
+    "./lint/prefer-effect-value.grit"
+  ],
+  "linter": {
+    "rules": {
+      "recommended": true,
+      "correctness": {
+        "noNestedComponentDefinitions": "off"
+      },
+      "complexity": {
+        "noForEach": "off"
+      },
+      "style": {
+        "noNonNullAssertion": "off",
+        "noNestedTernary": "error"
+      },
+      "suspicious": {
+        "noExplicitAny": "error",
+        "noConsole": {
+          "level": "warn",
+          "options": {
+            "allow": ["warn", "error"]
+          }
+        }
+      }
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["apps/deskohub-workspace/**"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noConsole": "error"
+          }
+        }
+      }
+    }
+  ],
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "double",
+      "jsxQuoteStyle": "double",
+      "semicolons": "always",
+      "trailingCommas": "es5"
+    }
+  },
+  "assist": {
+    "actions": {
+      "source": {
+        "organizeImports": "on"
+      }
+    }
+  },
+  "json": {
+    "formatter": {
+      "enabled": true
+    }
+  }
+}
