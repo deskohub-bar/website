@@ -1,0 +1,111 @@
+import { describe, expect, mock, test } from "bun:test";
+import {
+  EmailDeliveryIdSchema,
+  type EmailMessage,
+  type EmailSendResult,
+  EmailServiceError,
+  EmailServiceTag,
+} from "@deskohub/email";
+import { Effect, Layer } from "effect";
+import { type Locale, locales } from "@/features/i18n";
+import { formatDurationMinutes } from "@/shared/utils/date-formatting";
+import { TrainingReservationService } from "./training-reservation.service";
+
+const input = {
+  firstName: "Ada",
+  lastName: "Lovelace",
+  company: "Analytical Engines",
+  role: "Engineer",
+  email: "ada@example.test",
+  phone: "+420777777777",
+  date: new Date("2026-06-20T12:00:00.000Z"),
+  time: "18:00",
+  duration: 2,
+  specialRequirements: "Projector",
+};
+
+const sent = (id: string): EmailSendResult => ({
+  id: EmailDeliveryIdSchema.make(id),
+  status: "sent",
+  provider: "fake",
+  timestamp: new Date("2026-06-20T12:00:00.000Z"),
+});
+
+const runSubmit = (
+  send: ReturnType<typeof mock>,
+  locale: Locale = "en-US",
+  duration = input.duration
+) =>
+  Effect.runPromise(
+    Effect.gen(function* () {
+      const service = yield* TrainingReservationService;
+      return yield* service.submit({ ...input, duration }, locale);
+    }).pipe(
+      Effect.provide(
+        TrainingReservationService.Default.pipe(
+          Layer.provide(
+            Layer.succeed(EmailServiceTag, {
+              send,
+              sendTemplate: mock(() => Effect.succeed(sent("template"))),
+              verify: Effect.succeed(true),
+            })
+          )
+        )
+      )
+    )
+  );
+
+describe("TrainingReservationService", () => {
+  test("first send failure rejects with send failure message", async () => {
+    const send = mock(() => Effect.fail(new EmailServiceError("nope")));
+
+    await expect(runSubmit(send)).rejects.toThrow(
+      "Failed to send reservation. Please try again later."
+    );
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  test("confirmation send failure does not fail reservation", async () => {
+    let calls = 0;
+    const send = mock(() =>
+      calls++ === 0
+        ? Effect.succeed(sent("business"))
+        : Effect.fail(new EmailServiceError("confirmation failed"))
+    );
+
+    const result = await runSubmit(send);
+
+    expect(result).toMatchObject({ ...input, locale: "en-US" });
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
+  test("uses the same localized duration in text and HTML emails", async () => {
+    const send = mock((_message: EmailMessage) =>
+      Effect.succeed(sent("email"))
+    );
+
+    await runSubmit(send, "en-US", 2);
+
+    const business = send.mock.calls[0]?.[0] as EmailMessage;
+    const customer = send.mock.calls[1]?.[0] as EmailMessage;
+    expect(business.text).toContain("Doba trvání: 2 hodiny");
+    expect(business.html).toContain("2 hodiny");
+    expect(customer.text).toContain("Duration: 2 hours");
+    expect(customer.html).toContain("2 hours");
+  });
+
+  for (const locale of locales) {
+    test(`formats customer email duration with the generated ${locale} locale`, async () => {
+      const send = mock((_message: EmailMessage) =>
+        Effect.succeed(sent("email"))
+      );
+
+      await runSubmit(send, locale, 2);
+
+      const customer = send.mock.calls[1]?.[0] as EmailMessage;
+      const expectedDuration = formatDurationMinutes(120, locale);
+      expect(customer.text).toContain(expectedDuration);
+      expect(customer.html).toContain(expectedDuration);
+    });
+  }
+});

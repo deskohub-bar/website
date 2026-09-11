@@ -1,0 +1,70 @@
+import type { Locale } from "@/features/i18n";
+import { siteHeaderSectionIds } from "@/shared/components/site-header-config";
+import { workspaceSiteConstants } from "@/shared/utils";
+import { LandingPageFaqContactSection } from "./landing-page-faq-contact-section";
+import { LandingPageFoundersSection } from "./landing-page-founders-section";
+import { LandingPageHero } from "./landing-page-hero";
+import { landingPageHeroVars } from "./landing-page-hero-section";
+import { LandingPageLocationMapSection } from "./landing-page-location-map-section";
+import { LandingPagePhotoCarouselSection } from "./landing-page-photo-carousel-section";
+import { LandingPageTeambuildingsSection } from "./landing-page-teambuildings-section";
+
+type LandingPageProps = {
+  locale: Locale;
+};
+
+export function LandingPage({ locale }: LandingPageProps) {
+  const localePath = `/${locale}`;
+  const localizedHash = (hash: string) => `${localePath}${hash}`;
+  const contactHref = `${localePath}/contact`;
+  const contactAddress = workspaceSiteConstants.location.address;
+  const contactEmail = workspaceSiteConstants.contact.infoEmail;
+
+  return (
+    <main className="overflow-x-clip bg-navy-blue" style={landingPageHeroVars}>
+      <LandingPageHero
+        locale={locale}
+        overviewSectionId={siteHeaderSectionIds.overview}
+      />
+
+      <LandingPagePhotoCarouselSection locale={locale} />
+
+      <LandingPageLocationMapSection
+        locale={locale}
+        locationMapSectionId={siteHeaderSectionIds.locationMap}
+      />
+
+      <LandingPageFoundersSection
+        locale={locale}
+        foundersSectionId={siteHeaderSectionIds.founders}
+      />
+
+      <LandingPageTeambuildingsSection
+        locale={locale}
+        teambuildingsSectionId={siteHeaderSectionIds.teambuildings}
+        contactHref={contactHref}
+      />
+
+      {/* Legacy event/TTRPG hashes land by contact while those sections are hidden. */}
+      <div
+        id={siteHeaderSectionIds.events}
+        aria-hidden="true"
+        className="scroll-mt-[var(--anchor-scroll-offset)]"
+      />
+      <div
+        id={siteHeaderSectionIds.ttrpg}
+        aria-hidden="true"
+        className="scroll-mt-[var(--anchor-scroll-offset)]"
+      />
+
+      <LandingPageFaqContactSection
+        locale={locale}
+        faqContactSectionId={siteHeaderSectionIds.faqContact}
+        contactHref={contactHref}
+        deskohubBarCtaHref={localizedHash(`#${siteHeaderSectionIds.overview}`)}
+        contactAddress={contactAddress}
+        contactEmail={contactEmail}
+      />
+    </main>
+  );
+}

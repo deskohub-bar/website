@@ -1,0 +1,66 @@
+import { describe, expect, test } from "bun:test";
+import {
+  assertValidMigrationCount,
+  parseChangedMigrationPaths,
+} from "./validate-migration-count";
+
+describe("parseChangedMigrationPaths", () => {
+  test("returns non-empty migration paths", () => {
+    expect(
+      parseChangedMigrationPaths(`
+apps/deskohub-workspace/db/migrations/0002_minor_magik.sql
+apps/deskohub-workspace/db/migrations/20260720120000_new_migration/migration.sql
+`)
+    ).toEqual([
+      "apps/deskohub-workspace/db/migrations/0002_minor_magik.sql",
+      "apps/deskohub-workspace/db/migrations/20260720120000_new_migration/migration.sql",
+    ]);
+  });
+
+  test("returns an empty list when no migrations changed", () => {
+    expect(parseChangedMigrationPaths("\n")).toEqual([]);
+  });
+});
+
+describe("assertValidMigrationCount", () => {
+  test("allows at most one migration", () => {
+    expect(() => assertValidMigrationCount([])).not.toThrow();
+    expect(() => assertValidMigrationCount(["0001.sql"])).not.toThrow();
+  });
+
+  test("reports every migration when more than one changed", () => {
+    expect(() => assertValidMigrationCount(["0001.sql", "0002.sql"])).toThrow(
+      "Workspace PRs may introduce at most one Drizzle SQL migration; found 2.\n0001.sql\n0002.sql"
+    );
+  });
+});
+
+test("regenerates Workspace migrations in CI before accepting them", async () => {
+  const [workflow, turbo] = await Promise.all([
+    Bun.file(
+      new URL("../../../.github/workflows/workspace-tests.yml", import.meta.url)
+    ).text(),
+    Bun.file(new URL("../turbo.json", import.meta.url)).json() as Promise<{
+      readonly tasks: {
+        readonly "db:generate": {
+          readonly dependsOn: readonly string[];
+          readonly env: readonly string[];
+        };
+      };
+    }>,
+  ]);
+
+  expect(turbo.tasks["db:generate"].dependsOn).toContain("i18n:compile");
+  expect(turbo.tasks["db:generate"].env).toEqual(
+    expect.arrayContaining(["DATABASE_URL", "DATABASE_URL_UNPOOLED"])
+  );
+  expect(workflow).toContain(
+    "bun turbo db:generate --filter=deskohub-workspace"
+  );
+  expect(workflow).toContain(
+    "git add --intent-to-add -- apps/deskohub-workspace/db/migrations"
+  );
+  expect(workflow).toContain(
+    "git diff --exit-code -- apps/deskohub-workspace/db/migrations"
+  );
+});

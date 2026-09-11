@@ -1,0 +1,121 @@
+{
+  "$schema": "https://v2-9-14.turborepo.dev/schema.json",
+  "extends": ["//"],
+  "tasks": {
+    "lint": {
+      "dependsOn": [
+        "$TURBO_EXTENDS$",
+        "lint:biome",
+        "lint:eslint",
+        "lint:dependencies"
+      ]
+    },
+    "lint:biome": {
+      "inputs": ["$TURBO_DEFAULT$", "../../biome.json", "../../lint/*.grit"]
+    },
+    "lint:eslint": {
+      "inputs": ["$TURBO_DEFAULT$"]
+    },
+    "lint:dependencies": {
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "../../knip.jsonc",
+        "../../package.json",
+        "package.json"
+      ]
+    },
+    "build": {
+      "dependsOn": [
+        "@deskohub/dotypos#generate",
+        "@deskohub/igloohome#generate",
+        "@deskohub/nexi#generate",
+        "i18n:compile"
+      ],
+      "env": [
+        "EMAIL_PROVIDER",
+        "DOTYPOS_API_TIMEOUT",
+        "IGLOOHOME_API_TIMEOUT",
+        "IGLOOHOME_API_URL",
+        "IGLOOHOME_AUTH_URL",
+        "IGLOOHOME_ALGOPIN_TARGET_DEVICE_ID",
+        "NEXI_API_ORIGIN",
+        "NEXI_CHECKOUT_CURRENCY_OVERRIDE",
+        "NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME",
+        "NEXT_PUBLIC_GTM_ID",
+        "NEXT_PUBLIC_POSTHOG_HOST",
+        "NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN",
+        "NEXT_PUBLIC_VERCEL_ENV",
+        "POSTHOG_API_KEY",
+        "POSTHOG_API_HOST",
+        "POSTHOG_FEATURE_FLAG_OVERRIDES",
+        "POSTHOG_INGEST_HOST",
+        "POSTHOG_PROJECT_ID",
+        "POSTHOG_SERVICE_NAME",
+        "POSTHOG_SERVICE_NAMESPACE",
+        "VERCEL_PROJECT_PRODUCTION_URL"
+      ]
+    },
+    "i18n:compile": {
+      "env": ["!NEXT_PUBLIC_VERCEL_*"],
+      "inputs": [
+        "features/i18n/messages/*.json",
+        "project.inlang/settings.json",
+        "project.inlang/project_id"
+      ],
+      "outputs": ["features/i18n/paraglide/**"]
+    },
+    "feature-flags:sync": {
+      "cache": false,
+      "env": ["POSTHOG_API_HOST", "POSTHOG_API_KEY", "POSTHOG_PROJECT_ID"],
+      "outputs": ["features/feature-flags/generated/contract.ts"]
+    },
+    "db:generate": {
+      "cache": false,
+      "dependsOn": ["i18n:compile"],
+      "env": ["DATABASE_URL", "DATABASE_URL_UNPOOLED"]
+    },
+    "db:migrate": {
+      "cache": false,
+      "env": ["DATABASE_URL", "DATABASE_URL_UNPOOLED"]
+    },
+    "dev": {
+      "dependsOn": [
+        "@deskohub/dotypos#generate",
+        "@deskohub/igloohome#generate",
+        "@deskohub/nexi#generate",
+        "i18n:compile"
+      ]
+    },
+    "test": {
+      "cache": false,
+      "dependsOn": [
+        "$TURBO_EXTENDS$",
+        "@deskohub/dotypos#generate",
+        "@deskohub/igloohome#generate",
+        "@deskohub/nexi#generate",
+        "i18n:compile"
+      ],
+      "passThroughEnv": ["WORKSPACE_TEST_DATABASE_URL"]
+    },
+    "test:admin-cli": {
+      "dependsOn": [
+        "@deskohub/dotypos#generate",
+        "@deskohub/igloohome#generate",
+        "@deskohub/nexi#generate",
+        "i18n:compile"
+      ],
+      "outputs": []
+    },
+    "typecheck": {
+      "dependsOn": [
+        "@deskohub/igloohome#generate",
+        "@deskohub/nexi#generate",
+        "i18n:compile",
+        "typegen"
+      ]
+    },
+    "typegen": {
+      "outputs": [".next/types/**"]
+    }
+  }
+}

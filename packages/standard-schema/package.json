@@ -1,0 +1,19 @@
+{
+  "name": "@deskohub/standard-schema",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "lint": "biome check src --config-path ../../biome.json --vcs-root ../..",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "dependencies": {
+    "@standard-schema/spec": "^1.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5"
+  }
+}

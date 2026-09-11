@@ -1,0 +1,261 @@
+import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { Effect, Fiber, Layer } from "effect";
+import { TestClock } from "effect/testing";
+import { EmailDeliveryIdSchema } from "../../types/email.types";
+
+type SendResponse =
+  | { readonly data: { readonly id: string }; readonly error?: never }
+  | {
+      readonly data?: never;
+      readonly error: {
+        readonly message: string;
+        readonly statusCode?: number;
+      };
+    };
+type SendImplementation = (
+  payload?: unknown,
+  options?: { readonly idempotencyKey?: string }
+) => Promise<SendResponse>;
+type ListDomainsResponse =
+  | { readonly data: readonly unknown[]; readonly error?: never }
+  | { readonly data?: never; readonly error: { readonly message: string } };
+type ListDomainsImplementation = () => Promise<ListDomainsResponse>;
+
+let send = mock<SendImplementation>(async () => ({
+  data: { id: "resend-id" },
+}));
+let listDomains = mock<ListDomainsImplementation>(async () => ({ data: [] }));
+
+mock.module("resend", () => ({
+  Resend: class {
+    emails = { send: send };
+    domains = { list: listDomains };
+  },
+}));
+
+const { ResendEmailProviderLive } = await import("./resend-provider");
+const { EmailConfigTag, EmailProviderTag } = await import("../service");
+
+type EmailProviderRequirement = import("../service").EmailProviderTag;
+
+beforeEach(() => {
+  send = mock<SendImplementation>(async () => ({
+    data: { id: "resend-id" },
+  }));
+  listDomains = mock<ListDomainsImplementation>(async () => ({ data: [] }));
+});
+
+const config = {
+  provider: "resend" as const,
+  defaultFrom: { email: "deskohub@example.test" },
+  apiKey: "api-key",
+};
+
+const runProvider = <A, E>(
+  effect: Effect.Effect<A, E, EmailProviderRequirement>
+) =>
+  Effect.runPromise(
+    effect.pipe(
+      Effect.provide(
+        ResendEmailProviderLive.pipe(
+          Layer.provide(Layer.succeed(EmailConfigTag, config))
+        )
+      )
+    )
+  );
+
+const message = {
+  from: { email: "deskohub@example.test" },
+  to: { email: "ada@example.test" },
+  subject: "Hello",
+  html: "<p>Hello</p>",
+};
+
+describe("ResendEmailProvider", () => {
+  test("maps 4xx and invalid errors to EmailServiceError", async () => {
+    for (const error of [
+      { statusCode: 400, message: "Bad request" },
+      { message: "Invalid API key" },
+    ]) {
+      send = mock<SendImplementation>(async () => ({ error }));
+      const result = await runProvider(
+        Effect.gen(function* () {
+          const provider = yield* EmailProviderTag;
+          return yield* provider.send(message).pipe(Effect.result);
+        })
+      );
+
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        expect(result.failure._tag).toBe("EmailServiceError");
+      }
+    }
+  });
+
+  test("maps 5xx and network errors to NetworkError", async () => {
+    for (const failure of [
+      async () => ({ error: { statusCode: 500, message: "Server error" } }),
+      async () => {
+        throw new Error("network down");
+      },
+    ]) {
+      send = mock<SendImplementation>(failure);
+      const result = await runProvider(
+        Effect.gen(function* () {
+          const provider = yield* EmailProviderTag;
+          return yield* provider.send(message).pipe(Effect.result);
+        })
+      );
+
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        expect(result.failure._tag).toBe("NetworkError");
+      }
+    }
+  });
+
+  test("maps a stalled request to NetworkError", async () => {
+    send = mock<SendImplementation>(() => new Promise(() => {}));
+
+    const result = await runProvider(
+      Effect.gen(function* () {
+        const provider = yield* EmailProviderTag;
+        const fiber = yield* provider
+          .send(message)
+          .pipe(Effect.result, Effect.forkChild);
+        yield* TestClock.adjust("5 seconds");
+        return yield* Fiber.join(fiber);
+      }).pipe(Effect.provide(TestClock.layer()))
+    );
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({
+      _tag: "Failure",
+      failure: {
+        _tag: "NetworkError",
+        message: "Resend send timed out",
+      },
+    });
+  });
+
+  test("send result includes status", async () => {
+    const result = await runProvider(
+      Effect.gen(function* () {
+        const provider = yield* EmailProviderTag;
+        return yield* provider.send(message);
+      })
+    );
+
+    expect(result).toMatchObject({
+      id: EmailDeliveryIdSchema.make("resend-id"),
+      provider: "resend",
+      status: "sent",
+    });
+  });
+
+  test("rejects a Resend response without a valid delivery ID", async () => {
+    send = mock<SendImplementation>(async () => ({ data: { id: "" } }));
+
+    const result = await runProvider(
+      Effect.gen(function* () {
+        const provider = yield* EmailProviderTag;
+        return yield* provider.send(message).pipe(Effect.result);
+      })
+    );
+
+    expect(result._tag).toBe("Failure");
+    if (result._tag === "Failure") {
+      expect(result.failure).toMatchObject({
+        _tag: "EmailServiceError",
+        message: "Resend response did not contain a valid email delivery ID",
+        provider: "resend",
+      });
+    }
+  });
+
+  test("uses stable access and invoice delivery idempotency keys", async () => {
+    await runProvider(
+      Effect.gen(function* () {
+        const provider = yield* EmailProviderTag;
+        for (const category of [
+          "workspace-paid-reservation-access",
+          "workspace-invoice-customer",
+          "workspace-invoice-internal",
+        ]) {
+          yield* provider.send({
+            ...message,
+            tags: [category],
+            metadata: { workspaceReservationId: "reservation-id" },
+          });
+        }
+      })
+    );
+
+    expect(send.mock.calls.map(([, options]) => options)).toEqual([
+      {
+        idempotencyKey: "workspace-paid-reservation-access-reservation-id",
+      },
+      { idempotencyKey: "workspace-invoice-customer-reservation-id" },
+      { idempotencyKey: "workspace-invoice-internal-reservation-id" },
+    ]);
+  });
+
+  test("prefers an explicit idempotency key", async () => {
+    await runProvider(
+      Effect.gen(function* () {
+        const provider = yield* EmailProviderTag;
+        yield* provider.send({
+          ...message,
+          idempotencyKey: "invoice-resend-attempt-2",
+          tags: ["workspace-invoice-customer"],
+          metadata: { workspaceReservationId: "reservation-id" },
+        });
+      })
+    );
+
+    expect(send.mock.calls[0]?.[1]).toEqual({
+      idempotencyKey: "invoice-resend-attempt-2",
+    });
+  });
+
+  test("verify fails when Resend returns an error", async () => {
+    listDomains = mock<ListDomainsImplementation>(async () => ({
+      error: { message: "Invalid API key" },
+    }));
+
+    const result = await runProvider(
+      Effect.gen(function* () {
+        const provider = yield* EmailProviderTag;
+        return yield* provider.verify.pipe(Effect.result);
+      })
+    );
+
+    expect(result._tag).toBe("Failure");
+    if (result._tag === "Failure") {
+      expect(result.failure._tag).toBe("EmailServiceError");
+    }
+  });
+
+  test("layer fails when EMAIL_API_KEY is missing", async () => {
+    const result = await Effect.runPromise(
+      EmailProviderTag.pipe(
+        Effect.provide(
+          ResendEmailProviderLive.pipe(
+            Layer.provide(
+              Layer.succeed(EmailConfigTag, {
+                provider: "resend" as const,
+                defaultFrom: { email: "deskohub@example.test" },
+              })
+            )
+          )
+        ),
+        Effect.result
+      )
+    );
+
+    expect(result._tag).toBe("Failure");
+    if (result._tag === "Failure") {
+      expect(result.failure._tag).toBe("EmailServiceError");
+    }
+  });
+});

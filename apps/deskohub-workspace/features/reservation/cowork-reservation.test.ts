@@ -1,0 +1,127 @@
+import { describe, expect, test } from "bun:test";
+import { Result, Schema } from "effect";
+import "@/shared/polyfills/temporal";
+import {
+  coworkReservationOrderSchema,
+  coworkReservationSchema,
+  getCoworkReservationDetails,
+  getCoworkReservationIntervalInput,
+  getCoworkReservationOrder,
+} from "./cowork-reservation";
+
+const safeParseCoworkReservation = Schema.decodeUnknownResult(
+  coworkReservationSchema
+);
+const safeParseCoworkReservationOrder = Schema.decodeUnknownResult(
+  coworkReservationOrderSchema
+);
+
+describe("cowork reservation schema", () => {
+  test("owns the cowork full-day interval policy", () => {
+    expect(getCoworkReservationIntervalInput("2099-06-10")).toEqual({
+      startsAt: "2099-06-10T00:00",
+      endsAt: "2099-06-11T00:00",
+    });
+  });
+
+  test("represents cowork reservations by date without an interval", () => {
+    const result = safeParseCoworkReservation({
+      entryTier: "plus",
+      date: "2099-06-10",
+      coffee: false,
+      monitorOption: undefined,
+      name: "Ada Lovelace",
+      email: "ada@example.com",
+      phone: "+420777777777",
+      message: "  hello  ",
+      marketingConsent: false,
+    });
+
+    expect(Result.isSuccess(result)).toBe(true);
+    if (Result.isSuccess(result)) {
+      expect(result.success).toMatchObject({
+        kind: "cowork",
+        entryTier: "plus",
+        date: "2099-06-10",
+        coffee: true,
+        message: "hello",
+      });
+      expect(result.success).not.toHaveProperty("startsAt");
+      expect(result.success).not.toHaveProperty("endsAt");
+      expect(getCoworkReservationOrder(result.success)).not.toHaveProperty(
+        "marketingConsent"
+      );
+      expect(
+        getCoworkReservationDetails(getCoworkReservationOrder(result.success))
+      ).toEqual({
+        kind: "cowork",
+        entryTier: "plus",
+        date: "2099-06-10",
+        coffee: true,
+      });
+    }
+  });
+
+  test("decodes cowork orders with the domain discriminator", () => {
+    const result = safeParseCoworkReservationOrder({
+      kind: "cowork",
+      entryTier: "basic",
+      date: "2099-06-10",
+      coffee: false,
+      name: "Ada Lovelace",
+      email: "ada@example.com",
+      phone: "+420777777777",
+    });
+
+    expect(Result.isSuccess(result)).toBe(true);
+    if (Result.isSuccess(result)) {
+      expect(result.success).toMatchObject({
+        kind: "cowork",
+        entryTier: "basic",
+      });
+      expect(result.success).not.toHaveProperty("_tag");
+    }
+  });
+
+  test("rejects monitor setup for non-profi cowork tiers", () => {
+    const result = safeParseCoworkReservation({
+      entryTier: "basic",
+      date: "2099-06-10",
+      startsAt: "00:00",
+      endsAt: "24:00",
+      coffee: false,
+      monitorOption: "2x27-qhd",
+      name: "Ada Lovelace",
+      email: "ada@example.com",
+      phone: "+420777777777",
+      message: "",
+      marketingConsent: false,
+    });
+
+    expect(Result.isFailure(result)).toBe(true);
+    if (Result.isFailure(result)) {
+      expect(String(result.failure)).toContain('at ["monitorOption"]');
+    }
+  });
+
+  test("requires a monitor setup for profi cowork reservations", () => {
+    const result = safeParseCoworkReservation({
+      entryTier: "profi",
+      date: "2099-06-10",
+      startsAt: "00:00",
+      endsAt: "24:00",
+      coffee: true,
+      monitorOption: undefined,
+      name: "Ada Lovelace",
+      email: "ada@example.com",
+      phone: "+420777777777",
+      message: "",
+      marketingConsent: false,
+    });
+
+    expect(Result.isFailure(result)).toBe(true);
+    if (Result.isFailure(result)) {
+      expect(String(result.failure)).toContain('at ["monitorOption"]');
+    }
+  });
+});
