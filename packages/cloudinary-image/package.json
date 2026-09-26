@@ -1,0 +1,24 @@
+{
+  "name": "@deskohub/cloudinary-image",
+  "version": "0.1.0",
+  "dependencies": {
+    "@deskohub/cloudinary": "workspace:*",
+    "next-cloudinary": "^6.16.0"
+  },
+  "peerDependencies": {
+    "react": "^19.2.7"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.17"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./cloudinary-image": "./src/cloudinary-image.tsx",
+    "./url": "./src/url.ts"
+  },
+  "scripts": {
+    "lint": "biome check src --config-path ../../biome.json --vcs-root ../.."
+  },
+  "private": true,
+  "type": "module"
+}

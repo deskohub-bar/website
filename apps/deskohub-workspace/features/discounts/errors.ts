@@ -1,0 +1,88 @@
+import { Data } from "effect";
+import type { DiscountId } from "./contracts";
+import type { DiscountCodeId, VoucherId } from "./persistence-contracts";
+
+export type DiscountCalculationFailureReason =
+  | "invalid_discountable_subtotal"
+  | "currency_mismatch"
+  | "exponent_mismatch";
+
+export class DiscountCalculationError extends Data.TaggedError(
+  "DiscountCalculationError"
+)<{
+  readonly reason: DiscountCalculationFailureReason;
+  readonly message: string;
+  readonly discountId?: DiscountId;
+  readonly cause?: unknown;
+}> {}
+
+export type PromotionCodeUnavailableReason =
+  | "invalid_syntax"
+  | "feature_disabled"
+  | "unknown_code"
+  | "inactive"
+  | "not_started"
+  | "expired"
+  | "usage_limit_reached"
+  | "already_redeemed"
+  | "claim_conflict"
+  | "customer_ineligible"
+  | "product_ineligible"
+  | "no_eligible_subtotal";
+
+export class PromotionCodeUnavailableError extends Data.TaggedError(
+  "PromotionCodeUnavailableError"
+)<{
+  readonly reason: PromotionCodeUnavailableReason;
+  readonly message: string;
+  readonly codeId?: DiscountCodeId | VoucherId;
+  readonly cause?: unknown;
+}> {}
+
+export type DiscountProviderFailureReason =
+  | "malformed_configuration"
+  | "provider_failure";
+
+export class DiscountProviderError extends Data.TaggedError(
+  "DiscountProviderError"
+)<{
+  readonly reason: DiscountProviderFailureReason;
+  readonly message: string;
+  readonly cause?: unknown;
+}> {
+  static fromCause =
+    (input: {
+      readonly reason: DiscountProviderFailureReason;
+      readonly message: string;
+    }) =>
+    (cause: unknown) =>
+      new DiscountProviderError({ ...input, cause });
+}
+
+export type DiscountClaimFailureReason =
+  | "unknown_code"
+  | "inactive"
+  | "not_started"
+  | "expired"
+  | "usage_limit_reached"
+  | "already_redeemed"
+  | "customer_ineligible"
+  | "product_ineligible"
+  | "malformed_configuration"
+  | "claim_conflict"
+  | "money_mismatch";
+
+export class DiscountClaimError extends Data.TaggedError("DiscountClaimError")<{
+  readonly operation: "reserve" | "redeem" | "release";
+  readonly reason: DiscountClaimFailureReason;
+  readonly message: string;
+  readonly codeId?: DiscountCodeId | VoucherId;
+  readonly cause?: unknown;
+}> {}
+
+export type DiscountResolutionError =
+  | DiscountCalculationError
+  | PromotionCodeUnavailableError
+  | DiscountProviderError;
+
+export type DiscountError = DiscountClaimError | DiscountResolutionError;

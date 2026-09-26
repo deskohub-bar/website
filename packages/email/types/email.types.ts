@@ -1,0 +1,103 @@
+/**
+ * Email Service Types
+ *
+ * Core types for the email service that are provider-agnostic
+ */
+
+import { Schema } from "effect";
+
+export const EmailDeliveryIdSchema = Schema.NonEmptyString.pipe(
+  Schema.brand("EmailDeliveryId")
+).annotate({
+  identifier: "EmailDeliveryId",
+  description:
+    "Opaque identifier for an email delivery accepted by a provider.",
+});
+export type EmailDeliveryId = typeof EmailDeliveryIdSchema.Type;
+
+/**
+ * Email recipient type
+ */
+export interface EmailRecipient {
+  email: string;
+  name?: string;
+}
+
+/**
+ * Email attachment type
+ */
+export interface EmailAttachment {
+  filename: string;
+  content: Buffer | string;
+  contentType?: string;
+  contentId?: string;
+  encoding?: string;
+}
+
+/**
+ * Core email message structure
+ */
+export interface EmailMessage {
+  from: EmailRecipient;
+  to: EmailRecipient | EmailRecipient[];
+  cc?: EmailRecipient | EmailRecipient[];
+  bcc?: EmailRecipient | EmailRecipient[];
+  subject: string;
+  html?: string;
+  text?: string;
+  attachments?: EmailAttachment[];
+  replyTo?: EmailRecipient;
+  headers?: Record<string, string>;
+  idempotencyKey?: string;
+  tags?: string[];
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Email send result
+ */
+export interface EmailSendResult {
+  id: EmailDeliveryId;
+  status: "sent" | "queued" | "failed";
+  provider: string;
+  timestamp: Date;
+  error?: string;
+}
+
+/**
+ * Email template data types for different email types
+ */
+export interface ReservationConfirmationData {
+  customerName: string;
+  datetime: Date;
+  duration: number;
+  guestCount: number;
+  specialRequests?: string;
+  tableName?: string;
+  confirmationUrl?: URL;
+  cancelUrl?: string;
+  reservationUrl?: URL;
+}
+
+/**
+ * Supported email template types
+ */
+export type EmailTemplateType = "reservation-confirmation";
+
+/**
+ * Template data union type
+ */
+export type EmailTemplateData = {
+  type: "reservation-confirmation";
+  data: ReservationConfirmationData;
+};
+
+/**
+ * Email provider configuration
+ */
+export interface EmailProviderConfig {
+  provider: "resend" | "console";
+  apiKey?: string;
+  defaultFrom: EmailRecipient;
+  testMode?: boolean;
+}
