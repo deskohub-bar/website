@@ -1,0 +1,250 @@
+import { Schema } from "effect";
+
+export const unixTimestampSecondsSchema = Schema.Int.check(
+  Schema.isGreaterThanOrEqualTo(0)
+).annotate({
+  identifier: "UnixTimestampSeconds",
+  description: "Whole seconds since the Unix epoch.",
+});
+
+export const TemporalInstantSchema = Schema.declare(
+  (input): input is Temporal.Instant => input instanceof Temporal.Instant,
+  {
+    identifier: "TemporalInstant",
+    description: "Temporal instant value.",
+  }
+);
+
+export const TemporalPlainDateSchema = Schema.declare(
+  (input): input is Temporal.PlainDate => input instanceof Temporal.PlainDate,
+  {
+    identifier: "TemporalPlainDate",
+    description: "Temporal plain date value.",
+  }
+);
+
+export const TemporalPlainTimeSchema = Schema.declare(
+  (input): input is Temporal.PlainTime => input instanceof Temporal.PlainTime,
+  {
+    identifier: "TemporalPlainTime",
+    description: "Temporal plain time value.",
+  }
+);
+
+export const localTimeSchema = Schema.String.check(
+  Schema.makeFilter((value) => {
+    try {
+      return (
+        Temporal.PlainTime.from(value).toString({ smallestUnit: "minute" }) ===
+        value
+      );
+    } catch {
+      return false;
+    }
+  })
+)
+  .pipe(Schema.brand("LocalTime"))
+  .annotate({
+    identifier: "LocalTime",
+    description: "Canonical local time in HH:mm format.",
+  });
+
+export type LocalTime = typeof localTimeSchema.Type;
+
+export const localDateTimeSchema = Schema.String.check(
+  Schema.makeFilter((value) => {
+    try {
+      const dateTime = Temporal.PlainDateTime.from(value);
+      return (
+        dateTime.toString({
+          smallestUnit: dateTime.second === 0 ? "minute" : "second",
+        }) === value
+      );
+    } catch {
+      return false;
+    }
+  })
+)
+  .pipe(Schema.brand("LocalDateTime"))
+  .annotate({
+    identifier: "LocalDateTime",
+    description: "Canonical local date-time without an offset.",
+  });
+
+export type LocalDateTime = typeof localDateTimeSchema.Type;
+
+export const instantStringSchema = Schema.String.check(
+  Schema.makeFilter((value) => {
+    try {
+      Temporal.Instant.from(value);
+      return true;
+    } catch {
+      return false;
+    }
+  })
+)
+  .pipe(Schema.brand("Instant"))
+  .annotate({
+    identifier: "Instant",
+    description: "ISO instant string with an offset.",
+  });
+
+export type Instant = typeof instantStringSchema.Type;
+
+export const isPlainDateString = (annotations?: Schema.Annotations.Filter) =>
+  Schema.makeFilter<string>((value) => {
+    try {
+      return Temporal.PlainDate.from(value).toString() === value;
+    } catch {
+      return false;
+    }
+  }, annotations);
+
+export const plainDateStringSchema = Schema.String.check(isPlainDateString())
+  .pipe(Schema.brand("PlainDate"))
+  .annotate({
+    identifier: "PlainDate",
+    description: "Canonical calendar date in YYYY-MM-DD format.",
+  });
+
+export type PlainDate = typeof plainDateStringSchema.Type;
+
+export const isValidDate = (date: Date) => !Number.isNaN(date.getTime());
+
+export const temporalInstantToDate = (instant: Temporal.Instant) =>
+  new Date(instant.epochMilliseconds);
+
+export const temporalInstantToIsoString = (instant: Temporal.Instant) =>
+  temporalInstantToDate(instant).toISOString();
+
+export const temporalInstantToLocalDateTimeString = ({
+  instant,
+  timeZone,
+}: {
+  readonly instant: Temporal.Instant;
+  readonly timeZone: string;
+}) =>
+  instant
+    .toZonedDateTimeISO(timeZone)
+    .toPlainDateTime()
+    .toString({ smallestUnit: "minute" });
+
+export const localDateTimeToOffsetInstantString = ({
+  dateTime,
+  timeZone,
+}: {
+  readonly dateTime: string;
+  readonly timeZone: string;
+}) =>
+  Temporal.PlainDateTime.from(dateTime)
+    .toZonedDateTime(timeZone)
+    .toString({ smallestUnit: "second", timeZoneName: "never" });
+
+export const localDateTimeToTemporalInstantString = ({
+  dateTime,
+  timeZone,
+}: {
+  readonly dateTime: string;
+  readonly timeZone: string;
+}) =>
+  Temporal.PlainDateTime.from(dateTime)
+    .toZonedDateTime(timeZone)
+    .toInstant()
+    .toString();
+
+export const dateToTemporalInstant = (date: Date) =>
+  isValidDate(date)
+    ? Temporal.Instant.fromEpochMilliseconds(date.getTime())
+    : undefined;
+
+export const toTemporalInstant = (date: Date | Temporal.Instant) =>
+  date instanceof Date ? dateToTemporalInstant(date) : date;
+
+export const temporalPlainDateToDate = ({
+  date,
+  plainTime,
+  timeZone,
+}: {
+  readonly date: Temporal.PlainDate;
+  readonly plainTime: Temporal.PlainTime;
+  readonly timeZone: string;
+}) =>
+  temporalInstantToDate(
+    date.toZonedDateTime({ plainTime, timeZone }).toInstant()
+  );
+
+export const temporalInstantToPlainDate = ({
+  instant,
+  timeZone,
+}: {
+  readonly instant: Temporal.Instant;
+  readonly timeZone: string;
+}) => instant.toZonedDateTimeISO(timeZone).toPlainDate();
+
+export const dateToTemporalPlainDate = ({
+  date,
+  timeZone,
+}: {
+  readonly date: Date;
+  readonly timeZone: string;
+}) => dateToTemporalInstant(date)?.toZonedDateTimeISO(timeZone).toPlainDate();
+
+export const isFuturePlainDateTime = ({
+  dateTime,
+  timeZone,
+  now = Temporal.Now.instant(),
+}: {
+  readonly dateTime: Temporal.PlainDateTime;
+  readonly timeZone: string;
+  readonly now?: Temporal.Instant;
+}) =>
+  Temporal.PlainDateTime.compare(
+    dateTime,
+    now.toZonedDateTimeISO(timeZone).toPlainDateTime()
+  ) > 0;
+
+export const isMidnight = (
+  value: Temporal.PlainDateTime | Temporal.ZonedDateTime
+) =>
+  value.hour === 0 &&
+  value.minute === 0 &&
+  value.second === 0 &&
+  value.millisecond === 0 &&
+  value.microsecond === 0 &&
+  value.nanosecond === 0;
+
+export const isWholeHour = (
+  value: Temporal.PlainTime | Temporal.PlainDateTime | Temporal.ZonedDateTime
+) =>
+  value.minute === 0 &&
+  value.second === 0 &&
+  value.millisecond === 0 &&
+  value.microsecond === 0 &&
+  value.nanosecond === 0;
+
+export const floorToWholeHour = (value: Temporal.ZonedDateTime) =>
+  value.with({
+    minute: 0,
+    second: 0,
+    millisecond: 0,
+    microsecond: 0,
+    nanosecond: 0,
+  });
+
+export const ceilToWholeHour = (value: Temporal.ZonedDateTime) =>
+  isWholeHour(value) ? value : floorToWholeHour(value).add({ hours: 1 });
+
+export const makeWholeHourInstantStringSchema = (timeZone: string) =>
+  instantStringSchema.check(
+    Schema.makeFilter((value) => {
+      try {
+        const time = Temporal.Instant.from(value)
+          .toZonedDateTimeISO(timeZone)
+          .toPlainTime();
+
+        return isWholeHour(time);
+      } catch {
+        return false;
+      }
+    })
+  );
