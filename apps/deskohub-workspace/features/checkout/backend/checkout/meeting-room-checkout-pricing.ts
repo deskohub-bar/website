@@ -1,0 +1,166 @@
+import { Effect } from "effect";
+import { getMeetingRoomCheckoutSummary } from "@/features/checkout/checkout-summary-meeting-room";
+import type { ReservationQuoteError } from "@/features/checkout/reservation-quote-error";
+import { getReservationQuoteFingerprint } from "@/features/checkout/reservation-quote-fingerprint";
+import {
+  getMeetingRoomReservationQuote,
+  type MeetingRoomReservationQuote,
+} from "@/features/checkout/reservation-quote-meeting-room";
+import type {
+  DiscountQuote,
+  DiscountResolutionError,
+} from "@/features/discounts";
+import type {
+  MeetingRoomAdvertisedPriceReservation,
+  MeetingRoomReservationDetails,
+  MeetingRoomReservationPricingInput,
+  NormalizedMeetingRoomReservationOrder,
+} from "@/features/reservation/meeting-room-reservation";
+import { getMeetingRoomLastServiceDate } from "@/features/reservation/meeting-room-reservation-time";
+import {
+  type ReservationAdvertisementAffirmation,
+  type ReservationAdvertisementAffirmationInput,
+  type ReservationAdvertisementQuote,
+  type ReservationAdvertisementQuoteInput,
+  type ReservationCustomerQuoteInput,
+  type ReservationDiscountCodePriceInput,
+  type ReservationDiscountCodePriceResult,
+  type ReservationPaymentPriceAffirmation,
+  type ReservationPaymentPriceAffirmationInput,
+  type ReservationPreparedCustomerQuote,
+  reservationCheckoutPricing,
+} from "./reservation-checkout-pricing";
+
+export type MeetingRoomCheckoutPricingError =
+  | ReservationQuoteError
+  | DiscountResolutionError;
+
+export type MeetingRoomAdvertisementQuoteInput =
+  ReservationAdvertisementQuoteInput<MeetingRoomAdvertisedPriceReservation>;
+
+export type MeetingRoomAdvertisementAffirmationInput =
+  ReservationAdvertisementAffirmationInput<
+    MeetingRoomAdvertisedPriceReservation,
+    MeetingRoomReservationQuote
+  >;
+
+export type MeetingRoomCustomerQuoteInput =
+  ReservationCustomerQuoteInput<NormalizedMeetingRoomReservationOrder>;
+
+export type MeetingRoomPaymentPriceAffirmationInput =
+  ReservationPaymentPriceAffirmationInput<
+    NormalizedMeetingRoomReservationOrder,
+    MeetingRoomReservationQuote
+  >;
+
+export type MeetingRoomDiscountCodePriceInput =
+  ReservationDiscountCodePriceInput<
+    NormalizedMeetingRoomReservationOrder,
+    MeetingRoomReservationQuote
+  >;
+
+export type MeetingRoomAdvertisementQuote = ReservationAdvertisementQuote<
+  MeetingRoomAdvertisedPriceReservation,
+  MeetingRoomReservationQuote
+>;
+
+export type MeetingRoomAdvertisementAffirmation =
+  ReservationAdvertisementAffirmation<
+    MeetingRoomAdvertisedPriceReservation,
+    MeetingRoomReservationQuote
+  >;
+
+export type MeetingRoomCustomerQuote = ReservationPreparedCustomerQuote<
+  NormalizedMeetingRoomReservationOrder,
+  MeetingRoomReservationQuote
+>;
+
+export type MeetingRoomPaymentPriceAffirmation =
+  ReservationPaymentPriceAffirmation<
+    NormalizedMeetingRoomReservationOrder,
+    MeetingRoomReservationQuote
+  >;
+
+export type MeetingRoomDiscountCodePriceResult =
+  ReservationDiscountCodePriceResult<
+    NormalizedMeetingRoomReservationOrder,
+    MeetingRoomReservationQuote
+  >;
+
+const getMeetingRoomPricingContext = Effect.fn(
+  "MeetingRoomCheckoutPricing.getPricingContext"
+)(function* (reservation: MeetingRoomPricingSelection) {
+  const undiscountedQuote = yield* getMeetingRoomReservationQuote(reservation);
+  const [productItem] = undiscountedQuote.items;
+
+  return {
+    reservation,
+    discountInput: {
+      product: {
+        kind: "meeting-room" as const,
+        duration: productItem.duration,
+      },
+      discountableSubtotal: productItem.amount,
+      lastServiceDate:
+        getMeetingRoomPricingSelectionLastServiceDate(reservation),
+    },
+  };
+});
+
+/**
+ * PII-free meeting-room selection that pricing accepts: advertised-price
+ * inputs or the reservation domain's details projection. A full order
+ * satisfies it structurally through `MeetingRoomReservationDetails`.
+ */
+type MeetingRoomPricingSelection =
+  | MeetingRoomReservationPricingInput
+  | MeetingRoomReservationDetails;
+
+/**
+ * Hourly bookings can cross midnight, so concrete reservations derive the
+ * last service date from their exclusive end instead of the start date.
+ */
+const getMeetingRoomPricingSelectionLastServiceDate = (
+  selection: MeetingRoomPricingSelection
+) =>
+  "endsAt" in selection
+    ? getMeetingRoomLastServiceDate(selection)
+    : selection.lastServiceDate;
+
+type MeetingRoomPricingContext = Effect.Success<
+  ReturnType<typeof getMeetingRoomPricingContext>
+>;
+
+const buildMeetingRoomQuote = Effect.fn(
+  "MeetingRoomCheckoutPricing.buildQuote"
+)(function* (input: {
+  readonly pricing: MeetingRoomPricingContext;
+  readonly discountQuote: DiscountQuote;
+}) {
+  const quoteWithoutFingerprint = yield* getMeetingRoomReservationQuote(
+    input.pricing.reservation,
+    { discountQuote: input.discountQuote }
+  );
+
+  return {
+    ...quoteWithoutFingerprint,
+    fingerprint: getReservationQuoteFingerprint(
+      input.pricing.reservation,
+      quoteWithoutFingerprint
+    ),
+  };
+});
+
+export const meetingRoomCheckoutPricing = reservationCheckoutPricing<
+  MeetingRoomPricingSelection,
+  MeetingRoomAdvertisedPriceReservation,
+  NormalizedMeetingRoomReservationOrder,
+  MeetingRoomPricingContext,
+  MeetingRoomReservationQuote,
+  ReservationQuoteError,
+  ReservationQuoteError
+>({
+  getPricingContext: getMeetingRoomPricingContext,
+  buildQuote: buildMeetingRoomQuote,
+  getCheckoutSummary: ({ quote }) => getMeetingRoomCheckoutSummary(quote),
+});

@@ -1,0 +1,782 @@
+# Workspace Checkout Lifecycle
+
+## Contents
+
+- [Core lifecycle tables](#core-lifecycle-tables)
+- [Advertised, quoted, and payable prices](#advertised-quoted-and-payable-prices)
+- [Ownership](#ownership)
+- [No-PII policy](#no-pii-policy)
+- [Table contracts](#table-contracts)
+- [Lifecycle enums](#lifecycle-enums)
+- [Checkout session and attempt HMACs](#checkout-session-and-attempt-hmacs)
+- [Sequence diagrams](#sequence-diagrams)
+- [Recovery rules](#recovery-rules)
+- [Live test safety checklist](#live-test-safety-checklist)
+
+This document is the Phase 1 contract for the Workspace checkout database rewrite. It supersedes the earlier `payment_orders`-centered model for new implementation work.
+
+The local database is a Deskohub workflow, payment, legal, and recovery ledger. Dotypos remains the source of truth for customer facts and reservation facts. Nexi remains the source of truth for external payment processing facts; an exactly zero payable total completes through an internal paid attempt without contacting Nexi. The local database must not become a customer profile store, a reservation fact store, a raw provider payload archive, or a return-state token store.
+
+## Core lifecycle tables
+
+The core checkout lifecycle uses these tables:
+
+- `workspace_reservations`
+- `payment_attempts`
+- `webhook_events`
+- `legal_evidence_events`
+
+Do not recreate `checkout_return_state_tokens` as a state table. Return pages must derive enough context from signed URL state, route parameters, Nexi verification, and the durable rows above.
+
+Discount and voucher configuration and audit history extend this lifecycle through `discounts`, `discount_targets`, `promotion_codes`, `promotion_code_customers`, `discount_codes`, `vouchers`, `discount_applications`, `discount_code_redemptions`, and `voucher_redemptions`. These tables store only source-neutral benefit configuration, Dotypos customer IDs, generic application snapshots, and claim state. They must not store customer contact data, Workspace access codes, or raw provider payloads. Read the [discount administration reference](../../deskohub-workspace-administration/references/discounts.md) for operator mutations and the [business discount specification](../../../../apps/deskohub-workspace/docs/discount-codes.md) for product policy.
+
+`discount_codes` and `vouchers` are separate aggregates and have separate claim ledgers. The shared `promotion_codes` registry provides one globally unique submitted-code namespace and common timing/audience policy without making a voucher a discount code. Voucher availability is issued value minus reserved and redeemed voucher applications. Admission locks the voucher row, rechecks the exact available money, and inserts the voucher claim in the same payment transaction; release restores availability by state alone.
+
+Customer marketing consent is independent of a reservation and lives in `customer_marketing_consents`, keyed directly by the stable Dotypos customer ID. The reservation page always shows a privacy notice and link, but privacy-policy acknowledgement is not a consent gate and is not persisted. The optional marketing checkbox grants customer-level consent; leaving it unchecked is a no-op, not a withdrawal.
+
+## Advertised, quoted, and payable prices
+
+Checkout has three distinct price boundaries:
+
+1. The reservation page advertises a price.
+2. Reservation submission creates the authoritative price quote and derives the order summary that the customer reviews.
+3. Order submission freshly affirms that signed summary before payment begins.
+
+The server must issue an integrity-protected advertisement snapshot for only the product and reservation inputs that determine the price visible on the reservation page. Cowork monitor selection affects availability and final product composition, but its amount is always zero, so it is excluded from the advertised-price request, quote items, and quote fingerprint. The selected monitor is still validated during reservation submission and recorded in the signed reservation state. Reservation-page advertisement evaluates only automatic discounts that can be discovered without customer identity; currently this means Calendar sales. It must not resolve or create a Dotypos customer merely to advertise a price. Customer-specific pricing is outside the advertisement boundary by contract and does not need an inert marker in the snapshot. The snapshot contains no customer PII and is carried back by the reservation form without treating client-authored price data as authoritative. The signed order-summary state performs the same role for the price reviewed on the summary page.
+
+When a customer returns from Pay to edit a reservation, reservation-page availability projects the inventory that will exist after supersession. The availability request carries the already-signed Pay state separately from the public selection query. The server may exclude exactly one hold only after verifying that the signed order and checkout session still identify the current held reservation, its payment state permits supersession, and Dotypos still reports it as `NEW`. The inventory snapshot must independently confirm that the excluded reservation is still `NEW`; all other reservations and Calendar limitations remain in force. This projection is advisory only. Submission must still cancel the old hold and then perform the normal exclusion-free availability check before creating its replacement.
+
+A reservation quote contains authoritative pricing facts only: itemized priced components, payment totals, applied generic discounts, and the quote fingerprint. It does not contain the checkout summary or duplicate reservation selection. The checkout summary is a deterministic family-owned projection of the signed reservation plus its quote. This keeps zero-priced composition such as the selected cowork monitor visible to the customer without making it a price input or allowing UI structure to affect the price fingerprint.
+
+On reservation submission, the server opens the advertisement snapshot and freshly affirms only the anonymously discoverable automatic discounts that were advertised. A Calendar sale that became available after the snapshot was issued is not added retrospectively. After that boundary is affirmed, the normal reservation workflow resolves or creates the Dotypos customer and evaluates the customer discount for the first signed order summary. Because customer-specific pricing could not be evaluated at the anonymous advertisement boundary, that customer discount may first appear on the summary without producing `pricing_changed`. This is an explicit boundary contract, not a general permission to introduce later automatic discounts.
+
+Once a customer discount has appeared in a signed summary, it is an accepted discount like any other: code submission must affirm it before changing the summary, final order submission must freshly affirm it, and its disappearance or change produces the normal `pricing_changed` result. No later workflow may use the anonymous-advertisement exception to replace, add, or silently remove a customer discount that the customer has already seen.
+
+`pricing_changed` is a normal workflow result at both transitions, not an exceptional checkout failure:
+
+- If anonymous discount discovery fails before the reservation page is rendered, log the error, omit that discount from the advertisement, and continue without it. Quote generation must not add an anonymously discoverable automatic discount that becomes available after the advertisement snapshot was issued.
+- If a discount in the advertisement snapshot cannot be included when reservation submission creates the quote, create the current quote without that discount and return `pricing_changed` for every affected summary product key, such as `product:cowork:basic`. The customer must review the changed summary before payment can be requested.
+- If a discount in the signed summary cannot be freshly affirmed at order submission, return `pricing_changed` with a refreshed signed summary. Create no durable payment attempt and no external payment session.
+- Newly available anonymously discoverable automatic discounts are never introduced retrospectively during quote generation or final affirmation. They may appear only through a new advertisement/summary cycle. The customer discount may first appear only at the first signed-summary boundary after Dotypos identity resolution, as described above. A successfully submitted discount code is a separate deliberate exception because the customer explicitly requested that quote change.
+
+Calendar sale eligibility is one shared rule, `calendarSaleAppliesToBooking` in
+`features/discounts/calendar-sale.ts`. The booking instant must fall inside the
+sale's Prague all-day booking window, which has an exclusive end. The last
+service date must also be no later than the sale's last day, and earlier
+service dates qualify. Each product's pricing context supplies
+`lastServiceDate` in the discount input: office uses `endsOn`, cowork uses its
+reserved date, and meeting rooms use the Prague date of the exclusive `endsAt`
+(`getMeetingRoomLastServiceDate`), because hourly bookings can cross midnight
+and one ending exactly at midnight belongs to the previous day. Meeting-room
+advertised-price details carry `lastServiceDate` so the advertisement stays
+keyed by dates, not clock times. A range extending past the sale's last day gets
+no sale; never prorate. Do not re-derive the window or compare
+service dates against sale dates elsewhere.
+
+The booking instant is the price-lock moment. Reservation-page advertisement
+and the home-page banner use the current instant because they preview a booking
+made now. Reservation submission (`prepareWorkspacePayState`) captures
+`currentInstant` once and signs it into the Pay state as `bookedAt`. Every
+later affirmation reads it with `getSignedPayStateBookedAt` rather than the
+clock: summary acceptance, discount-code entry, payment start and
+claim-conflict refresh. Re-signed Pay states carry the original `bookedAt`
+forward. Editing or resubmitting the reservation creates a new Pay state and
+therefore a new booking instant. A sale that has ended by then disappears
+through the normal `pricing_changed` flow. Do not use the reservation draft's
+creation time, because drafts can be reused or superseded. Webhook,
+finalization and late-payment recovery read persisted application snapshots
+and never re-evaluate sale eligibility.
+
+Calendar discovery caching never extends the accepted interval. Occurrences are
+cached by the booking's Prague date, and eligibility is checked against the
+booking instant after a cached occurrence is read. The exclusive-end Prague
+midnight therefore remains authoritative without waiting for the 60-second
+discovery cache to expire.
+
+Discount code entry belongs on the order-summary page as an independent form with its own server action, pending state, and field error. It must not resubmit the reservation form or the main order submission:
+
+- The action receives the current signed summary and submitted code.
+- It first affirms every discount already displayed. If any changed, it returns the normal `pricing_changed` result and a refreshed signed summary.
+- An unavailable or invalid code returns a field-level error and leaves the existing signed summary payable. It never blocks proceeding without the code.
+- A valid code returns a new signed summary containing the code discount. It does not create a payment attempt, persist an application, or reserve code capacity.
+- Once present in the signed summary, a code follows the same final affirmation and payment-lifecycle rules as every other discount.
+
+The hard payment invariant is that the accepted payment attempt amount must exactly equal the last signed summary price shown to the customer. Order submission freshly affirms exactly the discounts in that summary and compares the complete quote fingerprint and total. A mismatch—or a failure to persist applications or admit a claim atomically—returns `pricing_changed`; the transaction rolls back and Nexi is not called. A positive total creates a Nexi attempt and HPP session. An exactly zero total atomically creates an already-paid `internal` attempt, marks the reservation paid, persists application snapshots, and immediately redeems any admitted code claim; it never prepares or calls Nexi.
+
+Advertised, signed, and freshly affirmed quotes and local payment attempts always retain the catalog currency. The controlled non-production Nexi sandbox currency override is a provider-adapter exception only: Workspace applies it immediately before HPP creation and again when constructing Nexi verification arguments. The override never changes locally persisted payment facts, the customer-visible quote, its numeric minor-unit value, or its exponent, and it is unavailable for production or the live Nexi origin.
+
+## Ownership
+
+| Data | Owner | Local DB contract |
+| --- | --- | --- |
+| Customer name, email, phone | Dotypos customer | Store only `dotypos_customer_id`. Never store as columns, JSON, event text, or raw payload. |
+| Dotypos reservation date, service options, staff note, reservation status | Dotypos reservation | Store `dotypos_reservation_id` and local workflow timestamps/states only. Read Dotypos when reservation facts are needed. |
+| Checkout session and attempt idempotency | Deskohub workflow | Store only the HMAC session and attempt keys. The object payloads used to derive them are transient and must not be persisted. |
+| Payment session and terminal state | Nexi plus Deskohub workflow | Store positive Nexi attempts with their external identifiers and store zero-total internal attempts without external fields. |
+| Nexi webhooks | Nexi plus Deskohub workflow | Store dedupe identity and normalized processing state. Never store raw notification bodies or optional sensitive provider fields. |
+| Customer email delivery tracking | Email provider plus Deskohub workflow | Store the active non-PII provider delivery ID and local fulfillment state only. Never store the customer address or raw delivery payloads. |
+| Administration order and operation views | Nexi, joined to Deskohub attempts | Read current orders and operations from Nexi on demand and expose only allowlisted identifiers, status, channel, timestamps, and amounts. Do not persist provider snapshots. |
+| Customer marketing consent | Deskohub customer consent | Store one active-or-withdrawn row per `dotypos_customer_id`, with the accepted marketing document hash, locale, and grant/withdrawal timestamps. Never store customer contact data. |
+| Reservation terms acceptance | Deskohub legal evidence | Store the accepted terms and operating-rules document keys, paths, hashes, timestamps, locale, and source. Never store rendered legal documents or customer contact data. |
+
+## No-PII Policy
+
+No customer PII may be persisted in plaintext database columns, JSON, text messages, or event metadata. This includes customer name, email, phone number, payment instrument data, Nexi `customerInfo`, raw provider payloads, and free-form user notes. The sole accounting exception is an invoice-source snapshot encrypted by PostgreSQL `pgcrypto` into `accounting_document_snapshots.encrypted_snapshot`.
+
+Allowed local values:
+
+- Dotypos customer IDs and reservation IDs.
+- Deskohub IDs, correlation IDs, HMAC checkout session and attempt keys, payment attempt IDs, webhook event IDs, provider operation IDs, and active customer email delivery IDs.
+- Nexi `securityToken`, because it is short-lived non-PII and needed for payment-attempt safety.
+- Legal document paths and hashes.
+- Customer marketing grant and withdrawal timestamps.
+- Local state enums, timestamps, and normalized failure codes.
+- Payment amounts, currencies, quote fingerprints, and product price metadata needed to verify a Nexi result, provided they do not include customer or reservation facts that Dotypos owns.
+- An immutable accounting snapshot encrypted into `bytea`, with only its non-PII payment-attempt/reservation references, schema version, key ID, and creation time stored in plaintext.
+
+Enforcement boundary:
+
+- Server actions may hold customer PII in memory only long enough to find or create the Dotypos customer and derive the transient checkout-key payloads.
+- Nexi HPP creation may transmit the signed reservation's customer name, email, and normalized phone fields as `order.customerInfo`; provider adapters must not persist or log those values.
+- Repository inputs must be shaped so PII has no plaintext destination field. Accounting snapshot plaintext may reach only the parameterized `pgp_sym_encrypt` call.
+- `jsonb` columns must use schemas that exclude customer contact fields, free-form customer notes, raw provider envelopes, and raw Dotypos responses.
+- Database query logs may retain non-sensitive parameters for diagnostics, but every confidential scalar must use `sensitiveDatabaseParameter` and structured parameters must pass through the shared recursive censor. Accounting encryption and decryption queries must mark the plaintext and key parameters, disable application tracing, and immediately replace raw database failures with stable errors.
+- Any future column or JSON field that can carry customer-authored free text is forbidden unless a separate privacy review explicitly reclassifies it.
+
+## Table Contracts
+
+### `workspace_reservations`
+
+One row per Deskohub checkout workflow for a Dotypos reservation hold and its payment lifecycle.
+
+| Column | Type | Required | Purpose |
+| --- | --- | --- | --- |
+| `id` | text | yes | Local workflow ID. Stable route/support reference. |
+| `checkout_session_key` | text | yes | HMAC key grouping deliberate reservation submissions while the customer moves between Reservation and Pay. Stores only an HMAC digest; newly derived session keys use the key-ID-prefixed digest, while a row added to an existing session reuses that session's stored key. |
+| `checkout_attempt_key` | text | yes | HMAC idempotency key for one mounted-form submission and its immediate retry. Includes the normalized reservation details and stores only an HMAC digest; new rows store the key-ID-prefixed digest. |
+| `correlation_id` | text | yes | Non-PII cross-system tracing ID. Unique. |
+| `dotypos_customer_id` | text | yes | Dotypos customer that owns customer PII. |
+| `dotypos_reservation_id` | text | no | Dotypos reservation hold/final reservation ID. Null until Dotypos creates it. |
+| `reservation_state` | text enum | yes | Local reservation workflow state. |
+| `payment_state` | text enum | yes | Aggregate payment state across attempts. |
+| `fulfillment_state` | text enum | yes | Local post-payment/legal-delivery workflow state. |
+| `active_payment_attempt_id` | text | no | Current Nexi or internal payment attempt. |
+| `active_customer_email_delivery_id` | text | no | Active non-PII provider delivery ID for the customer email: the accepted send awaiting its webhook, or, while a delivery-failure recovery reclaims fulfillment into `processing`, the prior failed send's ID as the recovery generation marker. |
+| `reservation_hold_expires_at` | timestamptz | no | Local hold deadline used for cleanup scheduling. Mirrors Deskohub hold policy, not Dotypos facts. |
+| `reservation_hold_expired_at` | timestamptz | no | When local cleanup observed the hold as expired. |
+| `reservation_created_at` | timestamptz | no | When Dotypos reservation creation succeeded. |
+| `reservation_confirmed_at` | timestamptz | no | When paid workflow confirmed the Dotypos reservation. |
+| `reservation_cancelled_at` | timestamptz | no | When Dotypos cancellation succeeded or Dotypos already reported cancellation. |
+| `paid_at` | timestamptz | no | When a verified Nexi attempt or atomic internal completion made the workflow paid. |
+| `fulfilled_at` | timestamptz | no | When all required post-payment work completed. |
+| `fulfillment_failed_at` | timestamptz | no | Most recent fulfillment failure time. |
+| `failure_code` | text | no | Normalized non-PII workflow failure code. |
+| `fulfillment_failure_code` | text | no | Normalized non-PII fulfillment failure code. |
+| `created_at` | timestamptz | yes | DB-managed creation timestamp. |
+| `updated_at` | timestamptz | yes | DB-managed update timestamp. |
+
+Indexes and constraints:
+
+- Primary key on `id`.
+- Unique index on `checkout_attempt_key`.
+- Partial unique index on `checkout_session_key` while `reservation_state <> 'cancelled'`.
+- Lookup index on `(checkout_session_key, created_at)`.
+- Unique index on `correlation_id`.
+- Partial unique index on `dotypos_reservation_id` where not null.
+- Unique index on `active_customer_email_delivery_id` where not null.
+- Partial index on `reservation_hold_expires_at` for `reservation_state = 'held'`.
+- Recovery index on `(reservation_state, payment_state, fulfillment_state)`.
+- `dotypos_reservation_id` must be non-null for `held`, `confirming`, `confirmed`, `cancelling`, `cancelled`, and `cancellation_failed` states.
+- `paid_at` must be non-null when `payment_state = 'paid'`.
+- `fulfilled_at` must be non-null when `fulfillment_state = 'fulfilled'`.
+- `fulfillment_failed_at` and `fulfillment_failure_code` must be non-null when `fulfillment_state = 'failed'`.
+- `active_customer_email_delivery_id` must be non-null when `fulfillment_state = 'awaiting_delivery'`.
+- `active_customer_email_delivery_id` is non-null only for `processing`, `awaiting_delivery`, `failed`, and `fulfilled` fulfillment states. A non-null ID while `processing` is the prior failed send retained as the recovery generation, not an awaited send.
+
+### `payment_attempts`
+
+One row per payment attempt. Positive totals create Nexi HPP/session attempts. Exactly zero totals create one already-paid internal attempt in the same transaction that marks the reservation paid. Retries never overwrite attempt history.
+
+| Column | Type | Required | Purpose |
+| --- | --- | --- | --- |
+| `id` | text | yes | Local payment attempt ID. |
+| `workspace_reservation_id` | text | yes | Parent workflow row. |
+| `provider` | text enum | yes | `nexi` for positive external payment or `internal` for zero-total completion. |
+| `provider_order_id` | text | no | Nexi order ID, normally the value sent to `order.orderId`. Required and unique for Nexi; forbidden for internal attempts. |
+| `provider_order_created_at` | timestamptz | no | When Nexi accepted the hosted-payment request and returned its provider session. Set once for new Nexi attempts. |
+| `security_token` | text | no | Nexi HPP security token. Short-lived non-PII. |
+| `state` | text enum | yes | Attempt-level payment state. |
+| `refund_state` | text enum | yes | Refund work state, separate from successful settlement. |
+| `refunded_amount_value` | integer | no | Sum of successful Nexi refunds in the attempt's scaled units. Set only while `refund_state = 'refunded'`. |
+| `refunded_at` | timestamptz | no | Latest successful Nexi refund time, or the reconciliation time when Nexi omits it. Set only while `refund_state = 'refunded'`. |
+| `amount_value` | integer | yes | Expected payment amount in scaled integer form. |
+| `amount_exponent` | integer | yes | Currency exponent used for amount verification. |
+| `currency` | text | yes | Uppercase ISO currency code. |
+| `provider_redirect_url` | text | no | Nexi hosted page URL, if needed to resume redirect before expiry. |
+| `last_webhook_event_id` | text | no | Last normalized webhook event applied to this attempt. |
+| `last_provider_operation_id` | text | no | Last provider operation ID observed. |
+| `last_provider_status` | text | no | Last normalized provider status observed. |
+| `failure_code` | text | no | Normalized non-PII unsuccessful terminal code. |
+| `created_at` | timestamptz | yes | DB-managed creation timestamp. |
+| `updated_at` | timestamptz | yes | DB-managed update timestamp. |
+
+Indexes and constraints:
+
+- Primary key on `id`.
+- Foreign key to `workspace_reservations(id)`.
+- Partial unique index on `provider_order_id` for Nexi attempts.
+- Index on `workspace_reservation_id`.
+- Recovery index on `(state, created_at)`.
+- Nexi attempts have a positive amount and a non-null provider order ID.
+- Internal attempts have an exactly zero amount, are inserted already paid, and have no provider order ID, security token, redirect URL, webhook ID, provider operation ID, provider status, or failure code.
+- `amount_exponent` must be between `0` and `20`.
+- `currency` must be uppercase three-letter text.
+- `failure_code` must be non-null for failed/cancelled/expired terminal states.
+
+### `webhook_events`
+
+One row per Nexi webhook event identity for dedupe and normalized processing status.
+
+| Column | Type | Required | Purpose |
+| --- | --- | --- | --- |
+| `id` | text | yes | Local webhook row ID. |
+| `provider` | text enum | yes | Initial value: `nexi`. |
+| `event_id` | text | yes | Provider event ID or deterministic identity derived from non-secret official fields. Unique. |
+| `payment_attempt_id` | text | no | Associated payment attempt when known. |
+| `provider_order_id` | text | no | Non-PII provider order ID from `operation.orderId`, for lookup before attempt association. |
+| `received_at` | timestamptz | yes | When the webhook was received. |
+| `processed_at` | timestamptz | no | When processing completed successfully. |
+| `state` | text enum | yes | Webhook processing state. |
+| `error_code` | text | no | Normalized non-PII processing error code. |
+| `created_at` | timestamptz | yes | DB-managed creation timestamp. |
+| `updated_at` | timestamptz | yes | DB-managed update timestamp. |
+
+No raw notification payload, `securityToken`, `customerInfo`, warnings, `additionalData`, card data, or provider response body may be stored.
+
+### `customer_marketing_consents`
+
+One row per Dotypos customer with a marketing-consent history state. There is no local customer foreign key because Dotypos owns customer identity.
+
+| Column | Type | Required | Purpose |
+| --- | --- | --- | --- |
+| `dotypos_customer_id` | text | yes | Primary key identifying the consenting Dotypos customer. |
+| `document_hash` | text | yes | Hash of the marketing communication document that was accepted. |
+| `locale` | text | yes | Locale of the accepted document. |
+| `granted_at` | timestamptz | yes | Server timestamp for the current grant. |
+| `withdrawn_at` | timestamptz | no | Withdrawal timestamp. Null means the consent is active. |
+
+Granting consent inserts a missing row, leaves an already-active row unchanged, and reactivates a withdrawn row with the newly submitted evidence. An unchecked reservation form never withdraws consent. No historical backfill is required.
+
+### `legal_evidence_events`
+
+Append-only reservation terms acceptance evidence written when the customer submits payment. Customer marketing consent does not belong in this table.
+
+| Column | Type | Required | Purpose |
+| --- | --- | --- | --- |
+| `id` | text | yes | Local legal evidence event ID. |
+| `workspace_reservation_id` | text | no | Associated workflow row when known. |
+| `document_key` | text | yes | Stable internal document key. |
+| `document_path` | text | yes | Path of accepted document version. |
+| `document_hash` | text | yes | SHA-256 hash of accepted/rejected document. |
+| `hash_algorithm` | text enum | yes | Initial value: `sha256`. |
+| `accepted` | boolean | yes | Whether the customer accepted this document. Current payment writes are accepted terms and operating rules. |
+| `accepted_at` | timestamptz | yes | Server timestamp for the acceptance decision. |
+| `locale` | text | yes | Locale of the legal document shown. |
+| `source` | text | yes | Normalized source. Current checkout writes use `payment_submit`. |
+| `created_at` | timestamptz | yes | DB-managed creation timestamp. |
+
+Indexes and constraints:
+
+- Primary key on `id`.
+- Index on `workspace_reservation_id`.
+- `hash_algorithm = 'sha256'`.
+- No rendered document bodies or PII-bearing consent payloads.
+
+## Lifecycle Enums
+
+### Reservation State
+
+- `draft`: local workflow exists before Dotypos hold creation is claimed.
+- `creating_hold`: a worker has claimed Dotypos reservation hold creation.
+- `held`: Dotypos has a `NEW` hold and local payment may proceed.
+- `hold_expired`: local policy observed the hold deadline before payment completed.
+- `confirming`: payment is verified paid and a worker is confirming/finalizing the Dotypos reservation.
+- `confirmed`: Dotypos reservation is confirmed/final for the paid booking.
+- `cancelling`: a worker is cancelling a Dotypos hold.
+- `cancelled`: Dotypos hold was cancelled or Dotypos already reports it as cancelled.
+- `cancellation_failed`: cancellation failed and needs retry/manual recovery.
+
+Allowed reservation transitions:
+
+- `draft -> creating_hold -> held`
+- `creating_hold -> cancellation_failed` when the hold is created in Dotypos but local attach/cancel recovery fails.
+- `creating_hold -> draft` only when Dotypos hold creation failed before any Dotypos reservation ID existed.
+- `held -> confirming -> confirmed` after verified paid payment.
+- `held -> hold_expired -> cancelling -> cancelled` for unpaid expired holds.
+- `held -> cancelling -> cancelled` for unsuccessful terminal payment before hold expiry.
+- `cancelling -> cancellation_failed`
+- `cancellation_failed -> cancelling -> cancelled`
+- `confirmed -> cancelling -> cancelled` through the explicit operator workflow, preserving paid and fulfillment facts while marking paid Nexi attempts as requiring a refund without issuing it.
+
+Forbidden reservation transitions:
+
+- Any transition from `cancelled`, or from `confirmed` outside the explicit guarded operator cancellation workflow.
+- Any creation of a second Dotypos reservation for the same `checkout_attempt_key`.
+- Any creation of a replacement Dotypos reservation in the same checkout session before the prior local and Dotypos reservations are cancelled.
+- Any cleanup cancellation finalization unless the row is still in `cancelling`, unpaid, and unconfirmed. Operator cancellation has separate claim and finalization guards, refuses while fulfillment is `processing` or `awaiting_delivery`, and requires explicit provider-removal confirmation before atomically retiring a live or ambiguous AlgoPIN.
+
+### Payment State
+
+Aggregate `workspace_reservations.payment_state` values:
+
+- `not_started`: no active payment attempt exists.
+- `pending`: a Nexi attempt is awaiting a terminal result.
+- `paid`: Nexi verification or an atomic zero-total internal completion confirmed successful payment.
+- `failed`: Nexi verification returned payment failure.
+- `cancelled`: Nexi/customer cancelled payment.
+- `expired`: Nexi/session/hold expiry ended the payment workflow.
+
+Attempt-level `payment_attempts.state` values:
+
+- `created`: local attempt exists before HPP session details are attached.
+- `pending`: customer can be redirected to Nexi or Nexi is processing.
+- `paid`: verified terminal successful attempt.
+- `failed`: verified terminal failed attempt.
+- `cancelled`: verified terminal cancellation.
+- `expired`: verified terminal expiry or local attempt expiry.
+
+Attempt-level `payment_attempts.refund_state` remains separate from settlement state:
+
+- `not_required`: no operator refund work is pending.
+- `required`: the paid Nexi attempt needs operator refund work, whether caused by an operator cancellation or an unrecoverable late payment; the payment remains truthfully `paid`.
+- `refunded`: Nexi reports at least one successful refund on the paid attempt's order. `refunded_amount_value` and `refunded_at` record the refund total and time; a partial refund still clears the refund work, and administration shows the partial amount. The attempt state stays `paid`.
+
+Refund reconciliation reads `GET /orders/{orderId}` and counts `REFUND` operations whose result is `EXECUTED`, `REFUNDED`, or `VOIDED`. A back-office refund made before settlement is confirmed to appear as `REFUND` with `VOIDED`. Declined, denied, failed, and cancelled refunds are excluded, and so are pending or unrecognized results, because they are not final; the next notification or batch picks up the final result. `verifyPaymentOutcome` never treats a refund operation as a failed payment, so a refunded paid order cannot reach the failure, terminal, or late-payment recovery paths. Reconciliation runs when Nexi sends a refund notification for the order and in the daily `/api/cron/workspace/payment-refunds` batch of 25 `required` attempts. The batch claims attempts by `refund_checked_at`, never-checked first and then least recently checked, and stamps each claim whatever the outcome (refund found, no refund, or provider failure), so attempts whose refund stays outstanding rotate behind newer ones instead of starving them. Concurrent batches skip each other's claimed rows. Recording is monotonic: a smaller or equal total is `unchanged`, and an attempt that is not a paid Nexi attempt is `not_applicable`. A refund recorded on a `not_required` paid attempt is kept, so a direct back-office refund of a fulfilled booking is still visible. Late-payment settlement into a refund outcome preserves an existing `refunded` state instead of reopening it.
+
+Use `payment_attempts.refund_state` as the single refund-work source of truth. Source-specific recovery rows may retain the reason and workflow outcome, but any transition to their refund-required outcome must mark the same payment attempt `required` atomically rather than create a competing refund queue.
+
+Allowed payment transitions:
+
+- Reservation aggregate: `not_started -> pending -> paid`.
+- Reservation aggregate: `not_started -> pending -> failed|cancelled|expired`.
+- Zero-total reservation aggregate: `not_started|failed|cancelled|expired -> paid` atomically with insertion of an already-paid internal attempt.
+- Attempt: `created -> pending -> paid|failed|cancelled|expired`.
+- Internal attempt: inserted directly as `paid`; no later provider or terminal transition applies.
+- Terminal aggregate updates require the active payment attempt ID and only apply while the aggregate state is still `pending` on a held reservation.
+- Normal attempt terminal updates only apply from non-terminal attempt states, and normal `paid` transition applies from `pending`. The late-payment recovery transaction is the sole exception: it may promote its matching failed, cancelled, or expired active attempt to `paid` while atomically recovering the reservation or recording the refund/review outcome.
+- Webhook terminal updates must update the attempt row and reservation aggregate in one database transaction. Provider retries may reapply a matching terminal attempt/reservation pair as an idempotent no-op, but must not mark one side terminal when the other side fails its guard.
+- A verified unsuccessful notification whose terminal transition fails its lifecycle guard (the attempt was already expired locally or is no longer the active attempt) is accepted and marked processed without changing state, matching status reconciliation. Keep the paid transition's guard failure retryable: it can be a transient race that a later delivery routes to late-payment recovery.
+- Discount application persistence and code-claim admission belong to the payment-attempt creation transaction. Claim redemption belongs to the paid transaction, and claim release belongs to every failed, cancelled, or expired transaction. Any application, claim, redemption, or release error is fatal and rolls back the owning payment transition; it must never be converted to an empty discount result or `not_pending` state.
+- Failed/cancelled/expired workflows may create a new `payment_attempts` row only when the reservation is still `held` and hold deadline is valid.
+- `paid` is terminal for payment state.
+- The current Nexi card HPP contract has no documented provider expiry. Queued hold cleanup applies a local abandonment cutoff 30 minutes after `provider_order_created_at`. Before the cutoff, an operation-free order is deferred through the existing queue retry window. At or after the cutoff, only a freshly verified order with no operations and no authorized or captured amount may transition to local `expired`; any operation or non-zero amount remains pending.
+- A verified successful webhook for an already-failed, cancelled, or expired local attempt starts a durable late-payment recovery instead of directly fulfilling the released reservation. A checkout status refresh whose pending finalization returns `not_pending` verifies the active terminal Nexi attempt and starts the same recovery without a webhook event (`late_payment_recoveries.webhook_event_id` is null). Recovery start locks the payment attempt before looking for an existing recovery, so concurrent webhook and verification paths share one row. Settlement keeps the attempt's previous `last_webhook_event_id` when the recovery has none.
+- Recovery reuses the original Dotypos hold only when the local row is still `held`, its `reservation_hold_expires_at` is more than `reusableHoldMinimumRemaining` (one minute) away, no newer checkout reservation exists, and Dotypos reports `NEW` or `CONFIRMED`. The settlement transaction rechecks the deadline under the reservation row lock; once it has passed, the settlement rejects reuse with `OriginalHoldNotReusableError` and the same run continues through release and recreation instead of waiting for the claim timeout. Availability and table assignment treat an unpaid `held` row past its deadline as free inventory (`selectExpiredHoldDotyposReservationIds`), so a Dotypos `NEW` status alone never proves the slot is still ours.
+- Any other late payment first releases the original hold: `held`, `hold_expired`, `cancellation_failed`, or a `cancelling` row untouched for ten minutes is claimed, the Dotypos hold is cancelled unless already `CANCELLED`, and the row is marked `cancelled`. A Dotypos `CONFIRMED` or unknown status requires review instead of cancellation. A failed Dotypos cancellation records `cancellation_failed` and leaves the recovery retryable; a fresh `cancelling` claim owned by cleanup is waited on.
+- After release, recovery runs the normal reservation creation for the immutable accepted reservation and price from the accounting snapshot: the ended check, `ensureAvailable`, table assignment, and a new `CONFIRMED` Dotypos reservation marked with the order reference. A replacement found by that marker from an interrupted earlier run is reused because it already passed the check. A recovered reservation transitions atomically to paid, re-redeems its released discount-code claim under the same total and per-customer use limits as admission, and continues normal fulfillment exactly like an on-time payment.
+- Recovery requires a refund only when the reservation cannot be provided: no capacity (`WorkspaceTableUnavailableError`) or no free table (`TableAssignmentUnavailableError`), an ended interval, a missing snapshot, a newer checkout reservation, a superseded attempt, an operator force-cancellation, or an unredeemable discount claim. Release the original hold before settling a refund on the active attempt, because a paid row is never selected by hold cleanup and would otherwise occupy the slot. Ambiguous provider state requires operator review.
+- The customer status derives from the reservation's latest late-payment recovery: `pending` or `processing` shows `late_payment_checking` and keeps refreshing, `refund_required` shows `late_payment_refund`, `review_required` shows `late_payment_review` with the same prefilled support-request link as `fulfillment_failed` (no automatic customer notification exists), and `recovered` falls through to the normal paid states. A refund owed on a superseded attempt does not override a reservation that its active attempt paid. Late-payment states never show the original hold's table or map.
+- An explicit operator force-cancellation marks the active pending attempt cancelled and releases its claim before cancelling the reservation. Its stable failure reason prevents late-payment recovery from recreating the booking; a later verified settlement requires a refund.
+
+### Fulfillment State
+
+- `not_started`: no post-payment confirmation/delivery work has completed.
+- `processing`: paid workflow is claimed by a fulfillment worker.
+- `awaiting_delivery`: production recorded the accepted customer send's active non-PII provider delivery ID and is waiting for the matching delivery webhook.
+- `fulfilled`: Dotypos reservation confirmation and required customer-confirmation/internal notifications are complete.
+- `failed`: payment succeeded but fulfillment needs retry or manual recovery.
+
+Allowed fulfillment transitions:
+
+- `not_started -> processing -> fulfilled`
+- `not_started -> processing -> failed`
+- `failed -> processing -> fulfilled`
+- `processing -> awaiting_delivery -> fulfilled`
+- `processing -> failed`
+- `awaiting_delivery -> failed`
+- `fulfilled -> failed` only when a matching failure or bounce webhook is strictly newer than `fulfilled_at`.
+- `failed -> fulfilled` only when the failure code is `fulfillment_email_failed` and a matching delivered webhook is strictly newer than `fulfillment_failed_at`.
+
+Fulfillment is allowed only when `payment_state = 'paid'`.
+
+When the production email provider accepts the required customer send, the
+fulfillment worker records its active non-PII provider delivery ID and moves
+`processing -> awaiting_delivery`. Stale `processing` recovery may reclaim an
+abandoned claim after one minute but never reclaims `awaiting_delivery`. A
+delivery webhook may change state only when its provider email ID matches the
+recorded active delivery ID and its provider event time is strictly newer than
+the timestamp guarding the current outcome: `fulfilled_at` when `fulfilled`,
+`fulfillment_failed_at` when `failed`; equal or older events are no-ops. A
+matching delivered event completes `awaiting_delivery` or repairs only `failed`
+with failure code `fulfillment_email_failed`; a strictly newer failure or
+bounce event fails `awaiting_delivery` and may also downgrade `fulfilled ->
+failed` so an undelivered confirmation surfaces for recovery. Outside production,
+fulfillment reaches `fulfilled` when the configured email provider accepts the
+required customer send; the internal notification remains best effort.
+Protected Preview deployments cannot receive provider callbacks reliably.
+
+Retrying a delivery failure preserves the stored delivery ID while fulfillment
+is reclaimed into `processing`; the ID is the recovery generation marker, not
+an awaited send. A recovery send derives an explicit customer idempotency key
+from that stored prior provider ID, so the provider cannot replay the bounced
+send under the original reservation-and-category key. The key stays stable
+when the recovery send itself fails and is retried, because the prior delivery
+ID is still stored, and each newly accepted send atomically replaces the
+stored ID, starting a new generation whose own later failure derives another
+distinct key. Initial sends with no prior provider ID keep the deterministic
+reservation-and-category idempotency key.
+
+The customer confirmation contains a protected reservation-access link and
+never contains the door PIN. The dedicated access page resolves the current PIN
+on every authorized request and returns it while the reservation is paid,
+locally confirmed, and live-confirmed in Dotypos. Do not apply a local clock or
+disclosure window. Igloohome's programmed AlgoPIN bounds are the sole authority
+for when the lock accepts the PIN. The signed access capability is bound to the
+reservation and locale, not to a copied reservation interval; live Dotypos
+timing remains authoritative when a confirmed reservation is moved or extended.
+Keep this boundary stateless; it does not require a new database field. Sign
+access capabilities with their dedicated long-lived token secret rather than
+the rotated checkout Pay-state keyring or provider credentials. Retain that
+secret for at least the maximum future reservation lifetime so an emailed
+access link remains valid until its reservation.
+
+### Reservation access issuance
+
+Paid fulfillment provisions an hourly Igloohome algoPIN before sending the
+protected access link. Authorized access-page requests reuse that credential. For
+the installed Retrofit Lock (OE1) linked to a Keypad (EK1),
+`IGLOOHOME_ALGOPIN_TARGET_DEVICE_ID` must be the EK1 device ID; Igloohome
+designates EK1 as the algoPIN-generation target.
+
+The `reservation_access_grants` ledger has one row per Workspace reservation and
+uses `pending`, `provisioning`, `issued`, `expired`, `failed`, and `uncertain`
+states. The
+issued PIN is stored as non-PII retry state. Never annotate, log, or return it
+except in the authorized access response; mark it as a sensitive database query
+parameter so SQL diagnostics cannot expose it. Retain it so the protected page
+can redisplay it; do not expire or delete it according to the application clock.
+
+If a Dotypos timing change produces a different rounded provider interval after
+a PIN is issued, atomically reset the known issued grant and issue a replacement
+for the new interval. Changes within the same rounded interval reuse the
+existing PIN. The old PIN remains governed by its original Igloohome bounds;
+do not turn a known schedule move into ambiguous-provider reconciliation.
+
+Provider 400, 401, 403, 404, and 415 responses are definitive rejections and
+may leave a retryable `failed` grant. Timeouts, transport failures, 5xx,
+undocumented statuses, malformed successes, and failures persisting a successful
+response are ambiguous. Record those as `uncertain` and require reconciliation;
+never automatically issue a second credential. Igloohome does not document an
+idempotency key or retrieval by `accessName`.
+
+Operator recovery exposes grant metadata but never the PIN. A `failed` grant
+may be retried through the normal issuance and fulfillment services. For an
+`uncertain` grant, require the operator to use the Igloohome app over Bluetooth
+at the lock, find `Deskohub <reservation-id>`, remove it or verify it is absent,
+and explicitly confirm that cleanup. Only then conditionally reset the uncertain
+grant and retry. If cleanup cannot be confirmed, wait for the possible
+credential to expire.
+
+A `provisioning` claim older than one minute has the same ambiguous-provider
+risk and uses the same confirmed cleanup workflow. A fresh claim remains
+in-progress and cannot be recovered yet.
+
+Floor the reservation start to the containing Prague hour and ceil its end to
+the containing or next Prague hour. The provider interval must start in the
+current or a future hour and span 1–672 elapsed hours. When a still-active
+reservation is first provisioned after its rounded start, use the current
+Prague hour through the rounded end. Persist the rounded scheduled start
+separately from that later provider start so subsequent live timing can be
+compared with the credential's original target. Preview uses a fixture
+credential and may never call live Igloohome; Production requires live mode.
+
+## Checkout Session And Attempt HMACs
+
+`checkoutSessionId` groups the reservation rows created while a customer moves back and forth between Reservation and Pay. It remains stable when the customer returns to the form and deliberately submits again. `checkoutAttemptId` identifies one mounted-form submission and its immediate transport retry; a changed reservation value or a new form mount creates a new attempt. Marketing consent is customer-scoped and is deliberately excluded from the reservation attempt HMAC.
+
+Only HMAC digests are stored in `workspace_reservations.checkout_session_key` and `workspace_reservations.checkout_attempt_key`, in one of two formats: the ring-keyed hex digest keyed by the whole `CHECKOUT_PAY_STATE_KEYS` string, or the key-ID-prefixed `<kid>:<hex digest>` keyed by that key's lookup subkey. Newly derived keys use the key-ID-prefixed format. A row added to an existing session reuses that session's stored session key, so a resubmitted session first created by an earlier deployment keeps its ring-keyed session key alongside a prefixed attempt key (see Key rotation). The opaque browser IDs are carried only in signed checkout state and action input. Both key payloads use `JSON.stringify` on a fixed object shape; do not sort keys or build a delimiter-joined tuple.
+
+```ts
+const checkoutSessionKey = hmac({
+  checkoutSessionId,
+});
+
+const checkoutAttemptKey = hmac({
+  checkoutSessionId,
+  checkoutAttemptId,
+  reservation: normalizedReservation,
+});
+```
+
+The normalized reservation is included so a replayed opaque attempt ID with changed values cannot reuse a hold created for different facts; its PII exists only in the transient HMAC payload. An exact attempt-key match makes an immediate retry idempotent. A new attempt in the same session does not mutate or reuse the existing Dotypos reservation: the server claims the previous unpaid hold for cancellation, verifies its live Dotypos status, cancels it when `NEW`, marks its local row cancelled, and creates a fresh local and Dotypos reservation. If the previous row has pending/paid payment, is no longer pending in Dotypos, or its Dotypos cancellation fails, the server leaves that row to its normal lifecycle and rotates to a fresh checkout session before creating the new reservation. Every created row keeps its original cleanup deadline and scheduled cleanup job.
+
+### Key rotation
+
+Lookup keys must survive `CHECKOUT_PAY_STATE_KEYS` rotation without a separate secret. Each configured key derives a lookup subkey through HKDF-SHA256 (info `deskohub-workspace/checkout-lookup-key`), so lookup HMACs never reuse the raw Pay-state encryption key. Attempt and session lookups accept the key-ID-prefixed derivation of every configured key and the ring-keyed derivation of the configured key-ring string. New attempts and brand-new sessions store the active (first) key's prefixed digest, selected by `storedLookupKeyFormat = "key-id-prefixed"` in `checkout-lookup-keys.server.ts`. Never compare or look up a single freshly derived key.
+
+Every row of one checkout session stores the same session key. Before creating a row, resolve the key stored by the session's latest row under any accepted derivation and reuse it; derive with the active key only for a brand-new session. Supersession, the one-current-row unique index, and late-payment recovery's newer-reservation check compare stored session keys, so mixing derivations inside a session would split it.
+
+Unique indexes cover only the stored strings, so they cannot stop two workers with different active keys or stored formats from both inserting a session's first row. Draft creation therefore runs in one transaction behind `pg_advisory_xact_lock` on a rotation-independent lock key: the first eight bytes of a domain-separated SHA-256 of the raw checkout session ID, which keeps the raw ID out of query parameters. Inside the lock it looks up the attempt and the session under every accepted derivation and inserts only when neither exists. Supersession is already serialized by its cancellation claim and inserts its replacement under the claimed row's stored session key.
+
+Workers before keyed lookup keys store only the ring-keyed digest, look up only that exact digest, and take no draft-creation lock. During a deployment overlap they would miss a prefixed row and insert a duplicate draft and Dotypos hold. The stored format therefore switches in separate, complete deployments, without changing `CHECKOUT_PAY_STATE_KEYS` until the last step. The code implements step 2:
+
+1. Accept: deploy lookups that accept both formats and the draft-creation lock, while new rows still store the ring-keyed digest (`storedLookupKeyFormat = "ring-keyed"`). Rows from either version share one digest per session and attempt, so the unique indexes deduplicate across versions.
+2. Write prefixed: once no worker before keyed lookup keys serves traffic, set `storedLookupKeyFormat = "key-id-prefixed"`. Workers from step 1 accept the prefixed format and take the same lock.
+3. Rotate: only after step 2 is the only deployment serving traffic and ring-keyed rows have ended (no unprefixed `checkout_session_key` or `checkout_attempt_key` on a `held` row or a row with `pending` payment, checked with a read-only query). The ring-keyed derivation matches only while the key-ring string is unchanged. Remove it from lookups once no such row remains.
+
+`CHECKOUT_PAY_STATE_KEYS` is an ordered `kid:base64url-32-byte-key` list. Only the first entry is active: it seals new Pay-state tokens and derives new lookup keys. Every entry opens tokens sealed with its key ID and is accepted for lookups. Rotate in phases, each a complete deployment, so no worker ever meets a token or lookup key derived with a key it lacks:
+
+1. Stage: append the new entry after the current active entry. Every worker can now open its tokens and find its lookup keys, but none uses it yet.
+2. Activate: once the staged configuration is the only one serving traffic, move the new entry first. While both orders serve traffic, the draft-creation lock and all-key lookups keep each session to one row.
+3. Retire: remove the old entry only after no in-flight session still stores keys prefixed with its ID, checked with a read-only query on `checkout_session_key` prefixes for rows that are `held` or have `pending` payment. Pay-state tokens sealed with that key stop opening once it is retired, so also wait at least the Pay-state token lifetime after activation.
+
+Never prepend a new key in a single step: a worker still on the old configuration could neither open the new tokens nor find the new lookup keys.
+
+Production stores `CHECKOUT_PAY_STATE_KEYS` as a Vercel sensitive variable. Neither `vercel env pull` nor the dashboard returns its value, but every phase rewrites the whole list. Before staging, confirm the developer can supply the current entries, and keep each new entry retrievable until it has been retired. If the current value cannot be recovered, the only option is a one-step replace: set a single new entry, then redeploy production. That breaks every Pay page opened before the deploy finishes. Their Pay-state tokens stop opening and their stored lookup keys stop matching, so do it at a quiet time and only after the step 3 rotation check passes. Held rows whose lookup keys no longer match still reach hold cleanup, which works from reservation IDs. The 2026-10-10 rotation took this path because the earlier value was unreadable, and it left the single active key ID `k20261010`.
+
+## Sequence Diagrams
+
+### Reservation Submit And Hold
+
+```mermaid
+sequenceDiagram
+  actor Customer
+  participant App as Workspace Server Action
+  participant DB as Local DB
+  participant Dotypos
+
+  Customer->>App: Submit reservation/contact form with optional marketing consent
+  App->>App: Open anonymous advertised-price snapshot
+  App->>App: Validate reservation input
+  App->>App: Affirm only its advertised anonymous automatic discounts
+  App->>App: Derive checkout session and attempt HMACs
+  App->>Dotypos: Find or create customer using PII
+  Dotypos-->>App: dotyposCustomerId
+  opt marketing checkbox checked
+    App->>DB: Grant customer_marketing_consents
+  end
+  App->>App: Evaluate customer discount for the first signed summary
+  alt same attempt is already held
+    App->>DB: Reuse exact attempt row
+  else session has an earlier unpaid hold
+    App->>DB: Claim earlier row for cancellation
+    App->>Dotypos: Cancel earlier NEW reservation
+    App->>DB: Mark earlier row cancelled and insert replacement draft
+  else no current row in session
+    App->>DB: Insert workspace_reservations(draft, not_started, not_started)
+  end
+  App->>DB: Claim reservation_state=creating_hold
+  App->>Dotypos: Create NEW reservation hold
+  Dotypos-->>App: dotyposReservationId
+  App->>DB: Set reservation_state=held and hold deadline
+  alt advertised price still matches
+    App-->>Customer: Show signed order summary, which may first add the customer discount
+  else advertised discount unavailable
+    App-->>Customer: Show refreshed signed summary with pricing_changed affected product keys; customer discount may still first appear
+  end
+```
+
+### Independent Discount Code Form
+
+```mermaid
+sequenceDiagram
+  actor Customer
+  participant Summary as Order Summary
+  participant App as Workspace Server Action
+
+  Customer->>Summary: Submit discount-code form
+  Summary->>App: Current signed summary + submitted code
+  App->>App: Affirm every displayed discount
+  alt displayed price changed
+    App-->>Summary: pricing_changed + refreshed signed summary
+  else code unavailable
+    App-->>Summary: Field error; retain current signed summary
+  else code accepted
+    App-->>Summary: New signed summary containing code discount
+  end
+```
+
+### Payment Attempt And Completion
+
+```mermaid
+sequenceDiagram
+  actor Customer
+  participant App as Workspace Server Action
+  participant DB as Local DB
+  participant Nexi
+
+  Customer->>App: Request payment for held workflow
+  App->>DB: Load held workspace_reservations row
+  App->>App: Freshly affirm exactly the signed-summary discounts and total
+  alt fingerprint, total, or claim admission changed
+    App-->>Customer: pricing_changed + refreshed signed summary; no payment session
+  else positive signed price affirmed
+    App->>DB: In one transaction create/link attempt, persist discount applications, and reserve code claim
+    App->>Nexi: POST /orders/hpp with the exact signed-summary amount
+    Nexi-->>App: hostedPage and securityToken
+    App->>DB: Store securityToken, redirect URL, attempt pending
+    App-->>Customer: Return hostedPage and pending reservation status
+    App-->>Customer: Open hostedPage in a new tab; navigate the original tab to pending reservation status
+  else exactly zero signed price affirmed
+    App->>DB: In one transaction insert paid internal attempt, mark reservation paid, persist applications, and admit/redeem code claim
+    App->>App: Invoke idempotent paid fulfillment
+    App-->>Customer: Redirect to local successful checkout status
+  end
+```
+
+The customer's single Order and pay activation starts checkout. Only after the
+action returns a hosted provider session does the Pay page open its hosted page
+in a new tab while browser activation remains, mark the original tab as owner in
+tab-local session storage, and navigate the original tab to status. If the
+browser blocks the new tab or activation expires, checkout navigates the current
+tab to the provider instead. It must not pre-open a placeholder before the
+hosted-provider result. No intermediate summary or second payment activation is
+rendered. The owner holds an
+exclusive browser lock scoped to the status path and preempts a returned payment
+tab that wins the hydration race. An unmarked returned tab closes when the lock
+is unavailable or preempted; if the original tab is closed, it keeps the lock
+and remains open.
+
+The hosted-provider return endpoint is a navigation-only redirect to the
+canonical status page. Provider returns may lack browser authorization cookies;
+keep authorization, provider verification, and reconciliation on the status
+page so a cookie-less return can still reach the tab coordinator. The return
+endpoint exposes no reservation data and grants no access.
+
+Starting a new reservation from terminal status or invalid Pay state uses a
+document navigation. Cache Components may retain the previous reservation form
+and its completed action result in an inactive route tree; restoring that tree
+through client navigation could replay the old Pay redirect instead of starting
+a fresh checkout session.
+
+A definitive Nexi HPP rejection atomically marks the attempt failed and releases
+its reserved code claim. A network, retryable provider, conflict, rate-limit, or
+otherwise ambiguous creation/attachment failure retains the created attempt and
+reserved claim. That active attempt blocks a second charge while webhook,
+return/status reconciliation, and hold cleanup determine the terminal outcome.
+
+Nexi documents no idempotency key for `POST /orders/hpp` (only for refunds and
+some other operations), and `GET /orders/{orderId}` returns no hosted page. A
+timeout, transport failure, or 5xx after creation may therefore follow a
+committed order whose session can never be recovered. Never resend hosted page
+creation automatically. An attempt still `created` with no security token never
+showed its hosted page to the customer, so it cannot be paid. Queued hold
+cleanup resolves it after the 30-minute abandonment window, measured from the
+attempt's creation: it looks up the order, and when Nexi returns 404 or an
+order with no operations and no authorized or captured amount, it fails the
+attempt with `nexi_hpp_create_unconfirmed` only while it is still `created`,
+releasing its claim before cancelling the hold. Payment activity on such an
+order needs operator review; an inconclusive lookup is retried later.
+
+### Webhook Success And Dotypos Confirmation
+
+```mermaid
+sequenceDiagram
+  participant Nexi
+  participant Webhook as Webhook Route
+  participant DB as Local DB
+  participant Dotypos
+  participant Fulfillment
+
+  Nexi->>Webhook: Official notification envelope
+  Webhook->>Webhook: Decode envelope; derive event identity
+  Webhook->>DB: Insert webhook_events(received) or load duplicate state
+  alt duplicate processed
+    Webhook-->>Nexi: No-op success
+  else duplicate failed/received or fresh event
+  Webhook->>DB: Claim retry only if webhook_events is not processed
+  Webhook->>DB: Load payment attempt by provider_order_id
+  Webhook->>Webhook: Constant-time compare a present securityToken; reject a mismatch
+  Webhook->>Nexi: GET /orders/{provider_order_id}
+  Nexi-->>Webhook: Verified payment result
+  Webhook->>DB: In one transaction mark attempt/reservation paid and redeem reserved discount claim
+  Webhook->>DB: Claim fulfillment_state=processing and reservation_state=confirming
+  Fulfillment->>Dotypos: Confirm/finalize reservation using dotyposReservationId
+  Dotypos-->>Fulfillment: Confirmation success
+  Fulfillment->>DB: reservation_state=confirmed; record provider delivery ID; fulfillment_state=awaiting_delivery
+  note over Fulfillment,DB: A matching email.delivered webhook later marks fulfillment_state=fulfilled
+  Webhook->>DB: webhook_events processed
+  end
+```
+
+Nexi marks the notification `securityToken` optional. Do not reject a
+notification merely because it has none: it is never trusted, and only the
+authoritative `GET /orders/{orderId}` verification may move payment state.
+Compare a present token in constant time and reject a mismatch, including any
+token for an attempt that was never issued one.
+
+### Nexi Failure, Cancel, Or Expired Return
+
+```mermaid
+sequenceDiagram
+  actor Customer
+  participant Return as Return/Status Route
+  participant DB as Local DB
+  participant Nexi
+  participant Cleanup as Hold Cleanup
+  participant Dotypos
+
+  Customer->>Return: Return from Nexi failure/cancel/expiry
+  Return->>DB: Load active payment attempt
+  Return->>Nexi: Verify provider_order_id when needed
+  Nexi-->>Return: Terminal unsuccessful or pending result
+  Return->>DB: In one transaction mark attempt/reservation terminal and release reserved discount claim
+  Return->>Cleanup: Request unpaid hold cancellation
+  Cleanup->>DB: Claim reservation_state=cancelling
+  Cleanup->>Dotypos: Cancel Dotypos reservation hold
+  Dotypos-->>Cleanup: Cancelled or already cancelled
+  Cleanup->>DB: reservation_state=cancelled
+  Return-->>Customer: Show safe non-PII status
+```
+
+### Expired Hold Cleanup And Cancellation Retry
+
+```mermaid
+sequenceDiagram
+  participant Job as Cleanup Job
+  participant DB as Local DB
+  participant Dotypos
+
+  Job->>DB: Select held unpaid rows past reservation_hold_expires_at
+  Job->>DB: Mark reservation_state=hold_expired then cancelling
+  Job->>Dotypos: Cancel Dotypos reservation hold
+  alt cancellation succeeds or already cancelled
+    Dotypos-->>Job: OK
+    Job->>DB: reservation_state=cancelled, reservation_cancelled_at
+  else cancellation fails
+    Dotypos-->>Job: Provider/client error
+    Job->>DB: reservation_state=cancellation_failed
+  end
+  Job->>DB: Later retry selects cancellation_failed rows
+```
+
+## Recovery Rules
+
+| Scenario | Query shape | Recovery action |
+| --- | --- | --- |
+| Held reservation without payment | `reservation_state = 'held' and payment_state = 'not_started'` | Allow payment attempt until hold expires. |
+| Pending payment | `payment_state = 'pending'` plus active attempt | Wait for webhook, verify with Nexi, or show pending status. |
+| Paid but not fulfilled | `payment_state = 'paid' and fulfillment_state in ('not_started', 'failed')` | Run fulfillment worker. |
+| Fulfillment stuck | `payment_state = 'paid' and fulfillment_state = 'processing'` | Inspect staleness; retry only through guarded repair path. |
+| Awaiting customer email delivery | `payment_state = 'paid' and fulfillment_state = 'awaiting_delivery'` | Wait for the matching provider delivery webhook; never reclaim or resend. |
+| Expired unpaid hold | `reservation_state = 'held' and payment_state <> 'paid' and reservation_hold_expires_at <= now()` | Cancel Dotypos hold. |
+| Cancellation failed | `reservation_state = 'cancellation_failed'` | Retry Dotypos cancellation. |
+| Late payment | `late_payment_recoveries.state in ('pending', 'processing')` | Queue recovery: reuse a current hold, otherwise release it and run normal reservation creation. |
+| Refund work | `payment_attempts.refund_state = 'required'` | Surface in the Admin UI refund banner and `needs_refund` filter; operators refund in the Nexi back office, and the Nexi refund notification or the daily payment-refunds cron records the refund. |
+| Duplicate webhook | Existing `webhook_events.event_id` | Return duplicate/accepted response without reapplying side effects. |
+
+## Live Test Safety Checklist
+
+- Confirm the database branch is development/preview, not production, before schema reset or test checkout.
+- Confirm migrations do not create `checkout_return_state_tokens`.
+- Confirm `workspace_reservations`, `payment_attempts`, `webhook_events`, `legal_evidence_events`, and `customer_marketing_consents` have no PII-capable columns or raw payload columns.
+- Confirm checkout session/attempt key derivation stores key-ID-prefixed HMAC digests for every new attempt and new session, reuses an existing session's stored session key in either format, and uses `JSON.stringify` on fixed object payloads.
+- Confirm Dotypos test customer lookup/create is the only persistence destination for customer name, email, and phone.
+- Confirm Dotypos reservation is created as a hold before payment only for the approved hold workflow, and Dotypos remains the source of reservation facts.
+- Confirm Nexi `securityToken` is stored only on `payment_attempts` and is not copied to webhook events.
+- Confirm internal attempts are exactly zero, already paid, and contain no Nexi identifiers, security token, redirect URL, webhook, operation, or provider-status fields.
+- Confirm webhook handling verifies through Nexi before marking payment paid or terminal unsuccessful.
+- Confirm fulfillment never reclaims `awaiting_delivery` and production completes only through the matching non-PII provider delivery webhook.
+- Confirm failure/cancel/expired payment paths cancel unpaid Dotypos holds or leave guarded local state for retry.
+- Confirm test data uses clearly fake customers and test payment instruments.
+- Confirm no production Dotypos or Nexi credentials are used for live tests unless an explicit production smoke test has been approved.
