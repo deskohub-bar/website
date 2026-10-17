@@ -1,0 +1,126 @@
+import {
+  type AudienceAttribute,
+  type AudienceAttributeDefinition,
+  audienceAttributeCatalogue,
+  type DatePeriodUnitType,
+} from "@deskohub/workspace-admin-api";
+import { Match } from "effect";
+import type {
+  AudienceCondition,
+  AudienceFilter,
+  AudienceFilterGroup,
+} from "../../audience-filter";
+import type { DatePeriod } from "../../date-period";
+
+export type { AudienceCondition, AudienceFilterGroup };
+
+/** The builder always edits a group, so a bare stored condition gets an AND root. */
+export const asRootGroup = (filter: AudienceFilter): AudienceFilterGroup =>
+  filter._tag === "Group"
+    ? filter
+    : { _tag: "Group", operator: "and", filters: [filter] };
+
+const lastThirtyDays: DatePeriod = { _tag: "Last", count: 30, unit: "day" };
+
+/** A condition with the entry's defaults. */
+export const newConditionFrom = ({
+  attribute,
+  defaults,
+}: AudienceAttributeDefinition) => ({
+  attribute,
+  _tag: "Condition" as const,
+  ...defaults,
+});
+
+/** Starting values for a condition an operator adds or switches to. */
+export const newCondition = (attribute: AudienceAttribute): AudienceCondition =>
+  // Each entry's defaults are typed against its own attribute's condition.
+  newConditionFrom(audienceAttributeCatalogue[attribute]) as AudienceCondition;
+
+/** An empty group nested in `parent`, which usually flips the parent's logic. */
+export const newNestedGroup = (
+  parent: AudienceFilterGroup
+): AudienceFilterGroup => ({
+  _tag: "Group",
+  operator: parent.operator === "and" ? "or" : "and",
+  filters: [],
+});
+
+export const appendFilter = (
+  group: AudienceFilterGroup,
+  filter: AudienceFilter
+): AudienceFilterGroup => ({ ...group, filters: [...group.filters, filter] });
+
+export const replaceFilterAt = (
+  group: AudienceFilterGroup,
+  index: number,
+  filter: AudienceFilter
+): AudienceFilterGroup => ({
+  ...group,
+  filters: group.filters.map((current, i) => (i === index ? filter : current)),
+});
+
+export const removeFilterAt = (
+  group: AudienceFilterGroup,
+  index: number
+): AudienceFilterGroup => ({
+  ...group,
+  filters: group.filters.filter((_, i) => i !== index),
+});
+
+/** Adds or removes one chosen value, keeping the original order. */
+export const toggleSetValue = <Value>(
+  selected: readonly Value[],
+  value: Value,
+  checked: boolean
+): readonly Value[] => {
+  const others = selected.filter((current) => current !== value);
+  return checked ? [...others, value] : others;
+};
+
+export type DatePeriodKind = DatePeriod["_tag"];
+
+/**
+ * The period after the operator switches its kind, keeping the dates and
+ * count it already had where the new kind uses them.
+ */
+export const switchDatePeriod = (
+  period: DatePeriod,
+  kind: DatePeriodKind,
+  today: string
+): DatePeriod => {
+  const dates = Match.value(period).pipe(
+    Match.tagsExhaustive({
+      AnyTime: () => ({ from: today, to: today }),
+      Last: () => ({ from: today, to: today }),
+      Range: ({ from, to }) => ({ from, to }),
+      Since: ({ date }) => ({ from: date, to: date }),
+      Onward: ({ date }) => ({ from: date, to: date }),
+      Until: ({ date }) => ({ from: date, to: date }),
+    })
+  );
+  return Match.value(kind).pipe(
+    Match.when("AnyTime", (): DatePeriod => ({ _tag: "AnyTime" })),
+    Match.when(
+      "Last",
+      (): DatePeriod => (period._tag === "Last" ? period : lastThirtyDays)
+    ),
+    Match.when(
+      "Range",
+      (): DatePeriod => ({ _tag: "Range", from: dates.from, to: dates.to })
+    ),
+    Match.when(
+      "Since",
+      (): DatePeriod => ({ _tag: "Since", date: dates.from })
+    ),
+    Match.when(
+      "Onward",
+      (): DatePeriod => ({ _tag: "Onward", date: dates.from })
+    ),
+    Match.when("Until", (): DatePeriod => ({ _tag: "Until", date: dates.to })),
+    Match.exhaustive
+  );
+};
+
+export const isDatePeriodUnit = (value: string): value is DatePeriodUnitType =>
+  value === "day" || value === "week" || value === "month" || value === "year";
