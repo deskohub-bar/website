@@ -1,0 +1,82 @@
+import type { DotyposTableId } from "@deskohub/dotypos";
+import { TableMap } from "@deskohub/dotypos/table-map";
+import type { CSSProperties } from "react";
+import { getWorkspaceRoomLayout } from "@/features/checkout/workspace-room-layouts";
+import type { WorkspaceTableMap } from "@/features/checkout/workspace-table-map";
+
+type WorkspaceTableMapViewProps = {
+  readonly ariaLabel: string;
+  readonly tableMap: WorkspaceTableMap;
+};
+
+const workspaceTableMapFontFamily = "Sculpin";
+const workspaceTableMapFontStack = `${workspaceTableMapFontFamily}, "Avenir Next", "Segoe UI", "Helvetica Neue", Arial, sans-serif`;
+const workspaceTableMapImageWidth = 720;
+const workspaceTableMapImageHeight = 540;
+
+const getRoomLayout = (roomName: string | undefined) => ({
+  ...getWorkspaceRoomLayout(roomName),
+  style: {
+    fill: "#ffffff",
+    fillOpacity: 0.72,
+    stroke: "#00024f",
+    strokeOpacity: 0.18,
+    strokeWidth: 3,
+  } satisfies CSSProperties,
+});
+
+const isAssignedTable = (
+  tableId: string | undefined,
+  assignedTableId: DotyposTableId
+) => tableId?.trim() === assignedTableId;
+
+const getTableAppearance = (
+  tableId: string | undefined,
+  assignedTableId: DotyposTableId
+): CSSProperties =>
+  isAssignedTable(tableId, assignedTableId)
+    ? {
+        fill: "#00024f",
+        stroke: "#00024f",
+        strokeWidth: 4,
+      }
+    : {
+        fill: "#ccf7ea",
+        stroke: "#00024f",
+        strokeOpacity: 0.25,
+        strokeWidth: 2,
+      };
+
+const getTableLabelStyle = (
+  tableId: string | undefined,
+  assignedTableId: DotyposTableId
+): CSSProperties => ({
+  fill: isAssignedTable(tableId, assignedTableId) ? "#ffffff" : "#00024f",
+  fontFamily: workspaceTableMapFontStack,
+  fontSize: 15,
+  fontWeight: 800,
+});
+
+export function WorkspaceTableMapView({
+  ariaLabel,
+  tableMap,
+}: WorkspaceTableMapViewProps) {
+  return (
+    <TableMap
+      ariaLabel={ariaLabel}
+      height={workspaceTableMapImageHeight}
+      roomLayout={getRoomLayout(tableMap.roomName)}
+      rotation={-90}
+      style={{ background: "#ffffff", fontFamily: workspaceTableMapFontStack }}
+      tableLabelInlineStyle={(table) =>
+        getTableLabelStyle(table.id, tableMap.assignedTableId)
+      }
+      tableShapeInlineStyle={(table) =>
+        getTableAppearance(table.id, tableMap.assignedTableId)
+      }
+      tableStyle={() => ""}
+      tables={tableMap.tables}
+      width={workspaceTableMapImageWidth}
+    />
+  );
+}

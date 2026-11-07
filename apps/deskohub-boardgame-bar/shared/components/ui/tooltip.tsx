@@ -1,0 +1,90 @@
+"use client";
+
+import * as TooltipPrimitive from "@radix-ui/react-tooltip";
+import { type ComponentProps, createContext, use, useState } from "react";
+import { cn } from "@/shared/utils/index";
+import { type TooltipTouchTap, useTooltipTouchTap } from "./tooltip-touch-tap";
+
+const TooltipTouchTapContext = createContext<TooltipTouchTap | null>(null);
+
+function TooltipProvider({
+  delayDuration = 200,
+  ...props
+}: ComponentProps<typeof TooltipPrimitive.Provider>) {
+  return <TooltipPrimitive.Provider delayDuration={delayDuration} {...props} />;
+}
+
+/**
+ * Radix opens a tooltip on the focus a touch tap emulates and closes it on the
+ * tap's click, so on touchscreens it only flashes. A touch tap on the trigger
+ * toggles the tooltip instead; outside taps, scrolling, and Escape dismiss it.
+ */
+function Tooltip({
+  defaultOpen = false,
+  onOpenChange,
+  open: openProp,
+  ...props
+}: ComponentProps<typeof TooltipPrimitive.Root>) {
+  const [uncontrolledOpen, setUncontrolledOpen] = useState(defaultOpen);
+  const open = openProp ?? uncontrolledOpen;
+  const setOpen = (nextOpen: boolean) => {
+    setUncontrolledOpen(nextOpen);
+    onOpenChange?.(nextOpen);
+  };
+  const { onRadixOpenChange, touchTap } = useTooltipTouchTap(open, setOpen);
+
+  return (
+    <TooltipTouchTapContext value={touchTap}>
+      <TooltipPrimitive.Root
+        {...props}
+        onOpenChange={onRadixOpenChange}
+        open={open}
+      />
+    </TooltipTouchTapContext>
+  );
+}
+
+function TooltipTrigger({
+  onClick,
+  onPointerCancel,
+  onPointerDown,
+  ...props
+}: ComponentProps<typeof TooltipPrimitive.Trigger>) {
+  const touchTap = use(TooltipTouchTapContext);
+  if (!touchTap) throw new Error("TooltipTrigger must be used within Tooltip");
+
+  return (
+    <TooltipPrimitive.Trigger
+      {...props}
+      onClick={(event) => {
+        onClick?.(event);
+        touchTap.tap(event.detail);
+      }}
+      onPointerCancel={(event) => {
+        onPointerCancel?.(event);
+        touchTap.cancelPress();
+      }}
+      onPointerDown={(event) => {
+        onPointerDown?.(event);
+        touchTap.press(event.pointerType);
+      }}
+    />
+  );
+}
+
+const TooltipContent = ({
+  className,
+  sideOffset = 4,
+  ...props
+}: ComponentProps<typeof TooltipPrimitive.Content>) => (
+  <TooltipPrimitive.Content
+    sideOffset={sideOffset}
+    className={cn(
+      "z-50 overflow-hidden rounded-md border bg-popover px-3 py-1.5 text-sm text-popover-foreground shadow-md animate-in fade-in-0 zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 origin-[--radix-tooltip-content-transform-origin]",
+      className
+    )}
+    {...props}
+  />
+);
+
+export { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger };
