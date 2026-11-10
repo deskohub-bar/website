@@ -1,0 +1,21 @@
+import "server-only";
+
+import { DotyposService } from "@deskohub/dotypos";
+import { Effect } from "effect";
+import { WorkspaceDotyposLayer } from "@/shared/backend/config/dotypos.config";
+import { runWorkspaceEffect } from "@/shared/backend/workspace-effect";
+import { getOfficeReservationSeatCapacity } from "./office-reservation-capacity";
+
+export const loadOfficeReservationSeatCapacity = Effect.fn(
+  function* () {
+    const dotypos = yield* DotyposService;
+    return yield* getOfficeReservationSeatCapacity(yield* dotypos.getTables());
+  },
+  (effect) =>
+    effect.pipe(
+      Effect.provide(WorkspaceDotyposLayer),
+      runWorkspaceEffect("reservation.office.load-seat-capacity", {
+        boundary: "page",
+      })
+    )
+);

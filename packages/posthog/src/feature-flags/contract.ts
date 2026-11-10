@@ -1,0 +1,58 @@
+export interface PostHogFeatureFlagDefinitionContract {
+  readonly payload: unknown;
+  readonly value: boolean | string;
+}
+
+type ValidPostHogFeatureFlagDefinitions<Definitions> = {
+  readonly [Key in keyof Definitions]: PostHogFeatureFlagDefinitionContract;
+};
+
+declare const postHogFeatureFlagDefinitions: unique symbol;
+
+export interface PostHogFeatureFlagContract<
+  Definitions extends ValidPostHogFeatureFlagDefinitions<Definitions>,
+> {
+  readonly keys: readonly Extract<keyof Definitions, string>[];
+  readonly [postHogFeatureFlagDefinitions]?: Definitions;
+}
+
+export type PostHogFeatureFlagKey<Definitions> = Extract<
+  keyof Definitions,
+  string
+>;
+
+export type PostHogFeatureFlagValue<
+  Definitions,
+  Key extends PostHogFeatureFlagKey<Definitions>,
+> = Definitions[Key] extends { readonly value: infer Value } ? Value : never;
+
+export type PostHogFeatureFlagOverrides<Definitions> = Readonly<{
+  [Key in PostHogFeatureFlagKey<Definitions>]?: PostHogFeatureFlagValue<
+    Definitions,
+    Key
+  >;
+}>;
+
+export type PostHogFeatureFlagPayload<
+  Definitions,
+  Key extends PostHogFeatureFlagKey<Definitions>,
+> = Definitions[Key] extends { readonly payload: infer Payload }
+  ? Payload
+  : never;
+
+export const definePostHogFeatureFlags = <
+  const Definitions extends ValidPostHogFeatureFlagDefinitions<Definitions>,
+>(
+  keys: readonly PostHogFeatureFlagKey<Definitions>[]
+): PostHogFeatureFlagContract<Definitions> => ({ keys });
+
+/**
+ * Each contract flag's constant value when its definitions were read, as
+ * classified by `getConstantEnabledValue`: `null` when the value depends on
+ * the request.
+ */
+export interface PostHogFeatureFlagSnapshot<Key extends string = string> {
+  /** ISO 8601 instant at which the definitions were read. */
+  readonly generatedAt: string;
+  readonly constantValues: Readonly<Record<Key, boolean | null>>;
+}

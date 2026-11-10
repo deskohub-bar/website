@@ -1,0 +1,298 @@
+import { describe, expect, test } from "bun:test";
+import { Effect, Fiber } from "effect";
+import { TestClock } from "effect/testing";
+import { FetchHttpClient } from "effect/unstable/http";
+import { PostHogProjectId } from "../identifiers";
+import {
+  listPostHogFeatureFlagDefinitions,
+  loadPostHogFeatureFlagDefinitions,
+  type PostHogFeatureFlagPageSource,
+} from "./definitions";
+
+describe("listPostHogFeatureFlagDefinitions", () => {
+  const projectId = PostHogProjectId.make("project");
+
+  test("paginates, excludes deleted flags, and normalizes definitions", async () => {
+    const calls: number[] = [];
+    const firstPage = Array.from({ length: 100 }, (_, index) => ({
+      key: `flag-${index.toString().padStart(3, "0")}`,
+    }));
+    const listPage: PostHogFeatureFlagPageSource = ({ offset }) => {
+      calls.push(offset);
+      return Effect.succeed(
+        offset === 0
+          ? { count: 102, results: firstPage }
+          : {
+              count: 102,
+              results: [
+                {
+                  key: "z-variant",
+                  filters: {
+                    multivariate: {
+                      variants: [
+                        { key: " treatment " },
+                        { key: "control" },
+                        { key: "control" },
+                      ],
+                    },
+                    payloads: { treatment: '{"capacity":8}' },
+                  },
+                },
+                { key: "deleted", deleted: true },
+              ],
+            }
+      );
+    };
+
+    const definitions = await Effect.runPromise(
+      listPostHogFeatureFlagDefinitions(projectId, listPage)
+    );
+
+    expect(calls).toEqual([0, 100]);
+    expect(definitions).toHaveLength(101);
+    expect(definitions.at(-1)).toEqual({
+      constantEnabledValue: undefined,
+      key: "z-variant",
+      payloads: { treatment: '{"capacity":8}' },
+      variants: ["control", "treatment"],
+    });
+  });
+
+  test("classifies only provably constant boolean evaluations", async () => {
+    const definitions = await Effect.runPromise(
+      listPostHogFeatureFlagDefinitions(projectId, () =>
+        Effect.succeed({
+          count: 8,
+          results: [
+            { key: "inactive", active: false },
+            {
+              key: "off",
+              active: true,
+              filters: { groups: [{ properties: [], rollout_percentage: 0 }] },
+            },
+            {
+              key: "on",
+              active: true,
+              filters: {
+                groups: [{ properties: [], rollout_percentage: 100 }],
+              },
+            },
+            {
+              key: "partial",
+              active: true,
+              filters: {
+                groups: [{ properties: [], rollout_percentage: 50 }],
+              },
+            },
+            {
+              key: "targeted",
+              active: true,
+              filters: {
+                groups: [
+                  {
+                    properties: [{ key: "plan", value: "paid" }],
+                    rollout_percentage: 100,
+                  },
+                ],
+              },
+            },
+            {
+              key: "targeted-then-global",
+              active: true,
+              filters: {
+                groups: [
+                  {
+                    properties: [{ key: "plan", value: "paid" }],
+                    rollout_percentage: 100,
+                  },
+                  { properties: [], rollout_percentage: 100 },
+                ],
+              },
+            },
+            {
+              key: "continuity",
+              active: true,
+              ensure_experience_continuity: true,
+              filters: { groups: [{ properties: [], rollout_percentage: 0 }] },
+            },
+            {
+              key: "variant",
+              active: true,
+              filters: {
+                groups: [{ properties: [], rollout_percentage: 100 }],
+                multivariate: {
+                  variants: [{ key: "control" }, { key: "treatment" }],
+                },
+              },
+            },
+          ] as const,
+        })
+      )
+    );
+
+    expect(
+      Object.fromEntries(
+        definitions.map(({ constantEnabledValue, key }) => [
+          key,
+          constantEnabledValue,
+        ])
+      )
+    ).toEqual({
+      continuity: undefined,
+      inactive: false,
+      off: false,
+      on: true,
+      partial: undefined,
+      targeted: undefined,
+      "targeted-then-global": true,
+      variant: undefined,
+    });
+  });
+
+  test("classifies early-exit, group-aggregated and default-rollout release conditions", async () => {
+    const unconditional = { properties: [], rollout_percentage: 100 };
+    const targeted = {
+      properties: [{ key: "plan", value: "paid" }],
+      rollout_percentage: 100,
+    };
+    const definitions = await Effect.runPromise(
+      listPostHogFeatureFlagDefinitions(projectId, () =>
+        Effect.succeed({
+          count: 8,
+          results: [
+            { key: "unknown-activity", filters: { groups: [unconditional] } },
+            { key: "default-rollout", active: true, filters: { groups: [{}] } },
+            {
+              key: "default-rollout-continuity-off",
+              active: true,
+              ensure_experience_continuity: false,
+              filters: { groups: [{ properties: [] }] },
+            },
+            {
+              key: "group-aggregated",
+              active: true,
+              filters: {
+                aggregation_group_type_index: 0,
+                groups: [unconditional],
+              },
+            },
+            {
+              key: "group-aggregated-condition",
+              active: true,
+              filters: {
+                groups: [{ ...unconditional, aggregation_group_type_index: 1 }],
+              },
+            },
+            {
+              key: "early-exit-after-full-release",
+              active: true,
+              filters: { early_exit: true, groups: [targeted, unconditional] },
+            },
+            {
+              key: "early-exit-after-partial-release",
+              active: true,
+              filters: {
+                early_exit: true,
+                groups: [
+                  { ...targeted, rollout_percentage: 50 },
+                  unconditional,
+                ],
+              },
+            },
+            {
+              key: "nobody-across-groups",
+              active: true,
+              filters: {
+                aggregation_group_type_index: 0,
+                groups: [
+                  { properties: [], rollout_percentage: 0 },
+                  { ...targeted, rollout_percentage: -1 },
+                ],
+              },
+            },
+          ] as const,
+        })
+      )
+    );
+
+    expect(
+      Object.fromEntries(
+        definitions.map(({ constantEnabledValue, key }) => [
+          key,
+          constantEnabledValue,
+        ])
+      )
+    ).toEqual({
+      "default-rollout": true,
+      "default-rollout-continuity-off": true,
+      "early-exit-after-full-release": true,
+      "early-exit-after-partial-release": undefined,
+      "group-aggregated": undefined,
+      "group-aggregated-condition": undefined,
+      "nobody-across-groups": false,
+      "unknown-activity": undefined,
+    });
+  });
+
+  test("does not classify an active flag without release conditions", async () => {
+    const [definition] = await Effect.runPromise(
+      listPostHogFeatureFlagDefinitions(projectId, () =>
+        Effect.succeed({ count: 1, results: [{ key: "empty", active: true }] })
+      )
+    );
+
+    expect(definition?.constantEnabledValue).toBeUndefined();
+  });
+
+  test("fails a stalled page request", async () => {
+    const error = await Effect.runPromise(
+      Effect.gen(function* () {
+        const fiber = yield* listPostHogFeatureFlagDefinitions(
+          projectId,
+          () => Effect.never
+        ).pipe(Effect.flip, Effect.forkChild);
+        yield* TestClock.adjust("10 seconds");
+        return yield* Fiber.join(fiber);
+      }).pipe(Effect.provide(TestClock.layer()))
+    );
+
+    expect(error).toMatchObject({
+      _tag: "PostHogFeatureFlagError",
+      message: "PostHog feature flag request timed out.",
+    });
+  });
+
+  test("keeps the HTTP status of a refused list request", async () => {
+    const refuse = Object.assign(
+      async () => new Response(null, { status: 429 }),
+      { preconnect: globalThis.fetch.preconnect }
+    );
+
+    const error = await Effect.runPromise(
+      loadPostHogFeatureFlagDefinitions({
+        apiKey: "synthetic-api-key",
+        host: new URL("https://posthog.example"),
+        projectId,
+      }).pipe(Effect.flip, Effect.provideService(FetchHttpClient.Fetch, refuse))
+    );
+
+    expect(error).toMatchObject({
+      _tag: "PostHogFeatureFlagError",
+      failureCode: "StatusCodeError",
+      httpStatus: 429,
+    });
+  });
+
+  test("fails through the Effect error channel for duplicate keys", async () => {
+    const result = await Effect.runPromiseExit(
+      listPostHogFeatureFlagDefinitions(projectId, () =>
+        Effect.succeed({
+          count: 2,
+          results: [{ key: "duplicate" }, { key: "duplicate" }],
+        })
+      )
+    );
+
+    expect(result._tag).toBe("Failure");
+  });
+});
