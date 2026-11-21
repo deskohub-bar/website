@@ -1,0 +1,27 @@
+{
+  "name": "@deskohub/tooltip",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/tooltip.tsx"
+  },
+  "scripts": {
+    "lint": "biome check src --config-path ../../biome.json --vcs-root ../..",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "dependencies": {
+    "@ui-sdk/core": "0.1.0-beta.13",
+    "@ui-sdk/react": "0.1.0-beta.13"
+  },
+  "peerDependencies": {
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "typescript": "npm:@typescript/typescript6@6.0.2"
+  }
+}

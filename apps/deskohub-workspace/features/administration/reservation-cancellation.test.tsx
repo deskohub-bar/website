@@ -1,0 +1,346 @@
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  test,
+} from "bun:test";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  within,
+} from "@testing-library/react";
+import { RouteLocaleProvider } from "@/features/i18n/route-locale";
+import {
+  workspaceRouterRefresh,
+  workspaceUseAction,
+} from "@/shared/testing/workspace-component-module-mocks";
+import {
+  registerWorkspaceComponentTestEnv,
+  unregisterWorkspaceComponentTestEnv,
+} from "@/shared/testing/workspace-component-test-env";
+import { m } from "./i18n";
+
+const execute = mock();
+
+interface CancelActionInput {
+  readonly reservationId: string;
+  readonly sendCancellationEmail: boolean;
+}
+
+type ActionOptions = {
+  readonly execute: (input: CancelActionInput) => void;
+  readonly isExecuting: boolean;
+  readonly onSuccess: (args: {
+    readonly data?: { readonly email: "failed" | "not_requested" | "sent" };
+  }) => void;
+  readonly onError: (args: {
+    readonly error: { readonly serverError?: string };
+  }) => void;
+  readonly onTransportError: () => void;
+};
+
+let actionOptions: ActionOptions | undefined;
+
+mock.module("./actions", () => ({
+  settleAdministrationReservationWithdrawal: mock(),
+  cancelAdministrationReservation: mock(),
+}));
+
+beforeAll(() => {
+  registerWorkspaceComponentTestEnv();
+});
+
+beforeEach(() => {
+  execute.mockClear();
+  actionOptions = undefined;
+  workspaceUseAction.mockReset();
+  workspaceUseAction.mockImplementation(() => ({
+    execute,
+    isExecuting: false,
+    result: {},
+  }));
+});
+
+const withActionOptions = () => {
+  workspaceUseAction.mockImplementation((_action, options) => {
+    actionOptions = options as ActionOptions | undefined;
+    return { execute, isExecuting: false, result: {} };
+  });
+};
+
+afterEach(() => {
+  cleanup();
+});
+
+afterAll(async () => {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await unregisterWorkspaceComponentTestEnv();
+});
+
+const fixtureReservationId = "01980000-0000-7000-8000-00000000abcd";
+
+const renderCancellation = async (
+  props?: Partial<{
+    canCancel: boolean;
+    reservationId: string;
+    invoice: {
+      invoiceNumber: string;
+      state: "live" | "cancelled";
+      customerNotice: "owed" | "not_owed";
+    } | null;
+  }>,
+  locale: "cs-CZ" | "en-US" = "en-US"
+) => {
+  const { ReservationCancellation } = await import(
+    "./reservation-cancellation"
+  );
+  return render(
+    <RouteLocaleProvider locale={locale}>
+      <ReservationCancellation
+        canCancel={true}
+        invoice={null}
+        reservationId={fixtureReservationId}
+        {...props}
+      />
+    </RouteLocaleProvider>
+  );
+};
+
+const openDialog = async (view: ReturnType<typeof render>) => {
+  await act(async () => {
+    fireEvent.click(
+      view.getAllByRole("button", { name: "Cancel reservation" })[0]
+    );
+  });
+};
+
+const submitDialog = async (view: ReturnType<typeof render>) => {
+  await act(async () => {
+    fireEvent.submit(
+      within(view.getByRole("dialog")).getByRole("form", {
+        name: "Cancel this reservation",
+      })
+    );
+  });
+};
+
+describe("ReservationCancellation", () => {
+  test("offers only the email choice and submits exact action args", async () => {
+    withActionOptions();
+    const view = await renderCancellation();
+    await openDialog(view);
+
+    const dialog = within(view.getByRole("dialog"));
+    expect(dialog.getAllByRole("checkbox")).toHaveLength(1);
+    expect(
+      dialog
+        .getByRole("button", { name: "Cancel reservation" })
+        .hasAttribute("disabled")
+    ).toBe(false);
+
+    await submitDialog(view);
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute.mock.calls[0][0]).toEqual({
+      confirmedConsequences: { invoice: false, customerNotice: false },
+      reservationId: fixtureReservationId,
+      sendCancellationEmail: true,
+    });
+  });
+
+  test("submits the unchecked email checkbox when the operator opts out", async () => {
+    withActionOptions();
+    const view = await renderCancellation();
+    await openDialog(view);
+
+    fireEvent.click(
+      within(view.getByRole("dialog")).getByRole("checkbox", {
+        name: "Send a cancellation email to the customer",
+      })
+    );
+
+    await submitDialog(view);
+    expect(execute.mock.calls[0][0]).toEqual({
+      confirmedConsequences: { invoice: false, customerNotice: false },
+      reservationId: fixtureReservationId,
+      sendCancellationEmail: false,
+    });
+  });
+
+  test("renders the failure email-outcome notice and closes the dialog", async () => {
+    withActionOptions();
+    const view = await renderCancellation();
+    await openDialog(view);
+
+    await submitDialog(view);
+    act(() => {
+      actionOptions?.onSuccess({ data: { email: "failed" } });
+    });
+
+    expect(
+      view.getByText(
+        "Reservation cancelled, but the cancellation email could not be sent."
+      )
+    ).toBeDefined();
+    expect(
+      view.queryByRole("form", { name: "Cancel this reservation" })
+    ).toBeNull();
+  });
+
+  test("speaks Czech on a Czech route, including the outcome", async () => {
+    withActionOptions();
+    const view = await renderCancellation({}, "cs-CZ");
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: "Zrušit rezervaci" }));
+    });
+
+    const dialog = within(view.getByRole("dialog"));
+    expect(dialog.getByText("Zrušit tuto rezervaci?")).toBeDefined();
+    expect(
+      dialog.getByRole("checkbox", {
+        name: "Poslat zákazníkovi e-mail o zrušení",
+      })
+    ).toBeDefined();
+    await act(async () => {
+      fireEvent.submit(
+        dialog.getByRole("form", { name: "Zrušit tuto rezervaci" })
+      );
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      actionOptions?.onSuccess({ data: { email: "sent" } });
+    });
+    expect(
+      view.getByText("Rezervace byla zrušena a zákazník dostal e-mail.")
+    ).toBeDefined();
+  });
+
+  test("keeps the dialog open and explains a refused or interrupted cancellation", async () => {
+    withActionOptions();
+    const view = await renderCancellation();
+    await openDialog(view);
+    await submitDialog(view);
+    const dialog = within(view.getByRole("dialog"));
+
+    act(() => {
+      actionOptions?.onError({
+        error: { serverError: "Synthetic refusal from the server." },
+      });
+    });
+    expect(dialog.getByRole("alert").textContent).toBe(
+      "Synthetic refusal from the server."
+    );
+
+    act(() => {
+      actionOptions?.onError({ error: {} });
+    });
+    expect(dialog.getByRole("alert").textContent).toBe(
+      m.administrationReservationCancellationFailed({}, { locale: "en-US" })
+    );
+
+    act(() => {
+      actionOptions?.onTransportError();
+    });
+    expect(dialog.getByRole("alert").textContent).toBe(
+      m.administrationReservationCancellationInterrupted(
+        {},
+        { locale: "en-US" }
+      )
+    );
+
+    act(() => {
+      actionOptions?.onSuccess({});
+    });
+    expect(view.getByRole("dialog")).toBeDefined();
+    expect(view.queryByRole("status")).toBeNull();
+  });
+
+  const invoiceWarning = (invoiceNumber: string) =>
+    m.administrationReservationCancellationInvoiceWarning(
+      { invoiceNumber },
+      { locale: "en-US" }
+    );
+  const noticeWarning =
+    m.administrationReservationCancellationInvoiceNoticeWarning(
+      {},
+      { locale: "en-US" }
+    );
+
+  test.each([
+    { customerNotice: "not_owed" as const },
+    { customerNotice: "owed" as const },
+  ])(
+    "warns that the live invoice is cancelled too and confirms what it warned about (notice $customerNotice)",
+    async ({ customerNotice }) => {
+      withActionOptions();
+      const view = await renderCancellation({
+        invoice: { invoiceNumber: "2026000007", state: "live", customerNotice },
+      });
+      await openDialog(view);
+      const dialog = within(view.getByRole("dialog"));
+
+      expect(dialog.queryByText(invoiceWarning("2026000007"))).not.toBeNull();
+      expect(dialog.queryByText(noticeWarning) !== null).toBe(
+        customerNotice === "owed"
+      );
+
+      await submitDialog(view);
+      expect(execute.mock.calls[0][0]).toMatchObject({
+        confirmedConsequences: {
+          invoice: true,
+          customerNotice: customerNotice === "owed",
+        },
+      });
+    }
+  );
+
+  test("shows no invoice warning for an invoice that is already cancelled", async () => {
+    withActionOptions();
+    const view = await renderCancellation({
+      invoice: {
+        invoiceNumber: "2026000007",
+        state: "cancelled",
+        customerNotice: "owed",
+      },
+    });
+    await openDialog(view);
+    const dialog = within(view.getByRole("dialog"));
+
+    expect(dialog.queryByText(invoiceWarning("2026000007"))).toBeNull();
+    expect(dialog.queryByText(noticeWarning)).toBeNull();
+    await submitDialog(view);
+    expect(execute.mock.calls[0][0]).toMatchObject({
+      confirmedConsequences: { invoice: false, customerNotice: false },
+    });
+  });
+
+  test("refreshes the page after a refusal so the current invoice warning shows", async () => {
+    withActionOptions();
+    workspaceRouterRefresh.mockClear();
+    const view = await renderCancellation();
+    await openDialog(view);
+    await submitDialog(view);
+
+    act(() => {
+      actionOptions?.onError({
+        error: {
+          serverError:
+            m.administrationReservationCancellationErrorConfirmationStale(
+              {},
+              { locale: "en-US" }
+            ),
+        },
+      });
+    });
+
+    expect(workspaceRouterRefresh).toHaveBeenCalled();
+    expect(view.getByRole("dialog")).toBeDefined();
+  });
+});

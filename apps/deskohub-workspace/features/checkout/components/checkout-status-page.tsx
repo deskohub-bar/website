@@ -1,0 +1,767 @@
+import { cva } from "class-variance-authority";
+import { Match } from "effect";
+import { Undo2 } from "lucide-react";
+import Link from "next/link";
+import type { ReactNode } from "react";
+import type { CheckoutStatusViewModel } from "@/features/checkout/backend/checkout";
+import {
+  type CheckoutStatusKind,
+  checkoutStatusTraits,
+} from "@/features/checkout/checkout-status-kind";
+import type { CheckoutStatusSummaryPresentation } from "@/features/checkout/checkout-status-summary-presentation";
+import { getWorkspaceOfficeProductTitle } from "@/features/checkout/product-catalog.i18n";
+import { getContactPageHref } from "@/features/contact/components/contact-page-link";
+import { getCoworkCheckoutStatusSummary } from "@/features/cowork/components/cowork-checkout-status-summary";
+import { type Locale, m } from "@/features/i18n";
+import { getMeetingRoomCheckoutStatusSummary } from "@/features/meeting-room/components/meeting-room-checkout-status-summary";
+import { getOfficeCheckoutStatusSummary } from "@/features/office/components/office-checkout-status-summary";
+import {
+  OfficeStatusPeopleList,
+  type ResendOfficeInvitation,
+} from "@/features/office/components/office-status-people";
+import { ReservationAccessButton } from "@/features/reservation/components/reservation-access-button";
+import { getOfficeReservationSelection } from "@/features/reservation/office-reservation";
+import type { WorkspaceReservationId } from "@/features/reservation/persistence-contracts";
+import { formatReservationDisplayDate } from "@/features/reservation/reservation-date";
+import {
+  getCoworkReservationPath,
+  getReservationStartPath,
+  reservationAccessPath,
+} from "@/features/reservation/routes";
+import { getSelectionPath } from "@/features/reservation/selection-path";
+import { ReservationWithdrawalLink } from "@/features/withdrawal/components/reservation-withdrawal-link";
+import type { ReservationWithdrawalEntry } from "@/features/withdrawal/withdrawal-read-model";
+import { Button } from "@/shared/components/ui/button";
+import { formatMoney } from "@/shared/money/money";
+import { cn } from "@/shared/utils";
+import { CheckoutFlowLayout } from "./checkout-flow-layout";
+import type { CheckoutQrPayment } from "./checkout-qr-payment-details";
+import {
+  type CheckoutStatusCopy,
+  getCheckoutStatusCopy,
+} from "./checkout-status-copy";
+import {
+  CheckoutStatusPaymentMethods,
+  type ContinueCheckoutPaymentAction,
+} from "./checkout-status-payment-methods";
+import { CheckoutStatusPaymentPageReopening } from "./checkout-status-payment-page-reopening";
+import { CheckoutStatusPaymentRetry } from "./checkout-status-payment-retry";
+import { WorkspaceTableMapView } from "./workspace-table-map-view";
+
+type CheckoutStatusPageProps = {
+  readonly locale: Locale;
+  readonly paymentMethods?: {
+    readonly continuePaymentAction: ContinueCheckoutPaymentAction;
+    readonly expiresAt: string;
+    readonly qrPayment?: CheckoutQrPayment;
+  };
+  readonly presentation?: "page" | "modal";
+  /** Sends an office invitee their invitation again, where the page can. */
+  readonly resendInvitation?: ResendOfficeInvitation;
+  readonly status: CheckoutStatusViewModel;
+  /**
+   * The reservation's online withdrawal: once the customer withdrew it reads
+   * as cancelled; while they can withdraw, it shows the withdrawal link.
+   */
+  readonly withdrawal?: ReservationWithdrawalEntry;
+};
+
+const statusIconWrapperVariants = cva(
+  "flex h-16 w-16 shrink-0 items-center justify-center rounded-full ring-8",
+  {
+    variants: {
+      tone: {
+        success:
+          "bg-aquamarine-green/14 text-aquamarine-ink ring-aquamarine-green/8",
+        pending: "bg-burned-orange/12 text-burned-orange ring-burned-orange/8",
+        warning: "bg-burned-orange/12 text-burned-orange ring-burned-orange/8",
+        failed: "bg-red-500/10 text-red-600 ring-red-500/8",
+        unknown: "bg-navy-blue/8 text-navy-blue/60 ring-navy-blue/6",
+      },
+    },
+  }
+);
+
+const getSummaryPresentation = (
+  status: CheckoutStatusViewModel,
+  locale: Locale,
+  officePeople?: ReactNode
+): CheckoutStatusSummaryPresentation | undefined =>
+  status.summary
+    ? Match.value(status.summary).pipe(
+        Match.discriminatorsExhaustive("kind")({
+          cowork: (summary) => getCoworkCheckoutStatusSummary(summary, locale),
+          "meeting-room": (summary) =>
+            getMeetingRoomCheckoutStatusSummary(summary, locale),
+          office: (summary) =>
+            getOfficeCheckoutStatusSummary(summary, locale, officePeople),
+        })
+      )
+    : undefined;
+
+/**
+ * The contact page asking staff to change who is coming: the order reference
+ * and date, then "Add:" and "Remove:" lines for the booker to fill in.
+ */
+const getPeopleChangeContactHref = (
+  status: CheckoutReservationStatusViewModel,
+  locale: Locale
+) =>
+  getContactPageHref(locale, {
+    name: status.supportContactPrefill?.name,
+    email: status.supportContactPrefill?.email,
+    message: m.checkoutStatusPeopleChangeMessage(
+      {
+        reservationDetails: getContactReservationDetails(
+          status,
+          locale,
+          getWorkspaceOfficeProductTitle(locale)
+        ),
+      },
+      { locale }
+    ),
+  });
+
+/**
+ * The lines that identify an order in a message to staff: its reference,
+ * then what it reserves and when. Without reconstructed details the order
+ * reference alone identifies it.
+ */
+const getContactReservationDetails = (
+  status: CheckoutStatusViewModel,
+  locale: Locale,
+  reservationTitle: string | undefined
+) =>
+  [
+    m.checkoutStatusContactOrderReference(
+      { orderId: status.orderId },
+      { locale }
+    ),
+    ...(status.summary && reservationTitle
+      ? [
+          m.checkoutStatusContactReservation(
+            {
+              reservation: reservationTitle,
+              date: formatReservationDisplayDate(
+                status.summary.reservedFrom,
+                locale
+              ),
+            },
+            { locale }
+          ),
+        ]
+      : []),
+  ].join("\n");
+
+const getSupportContactMessage = (
+  status: CheckoutStatusViewModel,
+  locale: Locale,
+  summaryPresentation: CheckoutStatusSummaryPresentation | undefined,
+  topic: NonNullable<
+    (typeof checkoutStatusTraits)[CheckoutStatusKind]["supportTopic"]
+  >
+) => {
+  const reservationDetails = getContactReservationDetails(
+    status,
+    locale,
+    summaryPresentation?.reservationTitle
+  );
+
+  const message = {
+    fulfillment_failed: m.checkoutStatusFulfillmentFailedContactMessage,
+    late_payment_review: m.checkoutStatusLatePaymentReviewContactMessage,
+    payment_pending: m.checkoutStatusPaymentPendingContactMessage,
+  }[topic];
+  return message({ reservationDetails }, { locale });
+};
+
+const getRepeatReservationSearchParams = (
+  status: CheckoutStatusViewModel
+): URLSearchParams | undefined => {
+  if (status.status !== "fulfilled" || !status.summary) return undefined;
+
+  return Match.value(status.summary).pipe(
+    Match.discriminatorsExhaustive("kind")({
+      cowork: ({ coffee, entryTier, monitorOption }) =>
+        new URLSearchParams({
+          entryTier,
+          coffee: String(coffee),
+          ...(monitorOption && { monitorOption }),
+        }),
+      "meeting-room": () => undefined,
+      office: ({ reservedFrom, reservedUntil, seats }) => {
+        const selection = getOfficeReservationSelection({
+          startsAt: reservedFrom,
+          endsAt: reservedUntil,
+          seats,
+        });
+        return selection
+          ? new URLSearchParams({
+              dayCount: String(selection.dayCount),
+              seats: String(selection.seats),
+            })
+          : undefined;
+      },
+    })
+  );
+};
+
+/**
+ * The reservation page a "reserve again" link opens: a failed, cancelled, or
+ * expired payment retries its booked selection; otherwise the link repeats
+ * the reservation's options.
+ */
+const getReserveAgainPath = (
+  status: CheckoutStatusViewModel,
+  locale: Locale,
+  {
+    offersRetry,
+    repeatSearchParams,
+  }: {
+    readonly offersRetry: boolean;
+    readonly repeatSearchParams: URLSearchParams | undefined;
+  }
+) => {
+  if (status.status === "not_found") return getCoworkReservationPath(locale);
+  if (!offersRetry) {
+    return getReservationStartPath(locale, status.kind, repeatSearchParams);
+  }
+  return status.retrySelection
+    ? getSelectionPath(locale, status.retrySelection)
+    : getReservationStartPath(locale, status.kind);
+};
+
+const getReserveAgainLabel = (
+  offersRetry: boolean,
+  repeatsReservation: boolean,
+  locale: Locale
+) => {
+  if (offersRetry) return m.checkoutStatusTryAgain({}, { locale });
+  return repeatsReservation
+    ? m.checkoutStatusBookAgain({}, { locale })
+    : m.checkoutStatusReserveAgain({}, { locale });
+};
+
+const getSupportContactHref = (
+  status: CheckoutStatusViewModel,
+  locale: Locale,
+  summaryPresentation: CheckoutStatusSummaryPresentation | undefined
+) => {
+  const topic = checkoutStatusTraits[status.status].supportTopic;
+  if (!topic || status.status === "not_found") return undefined;
+
+  return getContactPageHref(locale, {
+    ...status.supportContactPrefill,
+    message: getSupportContactMessage(
+      status,
+      locale,
+      summaryPresentation,
+      topic
+    ),
+  });
+};
+
+type CheckoutStatusPresentation = NonNullable<
+  CheckoutStatusPageProps["presentation"]
+>;
+
+type CheckoutReservationStatusViewModel = Exclude<
+  CheckoutStatusViewModel,
+  { readonly status: "not_found" }
+>;
+
+const getReservationAccessHref = (
+  status: CheckoutStatusViewModel,
+  locale: Locale,
+  reviewSandbox: boolean | undefined
+) =>
+  status.status === "fulfilled" && !reviewSandbox
+    ? `/${locale}${reservationAccessPath}/${encodeURIComponent(status.orderId)}`
+    : undefined;
+
+export function CheckoutStatusPage({
+  locale,
+  paymentMethods,
+  presentation = "page",
+  resendInvitation,
+  status,
+  withdrawal,
+}: CheckoutStatusPageProps) {
+  const withdrawn =
+    status.status !== "not_found" && withdrawal?.status === "withdrawn"
+      ? withdrawal
+      : undefined;
+  const statusCopy = getCheckoutStatusCopy(status, locale);
+  const canSwitchPayment =
+    !withdrawn &&
+    presentation === "page" &&
+    (status.status === "pending" || status.status === "payment_pending_delayed")
+      ? paymentMethods
+      : undefined;
+  const copy: CheckoutStatusCopy = withdrawn
+    ? {
+        ...statusCopy,
+        title: m.checkoutStatusWithdrawnTitle({}, { locale }),
+        lead: m.checkoutStatusWithdrawnLead(
+          { amount: formatMoney(withdrawn.refundAmount, locale) },
+          { locale }
+        ),
+        tone: "unknown",
+        Icon: Undo2,
+      }
+    : {
+        ...statusCopy,
+        ...(canSwitchPayment && {
+          title: m.checkoutQrWaiting({}, { locale }),
+          lead: m.checkoutQrWaitingLead({}, { locale }),
+        }),
+      };
+  const showReservationDetails = status.status !== "not_found";
+  const withdrawalOffered =
+    showReservationDetails && withdrawal?.status === "offered";
+  const officePeople = status.status !== "not_found" &&
+    status.kind === "office" &&
+    status.people && (
+      <OfficeStatusPeopleList
+        changeHref={getPeopleChangeContactHref(status, locale)}
+        contact={status.supportContactPrefill}
+        locale={locale}
+        orderId={status.orderId}
+        people={{
+          contactAttends: status.people.contactAttends,
+          invitees: status.people.invitees.map(
+            ({ id, email, resendAvailableAt }) => ({
+              id,
+              email,
+              resendAvailableAt: withdrawn
+                ? undefined
+                : resendAvailableAt?.toString(),
+            })
+          ),
+        }}
+        resendInvitation={
+          !withdrawn && status.people.resendable ? resendInvitation : undefined
+        }
+      />
+    );
+  const summaryPresentation = getSummaryPresentation(
+    status,
+    locale,
+    officePeople || undefined
+  );
+  const supportContactHref = getSupportContactHref(
+    status,
+    locale,
+    summaryPresentation
+  );
+  const offersRetry =
+    checkoutStatusTraits[status.status].offersReservationRetry;
+  const repeatReservationSearchParams =
+    getRepeatReservationSearchParams(status);
+  const reserveAgainPath = getReserveAgainPath(status, locale, {
+    offersRetry,
+    repeatSearchParams: repeatReservationSearchParams,
+  });
+  const offersNewReservation =
+    checkoutStatusTraits[status.status].offersNewReservation;
+  const reviewSandbox = status.status !== "not_found" && status.reviewSandbox;
+  const paymentPageReopenable =
+    status.status !== "not_found" && status.paymentPageReopenable;
+
+  return (
+    <CheckoutStatusFrame
+      locale={locale}
+      presentation={presentation}
+      reserveAgainPath={offersNewReservation ? reserveAgainPath : undefined}
+    >
+      <CheckoutStatusHeadline
+        copy={copy}
+        locale={locale}
+        reviewSandbox={!!reviewSandbox}
+        showSupportButton={!!supportContactHref}
+      />
+
+      {canSwitchPayment && (
+        <CheckoutStatusPaymentMethods
+          continuePaymentAction={canSwitchPayment.continuePaymentAction}
+          expiresAt={canSwitchPayment.expiresAt}
+          locale={locale}
+          orderId={status.orderId}
+          qrPayment={canSwitchPayment.qrPayment}
+        />
+      )}
+
+      {!!supportContactHref && (
+        <Button asChild size="lg" fullWidth className="mt-6">
+          <Link
+            href={supportContactHref}
+            id="checkout-status-support-contact"
+            prefetch={false}
+          >
+            {m.checkoutStatusFulfillmentFailedContactButton({}, { locale })}
+          </Link>
+        </Button>
+      )}
+
+      {showReservationDetails && (
+        <CheckoutStatusReservationDetails
+          locale={locale}
+          officePeople={
+            summaryPresentation ? undefined : officePeople || undefined
+          }
+          status={status}
+          summaryPresentation={summaryPresentation}
+          withdrawalOffered={withdrawalOffered}
+        />
+      )}
+
+      {/* Phone: the withdrawal link sits centred right above the actions. */}
+      {withdrawalOffered && (
+        <ReservationWithdrawalLink
+          className="mt-3 -mb-5 block w-full text-center underline sm:hidden"
+          locale={locale}
+          orderId={status.orderId}
+          reference={status.orderId}
+        />
+      )}
+      <CheckoutStatusActions
+        locale={locale}
+        offersNewReservation={offersNewReservation}
+        presentation={presentation}
+        reservationAccessHref={
+          withdrawn
+            ? undefined
+            : getReservationAccessHref(status, locale, reviewSandbox)
+        }
+        reserveAgainLabel={getReserveAgainLabel(
+          offersRetry,
+          !!repeatReservationSearchParams,
+          locale
+        )}
+        reserveAgainPath={reserveAgainPath}
+        reopensPaymentPageFor={
+          !canSwitchPayment &&
+          checkoutStatusTraits[status.status].offersPaymentPageReopening &&
+          paymentPageReopenable
+            ? status.orderId
+            : undefined
+        }
+        retriesPaymentFor={
+          checkoutStatusTraits[status.status].offersPaymentRetryInPlace
+            ? status.orderId
+            : undefined
+        }
+      />
+    </CheckoutStatusFrame>
+  );
+}
+
+/**
+ * Wraps the status card in the checkout steps on a page, or shows the bare
+ * card in a modal. On a page, the completed order step links to the next
+ * reservation when the status offers one.
+ */
+function CheckoutStatusFrame({
+  children,
+  locale,
+  presentation,
+  reserveAgainPath,
+}: {
+  readonly children: ReactNode;
+  readonly locale: Locale;
+  readonly presentation: CheckoutStatusPresentation;
+  readonly reserveAgainPath: string | undefined;
+}) {
+  const content = (
+    <div
+      className={
+        presentation === "modal"
+          ? "bg-white p-6 text-navy-blue sm:p-10"
+          : "rounded-[2.25rem] border border-white/55 bg-white/94 p-6 text-navy-blue shadow-[0_44px_140px_-54px_rgba(0,2,79,0.62)] backdrop-blur-sm sm:p-10"
+      }
+    >
+      {children}
+    </div>
+  );
+
+  return presentation === "modal" ? (
+    content
+  ) : (
+    <CheckoutFlowLayout
+      activeStepKey="complete"
+      locale={locale}
+      stepLinks={
+        reserveAgainPath === undefined
+          ? undefined
+          : { chooseSpace: { href: reserveAgainPath, navigation: "document" } }
+      }
+    >
+      {content}
+    </CheckoutFlowLayout>
+  );
+}
+
+function CheckoutStatusHeadline({
+  copy,
+  locale,
+  reviewSandbox,
+  showSupportButton,
+}: {
+  readonly copy: CheckoutStatusCopy;
+  readonly locale: Locale;
+  readonly reviewSandbox: boolean;
+  readonly showSupportButton: boolean;
+}) {
+  const Icon = copy.Icon;
+
+  return (
+    <>
+      <output className="sr-only" aria-live="polite" aria-atomic>
+        {m.checkoutStatusEyebrow({}, { locale })}: {copy.title}
+      </output>
+      <div className="flex flex-col gap-6 sm:flex-row sm:items-start">
+        <div className={statusIconWrapperVariants({ tone: copy.tone })}>
+          <Icon className="h-9 w-9" aria-hidden="true" />
+        </div>
+
+        <div className="min-w-0 flex-1">
+          <p className="text-sm font-semibold uppercase tracking-[0.18em] text-burned-orange">
+            {m.checkoutStatusEyebrow({}, { locale })}
+          </p>
+          <h1 className="mt-4 text-balance text-4xl leading-none sm:text-5xl">
+            {copy.title}
+          </h1>
+          <p
+            className={cn(
+              "mt-5 text-lg leading-8 text-navy-blue/70",
+              showSupportButton &&
+                "after:content-['_↴'] after:text-4xl after:leading-0"
+            )}
+          >
+            {copy.lead}
+          </p>
+          {reviewSandbox && (
+            <p
+              className="mt-4 rounded-2xl border border-navy-blue/10 bg-navy-blue/3 px-4 py-3 text-sm leading-6 text-navy-blue/72"
+              id="checkout-status-review-sandbox"
+            >
+              {m.checkoutStatusReviewSandboxNotice({}, { locale })}
+            </p>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+function CheckoutStatusReservationDetails({
+  locale,
+  officePeople,
+  status,
+  summaryPresentation,
+  withdrawalOffered,
+}: {
+  readonly locale: Locale;
+  readonly officePeople?: ReactNode;
+  readonly status: CheckoutReservationStatusViewModel;
+  readonly summaryPresentation: CheckoutStatusSummaryPresentation | undefined;
+  readonly withdrawalOffered: boolean;
+}) {
+  const summaryRows = summaryPresentation?.rows ?? [];
+  const rows = officePeople
+    ? [
+        {
+          label: m.checkoutStatusPeopleLabel({}, { locale }),
+          value: officePeople,
+        },
+      ]
+    : summaryRows;
+
+  return (
+    <>
+      <div className="mt-10 rounded-[1.6rem] border border-navy-blue/10 bg-linear-to-br from-white to-aquamarine-green/8 p-5 sm:p-6">
+        <div className="flex min-w-0 items-start justify-between gap-3">
+          <h2 className="min-w-0 text-xl text-navy-blue">
+            {m.checkoutStatusSummaryTitle({}, { locale })}
+          </h2>
+          {withdrawalOffered && (
+            <ReservationWithdrawalLink
+              className="underline max-sm:hidden"
+              locale={locale}
+              orderId={status.orderId}
+              reference={status.orderId}
+            />
+          )}
+        </div>
+
+        <dl className="mt-5 grid gap-3">
+          <div className="grid gap-1 rounded-2xl border border-navy-blue/8 bg-white/80 px-4 py-3 sm:grid-cols-[10rem_1fr] sm:gap-4">
+            <dt className="text-xs font-semibold uppercase tracking-[0.14em] text-navy-blue/52">
+              {m.checkoutStatusOrderIdLabel({}, { locale })}
+            </dt>
+            <dd className="break-all font-mono text-sm font-semibold text-navy-blue">
+              {status.orderId}
+            </dd>
+          </div>
+          {status.table && (
+            <div className="grid gap-1 rounded-2xl border border-navy-blue/8 bg-white/80 px-4 py-3 sm:grid-cols-[10rem_1fr] sm:gap-4">
+              <dt className="text-xs font-semibold uppercase tracking-[0.14em] text-navy-blue/52">
+                {
+                  {
+                    assigned: m.checkoutEmailTableNumberLabel({}, { locale }),
+                    shared: m.checkoutEmailTablesLabel({}, { locale }),
+                  }[status.table.mode]
+                }
+              </dt>
+              <dd className="text-base font-semibold text-navy-blue">
+                {status.table.name}
+              </dd>
+            </div>
+          )}
+          {rows.map((row) => (
+            <div
+              key={row.label}
+              className="grid gap-1 rounded-2xl border border-navy-blue/8 bg-white/80 px-4 py-3 sm:grid-cols-[10rem_1fr] sm:gap-4"
+            >
+              <dt className="text-xs font-semibold uppercase tracking-[0.14em] text-navy-blue/52">
+                {row.label}
+              </dt>
+              <dd className="text-base font-semibold text-navy-blue">
+                {row.value}
+              </dd>
+            </div>
+          ))}
+        </dl>
+
+        {summaryRows.length === 0 &&
+          checkoutStatusTraits[status.status].promisesEmail && (
+            <p className="mt-4 rounded-2xl border border-burned-orange/16 bg-burned-orange/8 px-4 py-3 text-sm leading-6 text-burned-orange-ink">
+              {m.checkoutStatusMissingSummary({}, { locale })}
+            </p>
+          )}
+      </div>
+
+      {status.tableMap && (
+        <div className="mt-8 rounded-[1.6rem] border border-navy-blue/10 bg-white/88 p-5 sm:p-6">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+            <div>
+              <h2 className="text-xl text-navy-blue">
+                {m.checkoutStatusTableMapTitle({}, { locale })}
+              </h2>
+              <p className="mt-2 text-sm leading-6 text-navy-blue/64">
+                {m.checkoutStatusTableMapLead({}, { locale })}
+              </p>
+            </div>
+            {status.tableMap.roomName && (
+              <p className="rounded-full border border-navy-blue/10 bg-navy-blue/5 px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em] text-navy-blue/60">
+                {m.checkoutStatusTableMapRoomLabel({}, { locale })}:{" "}
+                {status.tableMap.roomName}
+              </p>
+            )}
+          </div>
+
+          <div className="mt-5 overflow-hidden rounded-[1.2rem] border border-navy-blue/8 bg-linear-to-br from-aquamarine-green/8 to-white p-3 [&>svg]:h-[min(58vh,28rem)] [&>svg]:min-h-72 [&>svg]:w-full [&_text]:font-bold">
+            <WorkspaceTableMapView
+              ariaLabel={m.checkoutStatusTableMapTitle({}, { locale })}
+              tableMap={status.tableMap}
+            />
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+const checkoutStatusActionsClassName = "mt-8 flex flex-col gap-3 sm:flex-row";
+
+/**
+ * A page offers a new reservation and the way home; a fulfilled reservation
+ * also links to its access, softly navigating inside a modal. An order still
+ * awaiting its payment first offers its payment page again, in a modal too.
+ * On a page, an order whose payment ended unpaid offers paying it again in
+ * place of the new reservation, which stays its fallback.
+ */
+function CheckoutStatusActions({
+  locale,
+  offersNewReservation,
+  presentation,
+  reopensPaymentPageFor,
+  reservationAccessHref,
+  reserveAgainLabel,
+  reserveAgainPath,
+  retriesPaymentFor,
+}: {
+  readonly locale: Locale;
+  readonly offersNewReservation: boolean;
+  readonly presentation: CheckoutStatusPresentation;
+  /** The order whose payment page the status offers again, if any. */
+  readonly reopensPaymentPageFor: WorkspaceReservationId | undefined;
+  readonly reservationAccessHref: string | undefined;
+  readonly reserveAgainLabel: string;
+  readonly reserveAgainPath: string;
+  /** The order whose payment the status offers to try again, if any. */
+  readonly retriesPaymentFor: WorkspaceReservationId | undefined;
+}) {
+  const showPageActions = presentation === "page";
+  const retriesPayment =
+    showPageActions && offersNewReservation && retriesPaymentFor !== undefined;
+  const reserveAgain = (
+    <Button asChild size="lg" variant="secondary">
+      <a href={reserveAgainPath} id="checkout-status-reserve-again">
+        {reserveAgainLabel}
+      </a>
+    </Button>
+  );
+  if (!showPageActions && !reservationAccessHref && !reopensPaymentPageFor) {
+    return null;
+  }
+
+  const actions = (
+    <>
+      {showPageActions && (
+        <>
+          {offersNewReservation && !retriesPayment && reserveAgain}
+          <Button asChild variant="secondary" size="lg">
+            <Link href={`/${locale}`} prefetch={false}>
+              {m.checkoutStatusBackHome({}, { locale })}
+            </Link>
+          </Button>
+        </>
+      )}
+      {reservationAccessHref && (
+        <ReservationAccessButton
+          href={reservationAccessHref}
+          id="checkout-status-access"
+          layout={showPageActions ? "status-end" : "status"}
+          locale={locale}
+          navigation={presentation === "modal" ? "client" : "document"}
+        />
+      )}
+    </>
+  );
+
+  if (reopensPaymentPageFor) {
+    return (
+      <CheckoutStatusPaymentPageReopening
+        className={checkoutStatusActionsClassName}
+        locale={locale}
+        orderId={reopensPaymentPageFor}
+      >
+        {actions}
+      </CheckoutStatusPaymentPageReopening>
+    );
+  }
+  if (retriesPayment) {
+    return (
+      <CheckoutStatusPaymentRetry
+        className={checkoutStatusActionsClassName}
+        fallback={reserveAgain}
+        locale={locale}
+        orderId={retriesPaymentFor}
+      >
+        {actions}
+      </CheckoutStatusPaymentRetry>
+    );
+  }
+  return <div className={checkoutStatusActionsClassName}>{actions}</div>;
+}

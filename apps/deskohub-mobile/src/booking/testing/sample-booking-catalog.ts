@@ -1,0 +1,420 @@
+import type {
+  CustomerBookableDates,
+  CustomerBookingOfferings,
+  CustomerBookingSelection,
+  CustomerCheckoutSummary,
+  CustomerLegalDocument,
+  CustomerLocale,
+  CustomerMonitorOption,
+  CustomerOffering,
+  Money,
+} from "@deskohub/workspace-customer-api";
+import type { CoworkOvernightStay } from "../selection/cowork-selection";
+import {
+  addMonths,
+  daysBetween,
+  type PragueDate,
+  pragueInstant,
+} from "../selection/prague-date";
+
+/**
+ * Synthetic booking catalog for the fake Workspace: offerings, prices and
+ * legal documents. Nothing here is real customer or price data.
+ */
+
+/** Whole Czech crowns as the contract's minor-unit money. */
+export const czk = (crowns: number): Money => ({
+  value: Math.round(crowns * 100),
+  exponent: 2,
+  currency: "CZK",
+});
+
+const noSale = { discount: czk(0) };
+
+const copy = (locale: CustomerLocale, en: string, cs: string) =>
+  locale === "cs-CZ" ? cs : en;
+
+/** Per-day and per-booking prices the fake quotes, in crowns. */
+export const samplePrices = {
+  openSpace: 350,
+  reservedDesk: 550,
+  coffee: 50,
+  workstation: 150,
+  meetingRoom: { "hour:1": 400, "hour:4": 1200, "day:1": 2400 },
+  officeDay: 1200,
+  officeSeat: 250,
+} as const;
+
+/** When the sample Reserved Desk's overnight stay starts and ends. */
+export const sampleOvernightStay: CoworkOvernightStay = {
+  startTime: "12:00",
+  endTime: "12:00",
+};
+
+/**
+ * `offerings` with the Reserved Desk's overnight stay set to `overnightStay`,
+ * or removed without one, for a test that needs a day-only catalog.
+ */
+export const withReservedDeskOvernightStay = (
+  offerings: ReadonlyArray<CustomerOffering>,
+  overnightStay: CoworkOvernightStay | undefined
+): ReadonlyArray<CustomerOffering> =>
+  offerings.map((offering) => {
+    if (offering.family !== "cowork" || offering.tier !== "reserved-desk")
+      return offering;
+    const { overnightStay: _sampled, ...day } = offering;
+    return overnightStay === undefined ? day : { ...day, overnightStay };
+  });
+
+export const sampleOfficeMaximumSeats = 6;
+export const sampleOfficeMaximumDurationHours = 672;
+
+/**
+ * The dates an offering advertised on `advertisedOn` can be booked on, as
+ * the server's rules give them: cowork and meeting room six months ahead,
+ * the office one.
+ */
+export const sampleBookableDates = (
+  advertisedOn: PragueDate,
+  family: CustomerOffering["family"]
+): CustomerBookableDates => ({
+  earliest: advertisedOn,
+  latest: addMonths(advertisedOn, family === "office" ? 1 : 6),
+});
+
+export const sampleOfferings = (
+  locale: CustomerLocale,
+  advertisedOn: PragueDate
+): CustomerBookingOfferings => {
+  const offerings: ReadonlyArray<CustomerOffering> = [
+    {
+      family: "cowork",
+      tier: "open-space",
+      name: copy(locale, "Open Space", "Open Space"),
+      description: copy(
+        locale,
+        "Any free desk in the shared room.",
+        "Libovolný volný stůl ve sdílené místnosti."
+      ),
+      summary: copy(
+        locale,
+        "Sit wherever you like, until 17:00.",
+        "Seď, kde chceš, do 17:00."
+      ),
+      usage: copy(locale, "Weekdays 8:00–18:00.", "Všední dny 8:00–18:00."),
+      price: czk(samplePrices.openSpace),
+      advertisedPrice: { price: czk(samplePrices.openSpace), ...noSale },
+      bookableDates: sampleBookableDates(advertisedOn, "cowork"),
+      addOns: [
+        {
+          id: "coffee",
+          name: copy(locale, "Coffee", "Káva"),
+          price: czk(samplePrices.coffee),
+          included: false,
+        },
+      ],
+    },
+    {
+      family: "cowork",
+      tier: "reserved-desk",
+      name: copy(locale, "Reserved Desk", "Rezervovaný stůl"),
+      description: copy(
+        locale,
+        "Your own desk for the day.",
+        "Vlastní stůl na celý den."
+      ),
+      summary: copy(
+        locale,
+        "Your own desk for uninterrupted flow.",
+        "Tvůj vlastní stůl pro nerušenou práci."
+      ),
+      usage: copy(locale, "Weekdays 8:00–18:00.", "Všední dny 8:00–18:00."),
+      price: czk(samplePrices.reservedDesk),
+      advertisedPrice: { price: czk(samplePrices.reservedDesk), ...noSale },
+      bookableDates: sampleBookableDates(advertisedOn, "cowork"),
+      addOns: [
+        {
+          id: "coffee",
+          name: copy(locale, "Coffee", "Káva"),
+          price: czk(0),
+          included: true,
+        },
+        {
+          id: "workstation",
+          name: copy(locale, "Monitor workstation", "Pracovní stanice"),
+          price: czk(samplePrices.workstation),
+          included: false,
+          options: [
+            { id: "2x27-qhd", name: '2× 27" QHD' },
+            { id: "2x32-qhd", name: '2× 32" QHD' },
+            { id: "2x27-4k", name: '2× 27" 4K' },
+            { id: "2x32-4k", name: '2× 32" 4K' },
+          ],
+        },
+      ],
+      overnightStay: sampleOvernightStay,
+    },
+    ...(["hour:1", "hour:4", "day:1"] as const).map(
+      (duration): CustomerOffering => ({
+        family: "meeting-room",
+        duration,
+        durationLabel: {
+          "hour:1": copy(locale, "1 hour", "1 hodina"),
+          "hour:4": copy(locale, "4 hours", "4 hodiny"),
+          "day:1": copy(locale, "Whole day", "Celý den"),
+        }[duration],
+        name: copy(locale, "Meeting room", "Zasedací místnost"),
+        description: copy(
+          locale,
+          "A room for up to ten people.",
+          "Místnost až pro deset lidí."
+        ),
+        usage: copy(locale, "Book by the hour.", "Rezervace po hodinách."),
+        facts: [
+          {
+            kind: "capacity",
+            text: copy(locale, "Up to 10 seats", "Až 10 míst"),
+          },
+        ],
+        price: czk(samplePrices.meetingRoom[duration]),
+        advertisedPrice: {
+          price: czk(samplePrices.meetingRoom[duration]),
+          ...noSale,
+        },
+        bookableDates: sampleBookableDates(advertisedOn, "meeting-room"),
+      })
+    ),
+    {
+      family: "office",
+      name: copy(locale, "Private office", "Soukromá kancelář"),
+      description: copy(
+        locale,
+        "A private office reserved only for you for whole days, with the seats you need.",
+        "Soukromá kancelář jen pro tebe na celé dny, s tolika místy, kolik potřebuješ."
+      ),
+      usage: copy(locale, "Book whole days.", "Rezervace na celé dny."),
+      price: czk(samplePrices.officeDay),
+      seatPrice: czk(samplePrices.officeSeat),
+      maximumSeats: sampleOfficeMaximumSeats,
+      maximumDurationHours: sampleOfficeMaximumDurationHours,
+      advertisedPrice: {
+        price: czk(samplePrices.officeDay + samplePrices.officeSeat),
+        ...noSale,
+      },
+      bookableDates: sampleBookableDates(advertisedOn, "office"),
+    },
+  ];
+  return {
+    advertisedOn,
+    openingHours: copy(
+      locale,
+      "Monday to Friday, 8:00–18:00",
+      "Pondělí až pátek, 8:00–18:00"
+    ),
+    offerings,
+  };
+};
+
+/** One summary line before discounts. */
+interface PricedLine {
+  readonly key: string;
+  readonly crowns: number;
+  readonly dayCount?: number;
+  readonly seats?: number;
+  /** An office line's access part, before discounts. */
+  readonly accessCrowns?: number;
+  /** One office seat for the days booked, before discounts. */
+  readonly seatCrowns?: number;
+  /** A workstation line's monitor setup. */
+  readonly monitorOption?: CustomerMonitorOption;
+}
+
+/**
+ * When a meeting-room booking's early setup lets the customer in: 15
+ * minutes before its start, as the Workspace sets it.
+ */
+export const sampleEarlySetupStartsAt = (
+  selection: CustomerBookingSelection
+): string | undefined => {
+  if (selection.family !== "meeting-room" || selection.startTime === undefined)
+    return undefined;
+  const start = pragueInstant({
+    date: selection.date as PragueDate,
+    hour: Number(selection.startTime.slice(0, 2)),
+    minute: Number(selection.startTime.slice(3, 5)),
+  });
+  return new Date(start.getTime() - 15 * 60_000).toISOString();
+};
+
+/** Inclusive Prague days between two plain dates. */
+export const inclusiveDays = (from: PragueDate, to: PragueDate) =>
+  daysBetween(from, to) + 1;
+
+/** The summary lines a complete selection is priced with, in crowns. */
+export const pricedLines = (
+  selection: CustomerBookingSelection
+): ReadonlyArray<PricedLine> => {
+  if (selection.family === "cowork") {
+    const tier = selection.tier ?? "open-space";
+    return [
+      {
+        key: `product:cowork-${tier}`,
+        crowns:
+          tier === "open-space"
+            ? samplePrices.openSpace
+            : samplePrices.reservedDesk,
+      },
+      ...(tier === "open-space" && selection.coffee === true
+        ? [{ key: "addon:coffee", crowns: samplePrices.coffee }]
+        : []),
+      ...(tier === "reserved-desk" && selection.monitorOption !== undefined
+        ? [
+            {
+              key: "addon:workstation",
+              crowns: samplePrices.workstation,
+              monitorOption: selection.monitorOption,
+            },
+          ]
+        : []),
+    ];
+  }
+  if (selection.family === "meeting-room") {
+    const duration = selection.duration ?? "hour:1";
+    return [
+      {
+        key: `product:meeting-room-${duration}`,
+        crowns: samplePrices.meetingRoom[duration],
+      },
+    ];
+  }
+  const dayCount = inclusiveDays(
+    selection.date,
+    selection.endDate ?? selection.date
+  );
+  const seats = selection.seats ?? 1;
+  return [
+    {
+      key: "product:office",
+      crowns:
+        dayCount * (samplePrices.officeDay + seats * samplePrices.officeSeat),
+      dayCount,
+      seats,
+      accessCrowns: dayCount * samplePrices.officeDay,
+      seatCrowns: dayCount * samplePrices.officeSeat,
+    },
+  ];
+};
+
+/** The id of the one discount a sample summary lists. */
+export const sampleDiscountId = "sample-code";
+
+/**
+ * The checkout summary for priced lines, taking `discountShare` (0 to 1) off
+ * every product line and adding `surcharge` crowns to the first line, as a
+ * price change does.
+ */
+export const sampleSummary = ({
+  lines,
+  discountShare = 0,
+  discountLabel = "",
+  surcharge = 0,
+  earlySetupStartsAt,
+}: {
+  readonly lines: ReadonlyArray<PricedLine>;
+  readonly discountShare?: number;
+  readonly discountLabel?: string;
+  readonly surcharge?: number;
+  /** A meeting room's early setup: when the customer may come in, for free. */
+  readonly earlySetupStartsAt?: string | undefined;
+}): CustomerCheckoutSummary => {
+  const items = lines.map((line, index) => {
+    const original = line.crowns + (index === 0 ? surcharge : 0);
+    const off = Math.round(original * discountShare);
+    return {
+      key: line.key,
+      amount: czk(original - off),
+      ...(off > 0
+        ? {
+            originalAmount: czk(original),
+            discounts: [
+              {
+                discount: {
+                  id: sampleDiscountId,
+                  label: discountLabel,
+                  adjustment: {
+                    kind: "percentage" as const,
+                    basisPoints: Math.round(discountShare * 10_000),
+                  },
+                },
+                amount: czk(off),
+              },
+            ],
+          }
+        : {}),
+      ...(line.dayCount === undefined ? {} : { dayCount: line.dayCount }),
+      ...(line.seats === undefined ? {} : { seats: line.seats }),
+      ...(line.accessCrowns === undefined
+        ? {}
+        : { accessAmount: czk(line.accessCrowns) }),
+      ...(line.seatCrowns === undefined
+        ? {}
+        : { seatAmount: czk(line.seatCrowns) }),
+      ...(line.seatCrowns === undefined || line.seats === undefined
+        ? {}
+        : { seatsAmount: czk(line.seatCrowns * line.seats) }),
+      ...(line.dayCount === undefined ||
+      line.accessCrowns === undefined ||
+      line.seatCrowns === undefined
+        ? {}
+        : {
+            dailyAccessRate: czk(line.accessCrowns / line.dayCount),
+            dailySeatRate: czk(line.seatCrowns / line.dayCount),
+          }),
+      ...(index === 0 && earlySetupStartsAt !== undefined
+        ? { earlySetup: { startsAt: earlySetupStartsAt, amount: czk(0) } }
+        : {}),
+      ...(line.monitorOption === undefined
+        ? {}
+        : { monitorOption: line.monitorOption }),
+    };
+  });
+  const total = czk(
+    items.reduce((sum, item) => sum + item.amount.value, 0) / 100
+  );
+  return {
+    sections: [
+      { key: "order", items, total },
+      { key: "total", items: [{ key: "total:final", amount: total }], total },
+    ],
+    total,
+    vatStatus: "not-vat-payer",
+  };
+};
+
+const sampleHash = (seed: string, version: number) =>
+  `${seed}${version.toString(16).padStart(8, "0")}`;
+
+/** The published legal documents at `version`; a new version changes the hashes. */
+export const sampleLegalDocuments = (
+  locale: CustomerLocale,
+  version: number
+): ReadonlyArray<CustomerLegalDocument> => [
+  {
+    key: "terms-and-conditions",
+    path: locale === "cs-CZ" ? "/obchodni-podminky" : "/en-US/terms",
+    hash: sampleHash(
+      "3f6c0b1e9a7d4c2b8e5f1a0d7c6b9e2f4a1d8c7b6e5f0a9d3c2b1e8f",
+      version
+    ),
+    hashAlgorithm: "sha256",
+  },
+  {
+    key: "operating-rules",
+    path: locale === "cs-CZ" ? "/provozni-rad" : "/en-US/operating-rules",
+    hash: sampleHash(
+      "9b2e7d4a1c8f6e3b0d5a2c9f7e4b1d8a6c3f0e7b4d1a9c6f3e0b7d4a",
+      version
+    ),
+    hashAlgorithm: "sha256",
+  },
+];

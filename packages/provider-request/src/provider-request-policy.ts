@@ -1,0 +1,310 @@
+import { Duration, Effect, Schedule } from "effect";
+
+/**
+ * How a provider package retries its requests: an exponential, jittered
+ * backoff from `baseDelay`, at most `maxRetries` times. Which failures are
+ * retried stays with each operation, because only the provider knows which
+ * requests are safe to repeat.
+ */
+export interface ProviderRetryDeclaration {
+  /** Names the provider (and operation, where useful) in retry logs. */
+  readonly label: string;
+  readonly baseDelay: Duration.Input;
+  readonly maxRetries: number;
+}
+
+/** A provider's retry backoff, without a per-attempt timeout. */
+export interface ProviderRetryPolicy {
+  readonly maxRetries: number;
+  /**
+   * Retries `attempt` while `isRetryable` accepts its failure, up to
+   * `maxRetries` times, and logs each retry.
+   */
+  readonly retryWhile: <Failure>(
+    isRetryable: (failure: Failure) => boolean
+  ) => <A, E extends Failure, R>(
+    attempt: Effect.Effect<A, E, R>
+  ) => Effect.Effect<A, E, R>;
+  /**
+   * Retries like `retryWhile`, but waits at least the delay the provider asked
+   * for in the failure (an HTTP `Retry-After`, for example). A failure that
+   * asks for more than `maxRequestedDelay` ends the retries at once, so the
+   * caller never retries earlier than the provider allows.
+   */
+  readonly retryWhileHonoringDelay: <Failure>(
+    isRetryable: (failure: Failure) => boolean,
+    delay: ProviderRequestedDelay<Failure>
+  ) => <A, E extends Failure, R>(
+    attempt: Effect.Effect<A, E, R>
+  ) => Effect.Effect<A, E, R>;
+  /** The longest total backoff between attempts, with jitter at its maximum. */
+  readonly worstCaseBackoff: Duration.Duration;
+  /**
+   * The longest total backoff of `retryWhileHonoringDelay`: each retry waits
+   * the larger of its maximal backoff and `maxRequestedDelay`.
+   */
+  readonly worstCaseBackoffHonoringDelay: (
+    maxRequestedDelay: Duration.Input
+  ) => Duration.Duration;
+  /** Adds the per-attempt timeout of a deployment. */
+  readonly withAttemptTimeout: (
+    attemptTimeout: Duration.Input
+  ) => ProviderRequestPolicy;
+}
+
+/** How a retry reads the wait a provider asked for before the next attempt. */
+export interface ProviderRequestedDelay<Failure> {
+  /** The wait `failure` asks for, if it asks for one. */
+  readonly requestedDelay: (failure: Failure) => Duration.Duration | undefined;
+  /** The longest requested wait the retry honours. */
+  readonly maxRequestedDelay: Duration.Input;
+}
+
+/** A provider's retry backoff and per-attempt timeout, with their bounds. */
+export interface ProviderRequestPolicy
+  extends Omit<ProviderRetryPolicy, "withAttemptTimeout"> {
+  readonly attemptTimeout: Duration.Duration;
+  /**
+   * Bounds one attempt by `attemptTimeout`. A timed-out attempt is
+   * interrupted, which aborts a request that honors the abort signal, and
+   * fails with the provider's typed `onTimeout` failure.
+   */
+  readonly attempt: <TimeoutFailure>(
+    onTimeout: () => TimeoutFailure
+  ) => <A, E, R>(
+    attempt: Effect.Effect<A, E, R>
+  ) => Effect.Effect<A, E | TimeoutFailure, R>;
+  /** The longest an operation built from this provider's requests can take. */
+  readonly worstCase: ProviderOperationWorstCase;
+}
+
+/**
+ * How many pages a paginated load reads. `"unknown"` when the provider decides
+ * how many pages it returns.
+ */
+export type ProviderPageCount = number | "unknown";
+
+/**
+ * How a paginated load retries:
+ *
+ * - `each-page`: every page request is retried on its own.
+ * - `resume`: the load shares one retry budget across its pages, and each
+ *   retry resends the page that failed; pages already read are kept.
+ * - `none`: every page request runs once and the load is not retried.
+ */
+export type ProviderPageRetry = "each-page" | "resume" | "none";
+
+/**
+ * Worst cases assume every attempt waits out its timeout and every backoff
+ * draws the maximum jitter. Counts that are not whole numbers round up, and a
+ * count that is not finite has no finite bound (`Duration.infinity`).
+ */
+export interface ProviderOperationWorstCase {
+  /** One request that runs once: one attempt. */
+  readonly once: Duration.Duration;
+  /**
+   * One retried request: the first attempt and every retry, plus the backoff
+   * between them.
+   */
+  readonly retried: Duration.Duration;
+  /** `calls` requests one after another, each run once or retried. */
+  readonly sequential: (
+    calls: number,
+    each: "once" | "retried"
+  ) => Duration.Duration;
+  /**
+   * A paginated load of `pages` pages. A load always reads its first page. An
+   * `"unknown"` page count has no finite bound, unless the load enforces its
+   * own `deadline` over all its pages, which then bounds it.
+   */
+  readonly paginated: (load: {
+    readonly pages: ProviderPageCount;
+    readonly retry: ProviderPageRetry;
+    readonly deadline?: Duration.Input;
+  }) => Duration.Duration;
+}
+
+/**
+ * `Schedule.jittered` scales each delay by a random factor between 0.8 and
+ * 1.2 (Effect's `Schedule.ts`). Worst cases assume the maximum.
+ */
+const maxJitterFactor = 1.2;
+const backoffFactor = 2;
+
+export const ProviderRetryPolicy = {
+  /** Declares a provider's retry backoff once, for its schedule and bounds. */
+  make: (declaration: ProviderRetryDeclaration): ProviderRetryPolicy => {
+    const retryWhile =
+      <Failure>(isRetryable: (failure: Failure) => boolean) =>
+      <A, E extends Failure, R>(attempt: Effect.Effect<A, E, R>) =>
+        Effect.retry(attempt, {
+          schedule: retrySchedule(declaration, isRetryable),
+        });
+    const retryWhileHonoringDelay =
+      <Failure>(
+        isRetryable: (failure: Failure) => boolean,
+        delay: ProviderRequestedDelay<Failure>
+      ) =>
+      <A, E extends Failure, R>(attempt: Effect.Effect<A, E, R>) =>
+        Effect.retry(attempt, {
+          schedule: retryScheduleHonoringDelay(declaration, isRetryable, delay),
+        });
+    const worstCaseBackoff = getWorstCaseBackoff(declaration);
+    const worstCaseBackoffHonoringDelay = (maxRequestedDelay: Duration.Input) =>
+      getWorstCaseBackoff(declaration, maxRequestedDelay);
+    const retries = {
+      maxRetries: declaration.maxRetries,
+      retryWhile,
+      retryWhileHonoringDelay,
+      worstCaseBackoff,
+      worstCaseBackoffHonoringDelay,
+    };
+
+    return {
+      ...retries,
+      withAttemptTimeout: (input) => {
+        const attemptTimeout = Duration.fromInputUnsafe(input);
+        return {
+          ...retries,
+          attemptTimeout,
+          attempt:
+            <TimeoutFailure>(onTimeout: () => TimeoutFailure) =>
+            <A, E, R>(attempt: Effect.Effect<A, E, R>) =>
+              attempt.pipe(
+                Effect.timeoutOrElse({
+                  duration: attemptTimeout,
+                  orElse: () => Effect.fail(onTimeout()),
+                })
+              ),
+          worstCase: getOperationWorstCase({
+            attemptTimeout,
+            maxRetries: declaration.maxRetries,
+            worstCaseBackoff,
+          }),
+        };
+      },
+    };
+  },
+};
+
+const retrySchedule = <Failure>(
+  { label, baseDelay, maxRetries }: ProviderRetryDeclaration,
+  isRetryable: (failure: Failure) => boolean
+) =>
+  Schedule.exponential(baseDelay, backoffFactor).pipe(
+    Schedule.jittered,
+    Schedule.while<Failure, Duration.Duration>(({ input }) =>
+      isRetryable(input)
+    ),
+    Schedule.upTo({ times: maxRetries }),
+    Schedule.tap(({ output: delay, attempt }) =>
+      Effect.logWarning(`${label} retry attempt #${attempt}`, {
+        attemptNumber: attempt,
+        delayMs: Duration.toMillis(delay),
+        maxRetries,
+      })
+    )
+  );
+
+/**
+ * `retrySchedule` whose every delay is at least the one the failure asks for,
+ * ending the retries when a failure asks for more than the honoured maximum.
+ */
+const retryScheduleHonoringDelay = <Failure>(
+  declaration: ProviderRetryDeclaration,
+  isRetryable: (failure: Failure) => boolean,
+  { requestedDelay, maxRequestedDelay }: ProviderRequestedDelay<Failure>
+) => {
+  const maxDelay = Duration.fromInputUnsafe(maxRequestedDelay);
+  return Schedule.exponential(declaration.baseDelay, backoffFactor).pipe(
+    Schedule.jittered,
+    Schedule.while<Failure, Duration.Duration>(({ input }) => {
+      const delay = requestedDelay(input);
+      return (
+        isRetryable(input) &&
+        (delay === undefined || Duration.isLessThanOrEqualTo(delay, maxDelay))
+      );
+    }),
+    Schedule.modifyDelay(({ input, duration }) =>
+      Effect.succeed(
+        Duration.max(duration, requestedDelay(input) ?? Duration.zero)
+      )
+    ),
+    Schedule.upTo({ times: declaration.maxRetries }),
+    Schedule.tap(({ output: backoff, input, attempt }) =>
+      Effect.logWarning(`${declaration.label} retry attempt #${attempt}`, {
+        attemptNumber: attempt,
+        delayMs: Duration.toMillis(
+          Duration.max(backoff, requestedDelay(input) ?? Duration.zero)
+        ),
+        maxRetries: declaration.maxRetries,
+      })
+    )
+  );
+};
+
+const getWorstCaseBackoff = (
+  { baseDelay, maxRetries }: ProviderRetryDeclaration,
+  maxRequestedDelay: Duration.Input = Duration.zero
+) => {
+  const baseMilliseconds = Duration.toMillis(
+    Duration.fromInputUnsafe(baseDelay)
+  );
+  const requestedMilliseconds = Duration.toMillis(
+    Duration.fromInputUnsafe(maxRequestedDelay)
+  );
+  let backoffMilliseconds = 0;
+  for (let retry = 0; retry < maxRetries; retry += 1) {
+    backoffMilliseconds += Math.max(
+      baseMilliseconds * backoffFactor ** retry * maxJitterFactor,
+      requestedMilliseconds
+    );
+  }
+  return Duration.millis(backoffMilliseconds);
+};
+
+const getOperationWorstCase = ({
+  attemptTimeout,
+  maxRetries,
+  worstCaseBackoff,
+}: {
+  readonly attemptTimeout: Duration.Duration;
+  readonly maxRetries: number;
+  readonly worstCaseBackoff: Duration.Duration;
+}): ProviderOperationWorstCase => {
+  const once = attemptTimeout;
+  const retried = Duration.sum(
+    Duration.times(attemptTimeout, maxRetries + 1),
+    worstCaseBackoff
+  );
+  const request = { once, retried };
+
+  return {
+    once,
+    retried,
+    sequential: (calls, each) => repeated(request[each], Math.max(0, calls)),
+    paginated: ({ pages, retry, deadline }) => {
+      const pageCount = pages === "unknown" ? Infinity : Math.max(1, pages);
+      const load = {
+        "each-page": () => repeated(retried, pageCount),
+        // Each page waits out one attempt, and the shared retries each wait
+        // out one more, plus the backoff between them.
+        resume: () =>
+          Duration.sum(
+            repeated(attemptTimeout, pageCount + maxRetries),
+            worstCaseBackoff
+          ),
+        none: () => repeated(once, pageCount),
+      }[retry]();
+      return deadline === undefined
+        ? load
+        : Duration.min(load, Duration.fromInputUnsafe(deadline));
+    },
+  };
+};
+
+/** `count` operations of `bound` one after another; rounds a partial count up. */
+const repeated = (bound: Duration.Duration, count: number) =>
+  Number.isFinite(count)
+    ? Duration.times(bound, Math.ceil(count))
+    : Duration.infinity;

@@ -1,0 +1,100 @@
+import {
+  type CheckoutSummary,
+  checkoutSummaryDiscountSchema,
+  checkoutSummaryOrderSectionSchema,
+  checkoutSummarySchema,
+  checkoutSummaryTotalSectionSchema,
+} from "@/features/checkout/checkout-summary";
+import {
+  officeCheckoutSummaryDiscountedProductItemSchema,
+  officeCheckoutSummaryProductItemSchema,
+} from "@/features/checkout/checkout-summary-office-item";
+import {
+  getWorkspaceOfficeAccessPrice,
+  getWorkspaceOfficeSeatPrice,
+} from "@/features/checkout/product-catalog";
+import { getWorkspaceProductKey } from "@/features/checkout/product-identity";
+import {
+  getOfficeSeatsAmount,
+  type OfficeReservationQuote,
+} from "@/features/checkout/reservation-quote-office";
+import {
+  getWorkspaceOfficeProductIdentity,
+  type OfficeReservationDetails,
+} from "@/features/reservation/office-reservation";
+
+/** The dates, seats and public price of the office hold reopened from Pay. */
+export type HeldOfficePrice = Pick<
+  OfficeReservationDetails,
+  "startsOn" | "endsOn" | "seats"
+> & { readonly summary: CheckoutSummary };
+
+export const getOfficeCheckoutSummary = (
+  quote: OfficeReservationQuote
+): CheckoutSummary => {
+  const [item] = quote.items;
+  const product = getWorkspaceOfficeProductIdentity({
+    dayCount: item.dayCount,
+    seats: item.seats,
+  });
+  const key = `product:${getWorkspaceProductKey(product)}` as const;
+  const summaryDiscounts = quote.payment.discounts.map(({ amount, discount }) =>
+    checkoutSummaryDiscountSchema.make({ amount, discount })
+  );
+  const shared = {
+    key,
+    product,
+    dayCount: item.dayCount,
+    seats: item.seats,
+    accessAmount: item.accessAmount,
+    seatAmount: item.seatAmount,
+    seatsAmount: getOfficeSeatsAmount(item),
+    dailyAccessRate: getWorkspaceOfficeAccessPrice(1),
+    dailySeatRate: getWorkspaceOfficeSeatPrice(1),
+  };
+  const productItem =
+    summaryDiscounts.length > 0
+      ? officeCheckoutSummaryDiscountedProductItemSchema.make({
+          ...shared,
+          amount: quote.payment.expectedPrice,
+          originalAmount: quote.payment.undiscountedPrice,
+          discounts: [summaryDiscounts[0]!, ...summaryDiscounts.slice(1)],
+        })
+      : officeCheckoutSummaryProductItemSchema.make({
+          ...shared,
+          amount: quote.payment.undiscountedPrice,
+        });
+  const orderSection = checkoutSummaryOrderSectionSchema.make({
+    key: "order",
+    items: [productItem],
+    total: quote.payment.expectedPrice,
+  });
+  const totalSection = checkoutSummaryTotalSectionSchema.make({
+    key: "total",
+    items: [{ key: "total:final", amount: quote.payment.expectedPrice }],
+    total: quote.payment.expectedPrice,
+  });
+
+  return checkoutSummarySchema.make({
+    sections: [orderSection, totalSection],
+    total: quote.payment.expectedPrice,
+  });
+};
+
+/** Office edit shows public price details and sends them back for comparison. */
+export const getOfficeEditPriceSummary = (quote: OfficeReservationQuote) =>
+  getOfficeCheckoutSummary({
+    ...quote,
+    payment: {
+      ...quote.payment,
+      discounts: quote.payment.discounts.map(
+        ({
+          discount: { staffLabel: _staffLabel, ...discount },
+          ...applied
+        }) => ({
+          ...applied,
+          discount,
+        })
+      ),
+    },
+  });

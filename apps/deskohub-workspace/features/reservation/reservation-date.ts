@@ -1,0 +1,187 @@
+import { Option, Schema } from "effect";
+import type { Locale } from "@/features/i18n";
+import {
+  formatInstantDate,
+  formatInstantDateRange,
+  formatInstantDateTimeRange,
+  formatPlainDate,
+  formatPlainDateRange,
+} from "@/shared/utils/date-time-format";
+import { workspaceSiteConstants } from "@/shared/utils/site-constants";
+import {
+  plainDateStringSchema,
+  temporalInstantToDate,
+  temporalPlainDateToDate,
+} from "@/shared/utils/temporal";
+
+/** The workspace calendar date (Prague) of an instant. */
+export const getWorkspaceDate = (instant: Temporal.Instant) =>
+  instant
+    .toZonedDateTimeISO(workspaceSiteConstants.location.timeZone)
+    .toPlainDate();
+
+export const getCurrentWorkspaceDate = (now = Temporal.Now.instant()) =>
+  getWorkspaceDate(now);
+
+/** The first and last Prague dates touched by a nonempty half-open interval. */
+export const getTouchedWorkspaceDateBounds = (interval: {
+  readonly startsAt: Temporal.Instant;
+  readonly endsAt: Temporal.Instant;
+}) => ({
+  first: getWorkspaceDate(interval.startsAt),
+  last: getWorkspaceDate(interval.endsAt.subtract({ nanoseconds: 1 })),
+});
+
+/**
+ * Whether an interval holds some moment between `now` and the end of the
+ * workspace date (Prague) `now` falls on: it starts by that date and hasn't
+ * ended. An interval ending at `now` has ended.
+ */
+export const isOpenOnCurrentWorkspaceDate = (
+  interval: {
+    readonly startsAt: Temporal.Instant;
+    readonly endsAt: Temporal.Instant;
+  },
+  now: Temporal.Instant
+) =>
+  Temporal.PlainDate.compare(
+    getWorkspaceDate(interval.startsAt),
+    getWorkspaceDate(now)
+  ) <= 0 && Temporal.Instant.compare(interval.endsAt, now) > 0;
+
+export const isTodayOrFutureWorkspaceDate = (date: string) =>
+  date >= getCurrentWorkspaceDate().toString();
+
+const reservationDisplayDateFormatOptions: Intl.DateTimeFormatOptions = {
+  dateStyle: "full",
+  timeZone: workspaceSiteConstants.location.timeZone,
+};
+
+const reservationDisplayTimeFormatOptions: Intl.DateTimeFormatOptions = {
+  timeStyle: "short",
+  timeZone: workspaceSiteConstants.location.timeZone,
+};
+
+const reservationDisplayDateTimeFormatOptions: Intl.DateTimeFormatOptions = {
+  dateStyle: "medium",
+  timeStyle: "short",
+  timeZone: workspaceSiteConstants.location.timeZone,
+};
+
+const decodePlainDate = Schema.decodeUnknownOption(plainDateStringSchema);
+
+const parseReservationInputDate = (date: string) =>
+  decodePlainDate(date).pipe(
+    Option.map((plainDate) =>
+      temporalPlainDateToDate({
+        date: Temporal.PlainDate.from(plainDate),
+        plainTime: Temporal.PlainTime.from("12:00"),
+        timeZone: workspaceSiteConstants.location.timeZone,
+      })
+    ),
+    Option.getOrUndefined
+  );
+
+export const formatReservationDisplayDate = (
+  date: Temporal.Instant,
+  locale: Locale
+) =>
+  formatInstantDate({
+    instant: date,
+    locale,
+    dateStyle: reservationDisplayDateFormatOptions.dateStyle,
+    timeZone: workspaceSiteConstants.location.timeZone,
+  });
+
+export const formatReservationDisplayDateRange = (
+  start: Temporal.Instant,
+  exclusiveEnd: Temporal.Instant,
+  locale: Locale
+) => {
+  const inclusiveEnd = Temporal.Instant.fromEpochMilliseconds(
+    exclusiveEnd.epochMilliseconds - 1
+  );
+  return formatInstantDateRange({
+    start,
+    end: inclusiveEnd,
+    locale,
+    dateStyle: reservationDisplayDateFormatOptions.dateStyle,
+    timeZone: workspaceSiteConstants.location.timeZone,
+  });
+};
+
+/** A reservation's calendar date, written out as reservation summaries show it. */
+export const formatReservationDisplayPlainDate = (
+  date: Temporal.PlainDate,
+  locale: Locale
+) =>
+  formatPlainDate({
+    date,
+    locale,
+    dateStyle: reservationDisplayDateFormatOptions.dateStyle,
+  });
+
+/** An inclusive range of reservation calendar dates. */
+export const formatReservationDisplayPlainDateRange = (
+  start: Temporal.PlainDate,
+  end: Temporal.PlainDate,
+  locale: Locale
+) =>
+  formatPlainDateRange({
+    start,
+    end,
+    locale,
+    dateStyle: reservationDisplayDateFormatOptions.dateStyle,
+  });
+
+export const formatReservationInputDate = (
+  date: string,
+  locale: Locale,
+  fallback = date
+) => {
+  const parsedDate = parseReservationInputDate(date);
+
+  return parsedDate
+    ? new Intl.DateTimeFormat(
+        locale,
+        reservationDisplayDateFormatOptions
+      ).format(parsedDate)
+    : fallback;
+};
+
+export const formatReservationDisplayTimeRange = (
+  start: Temporal.Instant,
+  end: Temporal.Instant,
+  locale: Locale
+) =>
+  new Intl.DateTimeFormat(
+    locale,
+    reservationDisplayTimeFormatOptions
+  ).formatRange(temporalInstantToDate(start), temporalInstantToDate(end));
+
+/**
+ * A reservation that starts and ends at set times on different dates, such as
+ * an overnight stay, with both dates and times.
+ */
+export const formatReservationDisplayDateTimeRange = (
+  start: Temporal.Instant,
+  end: Temporal.Instant,
+  locale: Locale
+) =>
+  formatInstantDateTimeRange({
+    start,
+    end,
+    locale,
+    dateStyle: reservationDisplayDateTimeFormatOptions.dateStyle,
+    timeStyle: reservationDisplayDateTimeFormatOptions.timeStyle,
+    timeZone: workspaceSiteConstants.location.timeZone,
+  });
+
+export const formatReservationDisplayDateTime = (
+  instant: Temporal.Instant,
+  locale: Locale
+) =>
+  new Intl.DateTimeFormat(
+    locale,
+    reservationDisplayDateTimeFormatOptions
+  ).format(temporalInstantToDate(instant));
