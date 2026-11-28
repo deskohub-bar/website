@@ -1,0 +1,25 @@
+{
+  "name": "@deskohub/workspace-cloud-run",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./preview-generation": "./src/preview-generation.ts",
+    "./sandbox-probe": "./src/sandbox-probe/probe.ts",
+    "./sandbox-probe/email-preferences": "./src/sandbox-probe/email-preferences-rpcs.ts",
+    "./sandbox-probe/rpcs": "./src/sandbox-probe/probe-rpcs.ts",
+    "./service-role": "./src/service-role.ts",
+    "./sha256": "./src/sha256.mjs"
+  },
+  "scripts": {
+    "lint": "biome check .",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "dependencies": {
+    "@deskohub/workspace-rpc": "workspace:*",
+    "effect": "4.1.4"
+  },
+  "devDependencies": {
+    "typescript": "npm:@typescript/typescript6@6.0.2"
+  }
+}

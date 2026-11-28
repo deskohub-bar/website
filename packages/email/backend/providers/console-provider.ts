@@ -1,0 +1,120 @@
+import { Effect } from "effect";
+import {
+  type EmailDeliveryId,
+  EmailDeliveryIdSchema,
+  type EmailMessage,
+  type EmailSendResult,
+} from "../../types/email.types";
+import type { EmailProvider } from "../capabilities";
+import { emailRequestFingerprint } from "../email-request-fingerprint";
+
+const recipientAddresses = (message: EmailMessage): readonly string[] =>
+  Array.isArray(message.to)
+    ? message.to.map((recipient) => recipient.email)
+    : [message.to.email];
+
+const consoleDeliveryIdPrefix = "console-";
+
+/**
+ * Console never reports delivery, so callers treat its acceptance as final
+ * instead of waiting for a provider webhook.
+ */
+export const isConsoleEmailDeliveryId = (id: EmailDeliveryId): boolean =>
+  id.startsWith(consoleDeliveryIdPrefix);
+
+/**
+ * Logs mail instead of sending it. Internal: the email service sends through
+ * it when a message addresses only test recipients under recipient routing,
+ * or when the message's stream has an empty provider chain.
+ */
+export const ConsoleEmailProvider: EmailProvider = {
+  name: "console",
+
+  send: Effect.fn("consoleEmailProvider.send")(function* (
+    message: EmailMessage
+  ) {
+    if (message.sensitiveContent === true) {
+      // Sensitive messages may carry bearer data; log only non-PII facts.
+      yield* Effect.logInfo("Console Email Provider - Sending Email", {
+        category: message.tags?.[0],
+        hasHtml: !!message.html,
+        hasText: !!message.text,
+        sensitive: true,
+      });
+    } else {
+      const recipients = recipientAddresses(message);
+      yield* Effect.logInfo("Console Email Provider - Sending Email", {
+        from: message.from.email,
+        to: recipients,
+        subject: message.subject,
+        hasHtml: !!message.html,
+        hasText: !!message.text,
+        attachments: message.attachments?.map((attachment) => ({
+          filename: attachment.filename,
+          contentType: attachment.contentType,
+          contentId: attachment.contentId,
+        })),
+        tags: message.tags,
+        metadata: message.metadata,
+      });
+
+      if (process.env.NODE_ENV === "development") {
+        // biome-ignore lint/suspicious/noConsole: Console provider intentionally logs to console for development
+        console.log(`\n${"=".repeat(60)}`);
+        // biome-ignore lint/suspicious/noConsole: Console provider intentionally logs to console for development
+        console.log("EMAIL CONTENT:");
+        // biome-ignore lint/suspicious/noConsole: Console provider intentionally logs to console for development
+        console.log("=".repeat(60));
+        // biome-ignore lint/suspicious/noConsole: Console provider intentionally logs to console for development
+        console.log("Subject:", message.subject);
+        // biome-ignore lint/suspicious/noConsole: Console provider intentionally logs to console for development
+        console.log("To:", recipients.join(", "));
+        if (message.text) {
+          // biome-ignore lint/suspicious/noConsole: Console provider intentionally logs to console for development
+          console.log("\nText Version:");
+          // biome-ignore lint/suspicious/noConsole: Console provider intentionally logs to console for development
+          console.log("-".repeat(40));
+          // biome-ignore lint/suspicious/noConsole: Console provider intentionally logs to console for development
+          console.log(message.text);
+        }
+        if (message.html) {
+          // biome-ignore lint/suspicious/noConsole: Console provider intentionally logs to console for development
+          console.log("\nHTML Version (first 500 chars):");
+          // biome-ignore lint/suspicious/noConsole: Console provider intentionally logs to console for development
+          console.log("-".repeat(40));
+          // biome-ignore lint/suspicious/noConsole: Console provider intentionally logs to console for development
+          console.log(`${message.html.substring(0, 500)}...`);
+        }
+        // biome-ignore lint/suspicious/noConsole: Console provider intentionally logs to console for development
+        console.log(`${"=".repeat(60)}\n`);
+      }
+    }
+
+    const result: EmailSendResult = {
+      id: EmailDeliveryIdSchema.make(
+        `${consoleDeliveryIdPrefix}${Date.now()}-${Math.random().toString(36).substring(7)}`
+      ),
+      status: "sent",
+      provider: "console",
+      timestamp: new Date(),
+    };
+
+    yield* Effect.logInfo("Console Email Provider - Email sent", {
+      id: result.id,
+    });
+
+    return result;
+  }),
+
+  sendBatch: Effect.fn("consoleEmailProvider.sendBatch")(
+    function* (messages, options) {
+      yield* options.beforeRequest?.(
+        emailRequestFingerprint(["console", options.idempotencyKey, messages]),
+        messages.map((_, position) => position)
+      ) ?? Effect.void;
+      return yield* Effect.forEach(messages, (message) =>
+        ConsoleEmailProvider.send(message)
+      );
+    }
+  ),
+};

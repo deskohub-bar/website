@@ -1,0 +1,3 @@
+ALTER TABLE "email_campaign_recipients" ADD COLUMN "payload_fingerprint" text;--> statement-breakpoint
+ALTER TABLE "email_campaigns" ADD CONSTRAINT "email_campaigns_published_email_check" CHECK ("delivery" <> 'once' or "email_id" is null or ("purpose" = 'marketing' and "content" = '{}'::jsonb));--> statement-breakpoint
+ALTER TABLE "email_campaign_recipients" DROP CONSTRAINT "email_campaign_recipients_skip_reason_check", ADD CONSTRAINT "email_campaign_recipients_skip_reason_check" CHECK (("status" = 'skipped') = ("skip_reason" is not null) and ("skip_reason" is null or "skip_reason" in ('missing-from-dotypos', 'deleted-customer', 'missing-email', 'invalid-email', 'consent-withdrawn', 'outside-test-domain', 'missing-email-language')));

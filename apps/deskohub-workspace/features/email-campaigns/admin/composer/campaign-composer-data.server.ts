@@ -1,0 +1,167 @@
+import "server-only";
+
+import { emailDocumentRequiredTriggers } from "@deskohub/workspace-admin-api";
+import { Effect, Layer } from "effect";
+import { WorkspaceDatabase } from "@/db/database.service";
+import { m } from "@/features/administration/i18n";
+import { runAdministrationPage } from "@/features/administrators/server/administration-request.server";
+import type { Locale } from "@/features/i18n";
+import { getRequestLocale } from "@/features/i18n/server/request-locale";
+import {
+  isPublishedEmailCompatibleWithDelivery,
+  listCampaignEmailPublications,
+} from "../../backend/campaign-published-email";
+import { campaignBodyFormatVersion } from "../../body/campaign-body-document";
+import type {
+  CampaignLocaleContent,
+  CampaignTemplateKey,
+} from "../../body/campaign-content";
+import { renderCampaignEmailPreview } from "../../campaign-email";
+import { campaignContentLocaleOrder } from "../../recipient-locale";
+import { loadAudienceOptions } from "../audiences/audience-page-data.server";
+import {
+  campaignOperationCapabilities,
+  invokeCampaignOperation,
+} from "../campaign-operation-query.server";
+import type { CampaignComposerTemplate } from "./campaign-composer";
+
+/** Placeholder content that shows a template's typography and footer. */
+const templateSampleContent: CampaignLocaleContent = {
+  subject: "Sample campaign",
+  preheader: "How this template looks with typical content.",
+  body: {
+    formatVersion: campaignBodyFormatVersion,
+    doc: {
+      type: "doc",
+      content: [
+        {
+          type: "heading",
+          attrs: { level: 1 },
+          content: [{ type: "text", text: "A heading for your news" }],
+        },
+        {
+          type: "paragraph",
+          content: [
+            { type: "text", text: "Paragraph text with " },
+            { type: "text", text: "bold", marks: [{ type: "bold" }] },
+            { type: "text", text: " and " },
+            { type: "text", text: "italic", marks: [{ type: "italic" }] },
+            { type: "text", text: " words, and " },
+            {
+              type: "text",
+              text: "a link",
+              marks: [{ type: "link", attrs: { href: "https://deskohub.cz" } }],
+            },
+            { type: "text", text: "." },
+          ],
+        },
+        {
+          type: "bulletList",
+          content: ["First point", "Second point"].map((text) => ({
+            type: "listItem",
+            content: [{ type: "paragraph", content: [{ type: "text", text }] }],
+          })),
+        },
+        {
+          type: "ctaButton",
+          attrs: { label: "Call to action", href: "https://deskohub.cz" },
+        },
+        { type: "horizontalRule" },
+        {
+          type: "paragraph",
+          content: [{ type: "text", text: "A closing line after a divider." }],
+        },
+      ],
+    },
+  },
+};
+
+/**
+ * Admin descriptions of the templates. The template's own description stays
+ * English for the administration API.
+ */
+const campaignTemplateDescriptions = {
+  workspace: m.emailCampaignsComposerTemplateWorkspaceDescription,
+} as const satisfies Record<CampaignTemplateKey, (...args: never) => string>;
+
+/** The port's templates, each rendered with the sample content. */
+const loadTemplates = (locale: Locale) =>
+  invokeCampaignOperation("listCampaignTemplates", {}).pipe(
+    Effect.flatMap((templates) =>
+      Effect.forEach(templates, (template) =>
+        renderCampaignEmailPreview({
+          templateKey: template.key,
+          purpose: "marketing",
+          locale: "en-US",
+          content: templateSampleContent,
+        }).pipe(
+          Effect.map(
+            ({ html }): CampaignComposerTemplate => ({
+              key: template.key,
+              name: template.name,
+              description: campaignTemplateDescriptions[template.key](
+                {},
+                { locale }
+              ),
+              previewHtml: html,
+            })
+          )
+        )
+      )
+    )
+  );
+
+/** The fixed test-send inbox, or null where campaign email isn't configured. */
+const loadAdminInbox = invokeCampaignOperation("getCampaignSettings", {}).pipe(
+  Effect.map(({ testSendInbox }) => testSendInbox)
+);
+
+const loadPublishedEmails = Effect.flatMap(WorkspaceDatabase, ({ db }) =>
+  listCampaignEmailPublications(db).pipe(
+    Effect.map((rows) =>
+      rows.map(({ emailId, title, document }) => ({
+        emailId,
+        title,
+        locales: campaignContentLocaleOrder.filter((locale) =>
+          Object.hasOwn(document.translations, locale)
+        ),
+        compatibleWithOnce: isPublishedEmailCompatibleWithDelivery(
+          document,
+          "once"
+        ),
+        compatibleWithAutomated: isPublishedEmailCompatibleWithDelivery(
+          document,
+          "automated"
+        ),
+        requiredTriggers: emailDocumentRequiredTriggers(document),
+      }))
+    )
+  )
+);
+
+const loadComposerOptions = () =>
+  runAdministrationPage(
+    "email-campaigns.admin.load-composer",
+    Effect.promise(() => getRequestLocale()).pipe(
+      Effect.flatMap((locale) =>
+        Effect.all(
+          {
+            templates: loadTemplates(locale),
+            adminInbox: loadAdminInbox,
+            publishedEmails: loadPublishedEmails,
+          },
+          { concurrency: "unbounded" }
+        )
+      )
+    ),
+    Layer.merge(campaignOperationCapabilities, WorkspaceDatabase.Default)
+  );
+
+/** Audiences, templates, and the test inbox the composer offers. */
+export const loadCampaignComposerOptions = async () => {
+  const [audiences, options] = await Promise.all([
+    loadAudienceOptions(),
+    loadComposerOptions(),
+  ]);
+  return { audiences, ...options };
+};

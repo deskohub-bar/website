@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "composite": false,
+    "noEmit": true
+  },
+  "include": [
+    "src/**/*.ts",
+    "sandbox-probe/**/*.ts",
+    "scripts/**/*.ts",
+    "alchemy.run.ts",
+    "backend-preview.alchemy.ts",
+    "release.run.ts"
+  ]
+}

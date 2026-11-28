@@ -1,0 +1,24 @@
+{
+  "name": "deskohub-workspace-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun build.ts main",
+    "build:sandbox": "bun build.ts sandbox",
+    "lint": "cd ../.. && biome check apps/deskohub-workspace-api",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "dependencies": {
+    "@deskohub/workspace-backend": "workspace:*",
+    "@deskohub/workspace-cloud-run": "workspace:*",
+    "@deskohub/workspace-rpc": "workspace:*",
+    "@deskohub/workspace-telemetry": "workspace:*",
+    "@effect/platform-node": "4.1.4",
+    "@js-temporal/polyfill": "^0.5.1",
+    "effect": "4.1.4"
+  },
+  "devDependencies": {
+    "typescript": "npm:@typescript/typescript6@6.0.2"
+  }
+}

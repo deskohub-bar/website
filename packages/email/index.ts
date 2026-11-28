@@ -1,0 +1,44 @@
+export {
+  continuesEmailChain,
+  type EmailBatchOptions,
+  type EmailFailureKind,
+  type EmailProvider,
+} from "./backend/capabilities";
+export { makeEmailConfigLayer } from "./backend/email-config";
+export {
+  EmailDeliveryObserver,
+  type EmailFallbackEvent,
+  type EmailSentEvent,
+} from "./backend/email-delivery-observer";
+export {
+  type EmailProviderChains,
+  EmailProviders,
+  type EmailStream,
+} from "./backend/email-providers";
+export { emailRequestFingerprint } from "./backend/email-request-fingerprint";
+export {
+  internalRecipientForOrigin,
+  staffEmailSubject,
+} from "./backend/email-routing";
+export { NetworkError, type NetworkFailureKind } from "./backend/network-error";
+export { isConsoleEmailDeliveryId } from "./backend/providers/console-provider";
+export {
+  EmailConfigTag,
+  type EmailSendError,
+  EmailServiceError,
+  EmailServiceTag,
+} from "./backend/service";
+export { isTestEmailRecipient } from "./backend/test-recipients";
+export type {
+  EmailAttachment,
+  EmailBatchResult,
+  EmailConfig,
+  EmailDeliveryId,
+  EmailMessage,
+  EmailMetadataValue,
+  EmailProviderConfig,
+  EmailRecipient,
+  EmailSendFailure,
+  EmailSendResult,
+} from "./types/email.types";
+export { EmailDeliveryIdSchema } from "./types/email.types";

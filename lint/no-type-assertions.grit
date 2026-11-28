@@ -1,0 +1,25 @@
+engine biome(1.0)
+language js(typescript, jsx)
+
+// Biome overrides select the package and Workspace paths relative to the config.
+file($name, $body) where {
+  $name <: r".*\.(?:ts|tsx|mts|cts)$",
+  // Every `as` assertion has the `as` keyword and every angle-bracket assertion a `<`.
+  $body <: r"(?s).*(?:\bas\b|<).*",
+  $body <: contains bubble {
+    or {
+      TsAsExpression() as $assertion where {
+        not $assertion <: `$value as const`
+      },
+      TsTypeAssertionExpression(ty = $type) as $assertion where {
+        not $type <: r"^const$"
+      }
+    } where {
+      register_diagnostic(
+        span = $assertion,
+        message = "[anti-slop/no-type-assertions] Decode with Schema or narrow the value. Const assertions are allowed with `as const` and `<const>`.",
+        severity = "error"
+      )
+    }
+  }
+}

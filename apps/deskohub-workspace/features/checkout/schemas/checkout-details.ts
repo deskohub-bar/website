@@ -1,0 +1,98 @@
+import { Match, Schema } from "effect";
+import type { CoworkReservationQuote } from "@/features/checkout/reservation-quote-cowork";
+import type { MeetingRoomReservationQuote } from "@/features/checkout/reservation-quote-meeting-room";
+import type { OfficeReservationQuote } from "@/features/checkout/reservation-quote-office";
+import type { TableReservationQuote } from "@/features/checkout/reservation-quote-table";
+import {
+  coworkCheckoutDetailsSchema,
+  getCoworkCheckoutDetails,
+} from "@/features/checkout/schemas/checkout-details-cowork";
+import {
+  getMeetingRoomCheckoutDetails,
+  meetingRoomCheckoutDetailsSchema,
+} from "@/features/checkout/schemas/checkout-details-meeting-room";
+import {
+  getOfficeCheckoutDetails,
+  officeCheckoutDetailsSchema,
+} from "@/features/checkout/schemas/checkout-details-office";
+import {
+  getTableCheckoutDetails,
+  tableCheckoutDetailsSchema,
+} from "@/features/checkout/schemas/checkout-details-table";
+import type { Locale } from "@/features/i18n";
+import type { NormalizedCoworkReservationOrder } from "@/features/reservation/cowork-reservation";
+import type { NormalizedMeetingRoomReservationOrder } from "@/features/reservation/meeting-room-reservation";
+import type { NormalizedOfficeReservationOrder } from "@/features/reservation/office-reservation";
+import type { NormalizedTableReservationOrder } from "@/features/reservation/table-reservation";
+
+export const checkoutDetailsSchema = Schema.Union([
+  coworkCheckoutDetailsSchema,
+  meetingRoomCheckoutDetailsSchema,
+  officeCheckoutDetailsSchema,
+  tableCheckoutDetailsSchema,
+]).annotate({
+  identifier: "CheckoutDetails",
+  description: "Transient PII-free checkout provider snapshot.",
+});
+
+export type CheckoutDetails = typeof checkoutDetailsSchema.Type;
+
+/**
+ * Checkout details for log annotations: the reservation kind and how many
+ * discounts the price includes. The details themselves, with the reservation
+ * projection, price summary and legal evidence, stay off every row the
+ * annotation reaches.
+ */
+export const checkoutDetailsLogFields = (details: CheckoutDetails) => ({
+  reservationKind: details.reservation.kind,
+  discountCount: details.payment.discounts.length,
+});
+
+/** A submitted reservation of any family with its quote. */
+type PricedReservation =
+  | {
+      readonly kind: NormalizedCoworkReservationOrder["kind"];
+      readonly reservation: NormalizedCoworkReservationOrder;
+      readonly quote: CoworkReservationQuote;
+    }
+  | {
+      readonly kind: NormalizedMeetingRoomReservationOrder["kind"];
+      readonly reservation: NormalizedMeetingRoomReservationOrder;
+      readonly quote: MeetingRoomReservationQuote;
+    }
+  | {
+      readonly kind: NormalizedOfficeReservationOrder["kind"];
+      readonly reservation: NormalizedOfficeReservationOrder;
+      readonly quote: OfficeReservationQuote;
+    }
+  | {
+      readonly kind: "table";
+      readonly reservation: NormalizedTableReservationOrder;
+      readonly quote: TableReservationQuote;
+    };
+
+/** The checkout details of a priced reservation, by its family. */
+export const getCheckoutDetails = (input: {
+  readonly locale: Locale;
+  readonly priced: PricedReservation;
+  readonly legalEvidence: CheckoutDetails["legal"];
+}): CheckoutDetails => {
+  const { locale, legalEvidence } = input;
+  return Match.value(input.priced).pipe(
+    Match.discriminatorsExhaustive("kind")({
+      cowork: ({ reservation, quote }) =>
+        getCoworkCheckoutDetails({ locale, reservation, quote, legalEvidence }),
+      "meeting-room": ({ reservation, quote }) =>
+        getMeetingRoomCheckoutDetails({
+          locale,
+          reservation,
+          quote,
+          legalEvidence,
+        }),
+      office: ({ reservation, quote }) =>
+        getOfficeCheckoutDetails({ locale, reservation, quote, legalEvidence }),
+      table: ({ reservation, quote }) =>
+        getTableCheckoutDetails({ locale, reservation, quote, legalEvidence }),
+    })
+  );
+};

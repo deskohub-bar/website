@@ -1,0 +1,42 @@
+import { NexiAmountSchema, nexiMinorUnitExponent } from "@deskohub/nexi";
+import { Effect, Schema, SchemaGetter, SchemaIssue } from "effect";
+import { positiveMoneyCodec } from "@/shared/money/money";
+
+const invalidValue = <T>(actual: T, message: string) =>
+  new SchemaIssue.InvalidValue({ message }, actual);
+
+export const NexiAmountFromWorkspaceMoney = NexiAmountSchema.pipe(
+  Schema.decodeTo(positiveMoneyCodec, {
+    decode: SchemaGetter.transformEffect((nexiAmount, options) =>
+      Schema.decodeUnknownEffect(positiveMoneyCodec)(
+        {
+          value: Number(nexiAmount.amount),
+          exponent: nexiMinorUnitExponent,
+          currency: nexiAmount.currency,
+        },
+        options
+      ).pipe(
+        Effect.mapError((error) => invalidValue(nexiAmount, error.message))
+      )
+    ),
+    encode: SchemaGetter.transformEffect<
+      typeof NexiAmountSchema.Type,
+      typeof positiveMoneyCodec.Encoded
+    >((money, options) =>
+      Schema.decodeUnknownEffect(NexiAmountSchema)(
+        {
+          amount: (
+            money.value *
+            10 ** (nexiMinorUnitExponent - money.exponent)
+          ).toString(),
+          currency: money.currency,
+        },
+        options
+      ).pipe(Effect.mapError((error) => invalidValue(money, error.message)))
+    ),
+  })
+).annotate({
+  identifier: "NexiAmountFromWorkspaceMoney",
+  description:
+    "Codec between Money and Nexi's integer minor-unit amount shape with ISO 4217 currency.",
+});

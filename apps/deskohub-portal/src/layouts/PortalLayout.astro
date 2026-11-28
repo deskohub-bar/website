@@ -1,0 +1,37 @@
+---
+import "../styles/global.css";
+
+import type { PortalMetadata } from "../lib/portal";
+
+type Props = {
+  barClosed: boolean;
+  metadata: PortalMetadata;
+};
+
+const { barClosed, metadata } = Astro.props;
+---
+
+<!doctype html>
+<html lang={metadata.lang}>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="/favicon.svg" />
+    <title>{metadata.title}</title>
+    <meta name="description" content={metadata.metaDescription} />
+    <link rel="canonical" href={metadata.canonicalUrl} />
+    {
+      metadata.alternates.map(({ href, hrefLang }) => (
+        <link rel="alternate" hreflang={hrefLang} href={href} />
+      ))
+    }
+    <link
+      rel="alternate"
+      hreflang="x-default"
+      href={metadata.alternateDefaultUrl}
+    />
+  </head>
+  <body class:list={["portal-shell", { "portal-shell-bar-closed": barClosed }]}>
+    <slot />
+  </body>
+</html>

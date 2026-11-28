@@ -1,0 +1,23 @@
+{
+  "name": "@deskohub/workspace-domain",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./features/*": "./src/features/*.ts",
+    "./shared/*": "./src/shared/*.ts"
+  },
+  "scripts": {
+    "lint": "biome check .",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "dependencies": {
+    "@deskohub/i18n": "workspace:*",
+    "@deskohub/workspace-admin-api": "workspace:*",
+    "effect": "4.1.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.1",
+    "typescript": "npm:@typescript/typescript6@6.0.2"
+  }
+}

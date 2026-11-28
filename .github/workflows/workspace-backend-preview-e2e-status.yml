@@ -1,0 +1,48 @@
+name: Workspace backend preview proof
+
+on:
+  workflow_run:
+    workflows: [Workspace E2E]
+    branches: [main]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  publish-pilot-status:
+    if: >-
+      github.repository_id == '1015951989' && github.ref == 'refs/heads/main' && github.ref_protected &&
+      vars.WORKSPACE_BACKEND_PREVIEW_PR != '' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: workspace-backend-preview-e2e
+    concurrency:
+      group: workspace-backend-preview-status-${{ vars.WORKSPACE_BACKEND_PREVIEW_PR }}
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: read
+      deployments: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - name: Check out the reviewed status publisher
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/workspace-backend-preview
+            .github/actions/workspace-e2e-flows
+            packages/workspace-cloud-run/src
+      - name: Publish the verified completed pilot
+        env:
+          FLOWS_PUBLISH: .github/actions/workspace-e2e-flows/publish-status.mjs
+          GH_TOKEN: ${{ github.token }}
+          PILOT_PR_NUMBER: ${{ vars.WORKSPACE_BACKEND_PREVIEW_PR }}
+          PILOT_SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          PILOT_SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          PREVIEW_ENVIRONMENT: 'Preview – deskohub-workspace-site'
+          VERCEL_TOKEN: ${{ secrets.WORKSPACE_BACKEND_PREVIEW_VERCEL_TOKEN }}
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+        run: node "$FLOWS_PUBLISH" publish-completed-pilot

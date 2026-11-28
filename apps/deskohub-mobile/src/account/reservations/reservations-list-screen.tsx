@@ -1,0 +1,1175 @@
+import type {
+  CustomerHeldUnlimitedPass,
+  CustomerReservationOrderId,
+} from "@deskohub/workspace-customer-api";
+import {
+  useAtom,
+  useAtomMount,
+  useAtomRefresh,
+  useAtomValue,
+} from "@effect/atom-react";
+import { DateTime, Option } from "effect";
+import { AsyncResult } from "effect/reactivity";
+import { useIsFocused, useRouter } from "expo-router";
+import CalendarIcon from "lucide-react-native/icons/calendar";
+import CalendarPlus from "lucide-react-native/icons/calendar-plus";
+import ChevronRight from "lucide-react-native/icons/chevron-right";
+import Copy from "lucide-react-native/icons/copy";
+import Hourglass from "lucide-react-native/icons/hourglass";
+import KeyRound from "lucide-react-native/icons/key-round";
+import {
+  createContext,
+  type Dispatch,
+  type ReactNode,
+  type SetStateAction,
+  useContext,
+  useEffect,
+  useState,
+} from "react";
+import { Platform, Pressable, StyleSheet, View } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { orderStatusHref } from "../../booking/booking-routes";
+import { unneededReadAtom } from "../../booking/family/booking-family-atoms";
+import { AsyncView } from "../../customer-api/async-view";
+import { accountAtom } from "../../customer-api/customer-data-runtime";
+import type { CustomerRequestFailure } from "../../customer-api/customer-view-error";
+import type { AppLocale } from "../../i18n/app-locale";
+import { formatInstant } from "../../i18n/date-time-format";
+import { useAppLocale } from "../../i18n/locale-context";
+import { m } from "../../i18n/messages";
+import { passFeatureClosed } from "../../passes/pass-read-state";
+import { heldPassesAtom, passCatalogAtom } from "../../passes/pass-reads";
+import { UnlimitedPeriodItem } from "../../passes/unlimited-period-item";
+import { Badge } from "../../ui/badge";
+import { Card } from "../../ui/card";
+import { Button } from "../../ui/controls";
+import { EmptyState } from "../../ui/empty-state";
+import { FocusedStatusBar } from "../../ui/focused-status-bar";
+import { Icon } from "../../ui/icon";
+import { ListGroup, SectionHeader } from "../../ui/list";
+import { Masthead } from "../../ui/masthead";
+import { Notice } from "../../ui/notice";
+import { ScrollScreen, StickyFooterGroup } from "../../ui/scroll-screen";
+import { Skeleton, SkeletonGroup } from "../../ui/skeleton";
+import { SplitPane } from "../../ui/split-pane";
+import { Text } from "../../ui/text";
+import { useToast, useToastObstruction } from "../../ui/toast";
+import { brandText, color, radius, space } from "../../ui/tokens";
+import { useContentColumn, useViewport } from "../../ui/viewport";
+import {
+  type AccountNotice,
+  type ReservationsAccess,
+  reservationsAccess,
+  tabGate,
+} from "../account-gating";
+import { TabGateCard } from "../tab-gate-card";
+import { AccessPinButton } from "./access-pin-button";
+import { accessPinGroups } from "./access-pin-groups";
+import { useAccessPinView } from "./access-pin-view";
+import { copyAccessCodeAtom } from "./access-screen-state";
+import { bookingEntryEnabled } from "./booking-entry";
+import {
+  BookingTicket,
+  BookingTicketSkeleton,
+  DateTile,
+  DateTilePlaceholder,
+} from "./booking-ticket";
+import { countdownText, ticketBadge } from "./booking-ticket-text";
+import { establishmentAtom, establishmentPlace } from "./establishment";
+import {
+  invitedReservationsAtom,
+  invitedReservationView,
+} from "./invited-reservations";
+import {
+  OrderStatusScreen,
+  ReservationPaneHeading,
+} from "./order-status-screen";
+import { PastSavingsFooter } from "./past-savings-footer";
+import {
+  type NextAccess,
+  nextReservationView,
+  type ReservationGroups,
+  type ReservationListRow,
+  reservationRowView,
+  reservationStatusTarget,
+} from "./reservation-list-model";
+import {
+  type ReservationsList,
+  reservationHistoryAtom,
+  reservationsListAtom,
+  savedReservationsAtom,
+  savedReservationsBeforeAccountAtom,
+} from "./reservations-list-state";
+import { showsSavingsOffer } from "./savings-offer";
+import { rowOffersWithdrawal } from "./withdrawal-eligibility";
+import { WithdrawalLink } from "./withdrawal-link";
+
+/** How many past bookings show before "Show all". */
+export const pastPreviewCount = 2;
+
+const gateNotice: Record<AccountNotice, (locale: AppLocale) => string> = {
+  "completion-required": (locale) =>
+    m.account_notice_completion_required({}, { locale }),
+  "support-required": (locale) =>
+    m.account_notice_support_required({}, { locale }),
+  unavailable: (locale) => m.account_notice_unavailable({}, { locale }),
+  "deletion-pending": (locale) =>
+    m.account_notice_deletion_pending({}, { locale }),
+};
+
+const gateNoticeOf = (access: ReservationsAccess): AccountNotice | undefined =>
+  ({
+    available: undefined,
+    "completion-required": "completion-required" as const,
+    unavailable: access.kind === "unavailable" ? access.notice : undefined,
+  })[access.kind];
+
+/** Opens a reservation's booking view. */
+const useOpenReservation = () => {
+  const router = useRouter();
+  return (orderId: CustomerReservationOrderId) =>
+    router.push(orderStatusHref(orderId));
+};
+
+interface ReservationListSelection {
+  readonly orderId: CustomerReservationOrderId | undefined;
+  readonly onSelect: (orderId: CustomerReservationOrderId) => void;
+}
+
+const SelectionContext = createContext<ReservationListSelection | undefined>(
+  undefined
+);
+
+const PastReservationsExpansion = createContext<
+  readonly [boolean, Dispatch<SetStateAction<boolean>>] | undefined
+>(undefined);
+
+/** Shares the past list's expansion with every screen in the Reservations stack. */
+export function PastReservationsExpansionProvider({
+  children,
+}: {
+  readonly children: ReactNode;
+}) {
+  const expansion = useState(false);
+  return (
+    <PastReservationsExpansion value={expansion}>
+      {children}
+    </PastReservationsExpansion>
+  );
+}
+
+function ReservationsTabPanes({
+  list,
+  detail,
+}: {
+  readonly list: ReactNode;
+  readonly detail?: ReactNode;
+}) {
+  const { isExpanded } = useViewport();
+  return (
+    <SplitPane list={list} collapsed="list">
+      {detail ?? (isExpanded && <FocusedStatusBar style="dark" />)}
+    </SplitPane>
+  );
+}
+
+/** The tab root's masthead. */
+function ReservationsMasthead({ inPane }: { readonly inPane: boolean }) {
+  const locale = useAppLocale();
+  const { top } = useSafeAreaInsets();
+  const column = useContentColumn();
+  const title = m.account_section_reservations({}, { locale });
+  return inPane ? (
+    <View style={[styles.paneMasthead, { paddingTop: top + space.md }]}>
+      <View style={column}>
+        <Text variant="display" tone="inverse" role="heading">
+          {title}
+        </Text>
+      </View>
+    </View>
+  ) : (
+    <Masthead title={title} />
+  );
+}
+
+/**
+ * The tab's screen: the masthead over its content, pull to refresh, and the
+ * orders the account is invited to under whatever the content shows, read
+ * on their own: a gate, a failed history or a loading one never hides them.
+ */
+function ReservationsScreen({
+  refreshing,
+  onRefresh,
+  inPane = false,
+  children,
+}: {
+  readonly refreshing: boolean;
+  readonly onRefresh: () => void;
+  readonly inPane?: boolean;
+  readonly children: ReactNode;
+}) {
+  const refreshInvited = useAtomRefresh(invitedReservationsAtom);
+  return (
+    <ScrollScreen
+      masthead={<ReservationsMasthead inPane={inPane} />}
+      refreshing={refreshing}
+      onRefresh={() => {
+        onRefresh();
+        refreshInvited();
+      }}
+    >
+      {children}
+      <InvitedReservations />
+    </ScrollScreen>
+  );
+}
+
+/**
+ * The Reservations tab: the next booking as its ticket, then the later and
+ * past ones (GET /reservations), gated by the account's state. Saved
+ * reservations show at once while the list loads, and stay when it can't;
+ * they also show while the account itself can't be read (offline at launch).
+ */
+export function ReservationsListScreen({
+  selection,
+}: {
+  readonly selection?: ReservationListSelection;
+} = {}) {
+  // Read once for the screen, whichever of the views below shows it.
+  useAtomMount(savedReservationsAtom);
+  const account = useAtomValue(accountAtom);
+  return (
+    <>
+      {Option.match(
+        Option.map(AsyncResult.value(account), reservationsAccess),
+        {
+          onNone: () => <ReservationsBeforeAccount selection={selection} />,
+          onSome: (access) =>
+            access.kind === "available" ? (
+              <ReservationsHistory selection={selection} />
+            ) : (
+              <ReservationsGate
+                access={access}
+                inDetailRoute={selection !== undefined}
+              />
+            ),
+        }
+      )}
+    </>
+  );
+}
+
+/** When the account may not see reservations. */
+function ReservationsGate({
+  access,
+  inDetailRoute,
+}: {
+  readonly access: ReservationsAccess;
+  readonly inDetailRoute: boolean;
+}) {
+  const locale = useAppLocale();
+  const { isExpanded } = useViewport();
+  const account = useAtomValue(accountAtom);
+  const refresh = useAtomRefresh(accountAtom);
+  // A gate card says it all; other states keep their notice.
+  const gate = tabGate("reservations", access);
+  const shownNotice = gate === undefined ? gateNoticeOf(access) : undefined;
+  const notice =
+    shownNotice === undefined ? undefined : gateNotice[shownNotice](locale);
+  const list = (
+    <ReservationsScreen
+      refreshing={account.waiting}
+      onRefresh={refresh}
+      inPane={isExpanded}
+    >
+      {/* Kept mounted so assistive tech announces each change. */}
+      <Notice tone="info" message={notice} />
+      <AsyncView
+        result={account}
+        onRetry={refresh}
+        errorTitle={m.reservations_load_failed_title({}, { locale })}
+      >
+        {() => gate !== undefined && <TabGateCard gate={gate} />}
+      </AsyncView>
+    </ReservationsScreen>
+  );
+  return inDetailRoute ? list : <ReservationsTabPanes list={list} />;
+}
+
+/** Before the account is read: the saved reservations, if any. */
+function ReservationsBeforeAccount({
+  selection,
+}: {
+  readonly selection: ReservationListSelection | undefined;
+}) {
+  return (
+    <ReservationsListView
+      result={useAtomValue(savedReservationsBeforeAccountAtom)}
+      onRefresh={useAtomRefresh(accountAtom)}
+      selection={selection}
+    />
+  );
+}
+
+/** The account may see reservations: the list, saved then fresh. */
+function ReservationsHistory({
+  selection,
+}: {
+  readonly selection: ReservationListSelection | undefined;
+}) {
+  return (
+    <ReservationsListView
+      result={useAtomValue(reservationsListAtom)}
+      onRefresh={useAtomRefresh(reservationHistoryAtom)}
+      selection={selection}
+      showPreferred
+    />
+  );
+}
+
+function ReservationsListSkeleton() {
+  const locale = useAppLocale();
+  return (
+    <View style={styles.stack}>
+      <BookingTicketSkeleton
+        label={m.account_loading({}, { locale })}
+        stub="row"
+      />
+      <SkeletonGroup label={m.account_loading({}, { locale })}>
+        <View style={styles.sectionSkeleton}>
+          <Skeleton width={64} height={12} radius={6} />
+        </View>
+        <ListGroup>
+          {[0, 1].map((row) => (
+            <View key={row} style={styles.row}>
+              <Skeleton width={52} height={58} radius={14} />
+              <View style={[styles.rowText, styles.skeletonText]}>
+                <Skeleton width="56%" height={14} radius={7} />
+                <Skeleton width="42%" height={10} radius={5} />
+              </View>
+            </View>
+          ))}
+        </ListGroup>
+      </SkeletonGroup>
+    </View>
+  );
+}
+
+function ReservationsListView<E extends CustomerRequestFailure>({
+  result: list,
+  onRefresh: refresh,
+  selection,
+  showPreferred = false,
+}: {
+  readonly result: AsyncResult.AsyncResult<ReservationsList, E>;
+  readonly onRefresh: () => void;
+  readonly selection: ReservationListSelection | undefined;
+  readonly showPreferred?: boolean;
+}) {
+  const locale = useAppLocale();
+  const { isExpanded } = useViewport();
+  const open = useOpenReservation();
+  const value = AsyncResult.value(list);
+  const passReads = useReservationPasses(showPreferred);
+  const refreshAll = () => {
+    refresh();
+    passReads.refresh();
+  };
+  // Once shown, retain the featured order through resizing and list refreshes.
+  // null records that the customer returned from a missing preview.
+  const [preview, setPreview] = useState<CustomerReservationOrderId | null>();
+  if (
+    showPreferred &&
+    selection === undefined &&
+    isExpanded &&
+    preview === undefined
+  ) {
+    const featured = Option.flatMap(value, ({ groups }) =>
+      Option.flatMap(groups.featured, reservationStatusTarget)
+    );
+    if (Option.isSome(featured)) setPreview(featured.value);
+  }
+  const previewOrderId = preview ?? undefined;
+  const listSelection =
+    selection ??
+    (isExpanded ? { orderId: previewOrderId, onSelect: open } : undefined);
+  const savedAt = Option.flatMap(value, (shown) => shown.savedAt);
+  // The saved list says it is the one on this device; a failed refresh
+  // under it needs no second notice.
+  const shown = Option.match(value, {
+    onSome: (value) =>
+      Option.isSome(value.savedAt) && AsyncResult.isFailure(list)
+        ? AsyncResult.success<ReservationsList, E>(value, {
+            waiting: list.waiting,
+          })
+        : list,
+    onNone: () => list,
+  });
+  const content = (
+    <SelectionContext value={listSelection}>
+      <ReservationsScreen
+        refreshing={
+          (list.waiting && !AsyncResult.isInitial(list)) || passReads.refreshing
+        }
+        onRefresh={refreshAll}
+        inPane={listSelection !== undefined}
+      >
+        <AsyncView
+          result={shown}
+          onRetry={refreshAll}
+          errorTitle={m.reservations_load_failed_title({}, { locale })}
+          loading={<ReservationsListSkeleton />}
+        >
+          {({ groups }) => (
+            <ReservationGroupsView
+              groups={groups}
+              passes={passReads}
+              fresh={Option.isNone(savedAt)}
+              // The list from the device, with when it was saved.
+              savedNotice={
+                <Notice
+                  tone="info"
+                  message={Option.getOrUndefined(
+                    Option.map(savedAt, (time) =>
+                      m.reservations_last_updated(
+                        { time: formatInstant(time, locale, "date-time") },
+                        { locale }
+                      )
+                    )
+                  )}
+                />
+              }
+            />
+          )}
+        </AsyncView>
+      </ReservationsScreen>
+    </SelectionContext>
+  );
+  if (selection !== undefined) return content;
+  return (
+    <ReservationsTabPanes
+      list={content}
+      detail={
+        previewOrderId !== undefined ? (
+          <OrderStatusScreen
+            orderId={previewOrderId}
+            visit="normal"
+            active={isExpanded}
+            heading={isExpanded ? <ReservationPaneHeading /> : undefined}
+            onMissingReturn={() => {
+              setPreview(null);
+              refresh();
+            }}
+          />
+        ) : undefined
+      }
+    />
+  );
+}
+
+function BookButton() {
+  const locale = useAppLocale();
+  const router = useRouter();
+  return bookingEntryEnabled ? (
+    <Button
+      icon={CalendarPlus}
+      label={m.reservations_book({}, { locale })}
+      onPress={() => router.push("/book")}
+    />
+  ) : null;
+}
+
+/** Whether an Entry pack paid for the row's visit. */
+const isPackPaid = (row: ReservationListRow): boolean =>
+  row.settlement === "entry-pack";
+
+function EntryPackBadge() {
+  const locale = useAppLocale();
+  return (
+    <View style={{ alignItems: "flex-start" }}>
+      <Badge tone="info" label={m.passes_paid_with_pack({}, { locale })} />
+    </View>
+  );
+}
+
+function useReservationPasses(enabled: boolean) {
+  const locale = useAppLocale();
+  const catalogAtom = enabled ? passCatalogAtom : unneededReadAtom;
+  const catalog = useAtomValue(catalogAtom);
+  const refreshCatalog = useAtomRefresh(catalogAtom);
+  const passesReleased = AsyncResult.isSuccess(catalog);
+  const listAtom = passesReleased ? heldPassesAtom(locale) : unneededReadAtom;
+  const list = useAtomValue(listAtom);
+  const refreshList = useAtomRefresh(listAtom);
+  const held = AsyncResult.isSuccess(list) ? list.value.held : undefined;
+  const unlimited = (held ?? []).filter((pass) => pass.kind === "unlimited");
+  return {
+    // Read only while the pass rollout is open.
+    held: passesReleased ? held : undefined,
+    unlimited,
+    initial:
+      enabled &&
+      (AsyncResult.isInitial(catalog) ||
+        (passesReleased && AsyncResult.isInitial(list))),
+    failed:
+      (AsyncResult.isFailure(catalog) && !passFeatureClosed(catalog)) ||
+      (AsyncResult.isFailure(list) && !passFeatureClosed(list)),
+    refreshing: list.waiting && !AsyncResult.isInitial(list),
+    refresh: () => {
+      refreshCatalog();
+      refreshList();
+    },
+  };
+}
+
+function ReservationGroupsView({
+  groups,
+  savedNotice,
+  passes,
+  fresh,
+}: {
+  readonly groups: ReservationGroups;
+  readonly savedNotice: ReactNode;
+  readonly passes: ReturnType<typeof useReservationPasses>;
+  /** Whether the Workspace's list shows, not the one saved on this device. */
+  readonly fresh: boolean;
+}) {
+  const locale = useAppLocale();
+  const selection = useContext(SelectionContext);
+  const unlimited = passes.unlimited.filter(
+    (pass) => pass.status === "active" || pass.status === "upcoming"
+  );
+  const ended = passes.unlimited.filter(
+    (pass) => pass.status === "ended" || pass.status === "expired"
+  );
+  const passNotice = passes.failed && (
+    <View>
+      <Notice tone="error" message={m.passes_load_failed({}, { locale })} />
+      <Button
+        variant="text"
+        label={m.account_retry({}, { locale })}
+        disabled={passes.refreshing}
+        onPress={passes.refresh}
+      />
+    </View>
+  );
+  if (groups.empty && unlimited.length === 0 && ended.length === 0) {
+    return (
+      <View style={styles.stack}>
+        {passNotice}
+        {passes.initial && <ReservationsListSkeleton />}
+        {!passes.initial && !passes.failed && (
+          <Card>
+            <EmptyState
+              icon={CalendarIcon}
+              title={m.reservations_none_yet({}, { locale })}
+            >
+              <BookButton />
+            </EmptyState>
+          </Card>
+        )}
+        {savedNotice}
+      </View>
+    );
+  }
+  const later = [...groups.moreCurrent, ...groups.undated];
+  return (
+    <View style={styles.stack}>
+      {passNotice}
+      {unlimited.map((pass) => (
+        <UnlimitedPeriodItem key={pass.passId} pass={pass} />
+      ))}
+      {Option.match(groups.featured, {
+        onSome: (row) =>
+          selection === undefined ? (
+            <NextReservation row={row} />
+          ) : (
+            <View style={styles.group}>
+              <ReservationRow row={row} place="later" featured />
+            </View>
+          ),
+        onNone: () =>
+          unlimited.length === 0 ? <NothingUpcoming /> : undefined,
+      })}
+      {savedNotice}
+      {later.length > 0 && (
+        <View>
+          <SectionHeader title={m.reservations_section_later({}, { locale })} />
+          <ReservationRows rows={later} place="later" />
+        </View>
+      )}
+      {(groups.past.length > 0 || ended.length > 0) && (
+        <PastReservations
+          rows={groups.past}
+          passes={ended}
+          // A saved list keeps no party, so only a fresh one decides.
+          savings={
+            fresh &&
+            showsSavingsOffer({
+              past: groups.past,
+              held: passes.held,
+            })
+          }
+        />
+      )}
+    </View>
+  );
+}
+
+/**
+ * Orders someone else booked that invite this account, read-only: each
+ * opens its access screen. Nothing shows while they load, when the read
+ * fails, or when there are none; the account's own history stands alone.
+ */
+function InvitedReservations() {
+  const locale = useAppLocale();
+  const router = useRouter();
+  const invited = Option.getOrUndefined(
+    AsyncResult.value(useAtomValue(invitedReservationsAtom))
+  );
+  if (invited === undefined) return null;
+  const reservations = [...invited.current, ...invited.past];
+  if (reservations.length === 0) return null;
+  return (
+    <View style={styles.invited}>
+      <SectionHeader title={m.reservations_section_invited({}, { locale })} />
+      <View style={styles.group}>
+        {reservations.map((reservation, index) => {
+          const view = invitedReservationView(reservation, locale);
+          return (
+            <Pressable
+              key={view.orderId}
+              role="link"
+              onPress={() =>
+                router.push({
+                  pathname: "/reservations/[orderId]/access",
+                  params: { orderId: view.orderId },
+                })
+              }
+              style={({ pressed }) => [styles.row, pressed && styles.pressed]}
+            >
+              {index > 0 && <View aria-hidden style={styles.divider} />}
+              {Option.match(view.date, {
+                onSome: (parts) => (
+                  <DateTile parts={parts} tone="soft" compact />
+                ),
+                onNone: () => <DateTilePlaceholder />,
+              })}
+              <View style={styles.rowText}>
+                <Text variant="bodyStrong">{view.title}</Text>
+                <Text variant="bodySmall">{view.detail}</Text>
+                {reservation.status === "cancelled" && (
+                  <View style={styles.invitedBadge}>
+                    <Badge
+                      label={m.reservationStatusCancelled({}, { locale })}
+                      tone="neutral"
+                    />
+                  </View>
+                )}
+              </View>
+              <Icon icon={ChevronRight} size={20} color={color.ink3} />
+            </Pressable>
+          );
+        })}
+      </View>
+    </View>
+  );
+}
+
+/** No booking ahead: Book is the one action. */
+function NothingUpcoming() {
+  const locale = useAppLocale();
+  return (
+    <Card>
+      <View style={styles.nothing}>
+        <View style={styles.nothingHead}>
+          <View style={styles.nothingDisc}>
+            <Icon icon={CalendarPlus} color={color.action} />
+          </View>
+          <Text variant="headline" style={styles.rowText}>
+            {m.reservations_nothing_upcoming({}, { locale })}
+          </Text>
+        </View>
+        <BookButton />
+      </View>
+    </Card>
+  );
+}
+
+function PastReservations({
+  rows,
+  passes,
+  savings,
+}: {
+  readonly rows: ReadonlyArray<ReservationListRow>;
+  readonly passes: ReadonlyArray<CustomerHeldUnlimitedPass>;
+  /** Whether the group ends with the packs and passes offer. */
+  readonly savings: boolean;
+}) {
+  const locale = useAppLocale();
+  const selection = useContext(SelectionContext);
+  const sharedExpansion = useContext(PastReservationsExpansion);
+  const localExpansion = useState(false);
+  const [all, setAll] = sharedExpansion ?? localExpansion;
+  const shown = all
+    ? rows
+    : rows.filter(
+        (row, index) =>
+          index < pastPreviewCount ||
+          Option.exists(
+            reservationStatusTarget(row),
+            (id) => id === selection?.orderId
+          )
+      );
+  return (
+    <View>
+      <SectionHeader title={m.reservations_section_past({}, { locale })} />
+      <View style={passes.length > 0 && styles.stack}>
+        {passes.map((pass) => (
+          <UnlimitedPeriodItem key={pass.passId} pass={pass} />
+        ))}
+        {shown.length > 0 && (
+          <ReservationRows
+            rows={shown}
+            place="past"
+            footer={
+              rows.length > shown.length ? (
+                <Button
+                  variant="text"
+                  label={m.reservations_show_all_past({}, { locale })}
+                  onPress={() => setAll(true)}
+                />
+              ) : undefined
+            }
+            stickyFooter={savings ? <PastSavingsFooter /> : undefined}
+          />
+        )}
+      </View>
+    </View>
+  );
+}
+
+function ReservationRows({
+  rows,
+  place,
+  footer,
+  stickyFooter,
+}: {
+  readonly rows: ReadonlyArray<ReservationListRow>;
+  readonly place: "later" | "past";
+  readonly footer?: ReactNode;
+  /** The group's last row, pinned above the tab bar while the group scrolls. */
+  readonly stickyFooter?: ReactNode;
+}) {
+  const [obstruction, setObstruction] = useState(0);
+  useToastObstruction(obstruction);
+  return (
+    <StickyFooterGroup
+      style={styles.group}
+      footer={stickyFooter}
+      pinnedStyle={styles.pinnedFooter}
+      onObstruction={setObstruction}
+    >
+      {rows.map((row, index) => (
+        <ReservationRow
+          key={row.id}
+          row={row}
+          place={place}
+          divided={index > 0}
+        />
+      ))}
+      {footer}
+    </StickyFooterGroup>
+  );
+}
+
+/** A later or past booking: its day's tile, name and time. */
+function ReservationRow({
+  row,
+  place,
+  divided = false,
+  featured = false,
+}: {
+  readonly row: ReservationListRow;
+  readonly place: "later" | "past";
+  readonly divided?: boolean;
+  readonly featured?: boolean;
+}) {
+  const locale = useAppLocale();
+  const open = useOpenReservation();
+  const selection = useContext(SelectionContext);
+  const { isExpanded, fontScale } = useViewport();
+  const view = reservationRowView(row, place, locale);
+  const target = reservationStatusTarget(row);
+  const packPaid = isPackPaid(row);
+  const selected = Option.exists(target, (id) => id === selection?.orderId);
+  const hasChevron = Option.isSome(target) && selection === undefined;
+  const past = place === "past";
+  const dateTone = past ? "dim" : "soft";
+  const badge = Option.map(view.badge, (kind) => ticketBadge(kind, locale));
+  const stackedBadge = Option.isSome(badge) && isExpanded && fontScale >= 1.3;
+  // The badge's height: the chevron centres in the space below it.
+  const [badgeHeight, setBadgeHeight] = useState(0);
+  const content = (
+    <>
+      {divided && <View aria-hidden style={styles.divider} />}
+      {Option.match(view.date, {
+        onSome: (parts) => (
+          <DateTile
+            parts={parts}
+            tone={featured ? "strong" : dateTone}
+            compact
+          />
+        ),
+        onNone: () => <DateTilePlaceholder />,
+      })}
+      <View style={styles.rowText}>
+        {/* Give enlarged titles the full width of the fixed list pane. */}
+        <View
+          style={[styles.rowTitleLine, stackedBadge && styles.stackedBadge]}
+        >
+          <Text
+            variant="bodyStrong"
+            style={[styles.rowTitle, past ? styles.pastTitle : undefined]}
+          >
+            {view.title}
+          </Text>
+          {Option.match(badge, {
+            onSome: (badge) => (
+              <View
+                onLayout={(event) =>
+                  setBadgeHeight(event.nativeEvent.layout.height)
+                }
+                style={hasChevron && styles.rowBadge}
+              >
+                <Badge
+                  label={badge.label}
+                  tone={badge.tone}
+                  icon={badge.icon}
+                  stacked
+                />
+              </View>
+            ),
+            onNone: () => null,
+          })}
+        </View>
+        <Text variant="bodySmall" style={styles.rowDetail}>
+          {view.detail}
+        </Text>
+        {packPaid && <EntryPackBadge />}
+        {!past && rowOffersWithdrawal(row) && Option.isSome(target) && (
+          <WithdrawalLink
+            orderId={target.value}
+            style={styles.rowWithdrawal}
+            underlined
+          />
+        )}
+      </View>
+      {hasChevron && (
+        <View
+          style={[
+            styles.rowChevron,
+            Option.isSome(badge) && { paddingTop: badgeHeight + space.xs },
+          ]}
+        >
+          <Icon icon={ChevronRight} size={20} color={color.ink3} />
+        </View>
+      )}
+    </>
+  );
+  return Option.match(target, {
+    onNone: () => (
+      <View accessible style={styles.row}>
+        {content}
+      </View>
+    ),
+    onSome: (orderId) => (
+      <Pressable
+        role="link"
+        aria-current={selected ? "page" : undefined}
+        aria-selected={selected && Platform.OS !== "web" ? true : undefined}
+        onPress={() => (selection?.onSelect ?? open)(orderId)}
+        style={({ pressed }) => [
+          styles.row,
+          selected && styles.selectedRow,
+          pressed && styles.pressed,
+        ]}
+      >
+        {content}
+      </Pressable>
+    ),
+  });
+}
+
+/** The next booking as its ticket, with its PIN one tap away. */
+function NextReservation({ row }: { readonly row: ReservationListRow }) {
+  const locale = useAppLocale();
+  const open = useOpenReservation();
+  const establishment = AsyncResult.value(useAtomValue(establishmentAtom));
+  const view = nextReservationView(row, DateTime.nowUnsafe(), locale);
+  const target = reservationStatusTarget(row);
+  const packPaid = isPackPaid(row);
+  return (
+    <BookingTicket
+      onPress={Option.getOrUndefined(
+        Option.map(target, (orderId) => () => open(orderId))
+      )}
+      lead={Option.getOrUndefined(
+        Option.map(view.countdown, (countdown) => ({
+          kind: "countdown" as const,
+          text: countdownText(countdown, locale),
+        }))
+      )}
+      badge={ticketBadge(view.badge, locale)}
+      date={Option.getOrUndefined(view.date)}
+      title={view.title}
+      lines={[
+        view.when,
+        ...Option.toArray(Option.map(establishment, establishmentPlace)),
+      ]}
+      stub={packPaid ? "column" : "row"}
+    >
+      {packPaid && <EntryPackBadge />}
+      <NextAccessLine
+        access={view.access}
+        orderId={Option.getOrUndefined(target)}
+        withdrawable={rowOffersWithdrawal(row)}
+      />
+    </BookingTicket>
+  );
+}
+
+function AccessTile({ waiting = false }: { readonly waiting?: boolean }) {
+  return (
+    <View
+      aria-hidden
+      style={[styles.accessTile, waiting && styles.accessTileWaiting]}
+    >
+      <Icon
+        icon={waiting ? Hourglass : KeyRound}
+        size={20}
+        color={waiting ? color.navy : color.positiveInk}
+      />
+    </View>
+  );
+}
+
+/**
+ * The least width the stub's text keeps: what fits beside the action at the
+ * default font size, growing with the system font so the action wraps under
+ * the text rather than squeezing it.
+ */
+const useStubTextWidth = () => {
+  const { fontScale } = useViewport();
+  return { minWidth: 140 * fontScale };
+};
+
+/** The stub of the next booking's ticket: today's PIN, or the way to it. */
+function NextAccessLine({
+  access,
+  orderId,
+  withdrawable,
+}: {
+  readonly access: NextAccess;
+  readonly orderId: CustomerReservationOrderId | undefined;
+  readonly withdrawable: boolean;
+}) {
+  const locale = useAppLocale();
+  const open = useOpenReservation();
+  const stubTextWidth = useStubTextWidth();
+  const withdrawalLink =
+    orderId !== undefined && withdrawable ? (
+      <WithdrawalLink
+        orderId={orderId}
+        style={styles.stubWithdrawal}
+        underlined
+      />
+    ) : null;
+  switch (access._tag) {
+    case "Pin":
+      return orderId === undefined ? null : (
+        <>
+          {withdrawalLink && (
+            <View style={styles.stubActions}>{withdrawalLink}</View>
+          )}
+          <TodayPin code={access.code} until={access.until} orderId={orderId} />
+        </>
+      );
+    case "Ready":
+      return orderId === undefined ? null : (
+        <View style={styles.stubActions}>
+          {withdrawalLink}
+          <AccessPinButton orderId={orderId} />
+        </View>
+      );
+    case "AfterPayment":
+      return (
+        <>
+          <AccessTile waiting />
+          <Text variant="subhead" style={[styles.stubText, stubTextWidth]}>
+            {m.reservations_pin_after_payment({}, { locale })}
+          </Text>
+          {orderId !== undefined && (
+            <Button
+              variant="secondary"
+              size="small"
+              width="content"
+              label={m.reservations_check({}, { locale })}
+              onPress={() => open(orderId)}
+            />
+          )}
+        </>
+      );
+  }
+}
+
+/** Today's PIN on the ticket, with Copy. */
+function TodayPin({
+  code,
+  until,
+  orderId,
+}: {
+  readonly code: string;
+  readonly until: string;
+  readonly orderId: CustomerReservationOrderId;
+}) {
+  const locale = useAppLocale();
+  const toast = useToast();
+  const stubTextWidth = useStubTextWidth();
+  const [copied, copy] = useAtom(copyAccessCodeAtom(orderId));
+  useAccessPinView(useIsFocused());
+  // Says how the copy went, once per copy.
+  useEffect(() => {
+    if (copied.waiting || AsyncResult.isInitial(copied)) return;
+    toast.show(
+      AsyncResult.isSuccess(copied)
+        ? { message: m.reservations_access_copied({}, { locale }) }
+        : {
+            message: m.reservations_access_copy_failed({}, { locale }),
+            tone: "neutral",
+          }
+    );
+  }, [copied, toast, locale]);
+  return (
+    <>
+      <AccessTile />
+      <View style={[styles.stubText, stubTextWidth]}>
+        <Text variant="hint">
+          {m.reservations_pin_today_until({ time: until }, { locale })}
+        </Text>
+        <Text
+          numeric
+          aria-label={m.reservations_access_code_label(
+            { digits: code.split("").join(" ") },
+            { locale }
+          )}
+          style={styles.pin}
+        >
+          {accessPinGroups(code).join(" ")}
+        </Text>
+      </View>
+      <Pressable
+        role="button"
+        aria-label={m.reservations_access_copy({}, { locale })}
+        disabled={copied.waiting}
+        hitSlop={space.xs}
+        onPress={() => copy(code)}
+        style={({ pressed }) => [styles.copy, pressed && styles.pressed]}
+      >
+        <Icon icon={Copy} size={20} />
+      </Pressable>
+    </>
+  );
+}
+
+/** The chevron and the gap before it, which a row's badge spans. */
+const rowChevronColumn = 20 + space.md;
+
+const styles = StyleSheet.create({
+  invited: { marginTop: space.xl },
+  invitedBadge: { marginTop: space.xs },
+  paneMasthead: { backgroundColor: color.navy, paddingBottom: space.md },
+  stack: { gap: space.lg },
+  rowDetail: { marginTop: 2 },
+  selectedRow: { backgroundColor: color.actionTint },
+  // A row's chevron, centred in the row or in the space below its badge.
+  rowChevron: { alignSelf: "stretch", justifyContent: "center" },
+  // Line 1: the title, then the status badge reaching over the chevron.
+  rowTitleLine: {
+    alignItems: "flex-start",
+    flexDirection: "row",
+    gap: space.sm,
+    justifyContent: "space-between",
+  },
+  stackedBadge: { flexDirection: "column", gap: space.xxs },
+  rowTitle: { flexShrink: 1 },
+  rowBadge: { marginRight: -rowChevronColumn },
+  rowWithdrawal: { alignSelf: "flex-start", marginTop: 2 },
+  stubActions: { gap: space.sm, width: "100%" },
+  stubWithdrawal: { alignSelf: "center" },
+  pressed: { opacity: 0.7 },
+  group: {
+    backgroundColor: color.surface,
+    borderColor: color.line,
+    borderRadius: radius.group,
+    borderWidth: 1,
+    overflow: "hidden",
+  },
+  // The pinned savings footer, between the Past group's sides.
+  pinnedFooter: {
+    borderColor: color.line,
+    borderLeftWidth: 1,
+    borderRightWidth: 1,
+  },
+  row: {
+    alignItems: "center",
+    flexDirection: "row",
+    gap: space.md,
+    minHeight: 72,
+    paddingHorizontal: 14,
+    paddingVertical: space.md,
+  },
+  divider: {
+    backgroundColor: color.divider,
+    height: 1,
+    left: 82,
+    position: "absolute",
+    right: 0,
+    top: 0,
+  },
+  rowText: { flex: 1, minWidth: 0 },
+  // The stub's text keeps room to read; at large font sizes the action
+  // wraps under it (see `useStubTextWidth`).
+  stubText: { flexBasis: 0, flexGrow: 1 },
+  skeletonText: { gap: space.sm },
+  sectionSkeleton: { paddingBottom: space.sm, paddingTop: space.xl },
+  pastTitle: { color: color.ink2 },
+  nothing: { gap: space.md },
+  nothingHead: { alignItems: "center", flexDirection: "row", gap: 14 },
+  nothingDisc: {
+    alignItems: "center",
+    backgroundColor: color.actionTint,
+    borderRadius: 14,
+    height: 48,
+    justifyContent: "center",
+    width: 48,
+  },
+  accessTile: {
+    alignItems: "center",
+    backgroundColor: color.positiveTint,
+    borderRadius: radius.tile,
+    height: 40,
+    justifyContent: "center",
+    width: 40,
+  },
+  accessTileWaiting: { backgroundColor: color.sunken },
+  pin: { ...brandText(24, 30, 700, 2), color: color.navy },
+  copy: {
+    alignItems: "center",
+    backgroundColor: color.sunken,
+    borderRadius: 20,
+    height: 40,
+    justifyContent: "center",
+    width: 40,
+  },
+});

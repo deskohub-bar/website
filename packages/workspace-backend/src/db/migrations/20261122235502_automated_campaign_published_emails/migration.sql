@@ -1,0 +1,4 @@
+ALTER TABLE "email_campaign_automation_versions" ADD COLUMN "frozen_email_version_id" text;--> statement-breakpoint
+ALTER TABLE "email_campaign_automation_versions" ADD CONSTRAINT "email_campaign_automation_versions_DW1uiFSJliHx_fkey" FOREIGN KEY ("frozen_email_version_id") REFERENCES "email_versions"("id");--> statement-breakpoint
+ALTER TABLE "email_campaign_automation_versions" ADD CONSTRAINT "email_campaign_automation_versions_published_email_check" CHECK (("email_id" is null) = ("frozen_email_version_id" is null) and ("email_id" is null or ("purpose" = 'marketing' and "content" = '{}'::jsonb)));--> statement-breakpoint
+ALTER TABLE "email_campaigns" DROP CONSTRAINT "email_campaigns_published_email_check", ADD CONSTRAINT "email_campaigns_published_email_check" CHECK ("email_id" is null or ("purpose" = 'marketing' and "content" = '{}'::jsonb));

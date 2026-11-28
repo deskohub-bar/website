@@ -1,0 +1,39 @@
+{
+  "name": "@deskohub/workspace-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./db/schema": "./src/db/schema/index.ts",
+    "./db/*": "./src/db/*.ts",
+    "./features/*": "./src/features/*.ts",
+    "./sandbox": "./src/sandbox.ts",
+    "./shared/*": "./src/shared/*.ts"
+  },
+  "scripts": {
+    "lint": "biome check .",
+    "typecheck": "tsc --project tsconfig.json",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@deskohub/dotypos": "workspace:*",
+    "@deskohub/email": "workspace:*",
+    "@deskohub/i18n": "workspace:*",
+    "@deskohub/igloohome": "workspace:*",
+    "@deskohub/nexi": "workspace:*",
+    "@deskohub/workspace-admin-api": "workspace:*",
+    "@deskohub/workspace-domain": "workspace:*",
+    "@deskohub/workspace-rpc": "workspace:*",
+    "@deskohub/workspace-telemetry": "workspace:*",
+    "@effect/sql-pg": "4.1.4",
+    "drizzle-orm": "1.0.0-rc.5",
+    "effect": "4.1.4",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.1",
+    "typescript": "npm:@typescript/typescript6@6.0.2",
+    "@types/pg": "^8.20.0"
+  }
+}

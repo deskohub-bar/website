@@ -1,0 +1,1067 @@
+import "@/shared/testing/workspace-test-env";
+
+import { describe, expect, test } from "bun:test";
+import { testEmailAddress } from "@deskohub/test-email";
+import {
+  AdministrationAssistantConnectionId,
+  type AdministrationChannel,
+  AdministrationInvoiceId,
+  CliMutationInProgress,
+  CliMutationRequestId,
+  CliSessionId,
+  CliSessionUnauthorized,
+  type CurrentAdministrationCaller,
+} from "@deskohub/workspace-admin-api";
+import { NodeHttpServer } from "@effect/platform-node";
+import { EffectDrizzleQueryError } from "drizzle-orm/effect-core";
+import { Effect, Layer, Logger, Option, Predicate, Schema } from "effect";
+import { HttpRouter } from "effect/http";
+import { StandaloneAccessCodeAdministration } from "@/features/access-codes";
+import type { AgentScope } from "@/features/account/agent-scopes";
+import {
+  CustomerAgentAuthorization,
+  CustomerAgentAuthorizationError,
+  type CustomerAgentGrant,
+  customerAgentClientIdSchema,
+} from "@/features/account/backend/auth/customer-agent-authorization.service";
+import { CustomerAgentClientDirectory } from "@/features/account/backend/auth/customer-agent-client-directory.service";
+import { testSessionProfile } from "@/features/account/backend/customer-authentication.test-utils";
+import {
+  CustomerAccountAccessError,
+  customerAccountIdSchema,
+} from "@/features/account/customer-account";
+import { InvoiceAdministrationService } from "@/features/accounting/admin/invoice-administration.service";
+import { invoiceAdministrationDetail } from "@/features/accounting/admin/invoice-detail.test-utils";
+import { AdministrationActionLog } from "@/features/admin-cli/administration-action-log.service";
+import { AdministrationRequestLedger } from "@/features/admin-cli/administration-request-ledger.service";
+import {
+  GrantedAdministrator,
+  UnusedWithdrawalService,
+} from "@/features/admin-cli/cli-api.test-utils";
+import { CliAuthentication } from "@/features/admin-cli/cli-authentication.service";
+import { CliAuthenticationAdmission } from "@/features/admin-cli/cli-authentication-admission.service";
+import { CliClientCompatibilityLive } from "@/features/admin-cli/cli-client-version";
+import {
+  CliBearerAuthenticationLive,
+  CliSessionAdministrationAuthenticationLive,
+  handleWorkspaceAdminApiRequest,
+  makeWorkspaceAdminApiLayer,
+} from "@/features/admin-cli/workspace-admin-api.server";
+import { AdministrationService } from "@/features/administration/administration.service";
+import { UnusedAdministrationCustomerDirectory } from "@/features/administration/customer-directory.test-utils";
+import { loadFixtureReservation } from "@/features/administration/fixtures";
+import { ReservationAccessAdministration } from "@/features/administration/reservation-access-administration.service";
+import { ReservationAdministrationService } from "@/features/administration/reservation-administration.service";
+import {
+  AdministratorRoster,
+  LegacyAdministratorBackfill,
+} from "@/features/administrators";
+import type { AdministratorAccountActor } from "@/features/administrators/account-role";
+import { AccountRoleGrants } from "@/features/administrators/backend/account-role-grants.service";
+import { AdministratorAgentAuthorization } from "@/features/administrators/backend/administrator-agent-authorization.service";
+import { AdministratorAssistantConnections } from "@/features/administrators/backend/administrator-assistant-connections.service";
+import type { CustomerAgentCaller } from "@/features/agent-tools/customer-agent-caller";
+import { DiscountAdministration } from "@/features/discounts/admin/discount-administration.service";
+import { CampaignOperations } from "@/features/email-campaigns/backend/campaign-operations.service";
+import { ReservationProductDetailsBackfill } from "@/features/reservation/backend/reservation-product-details-backfill.service";
+import { reservationCustomerEmailSchema } from "@/features/reservation/reservation-contact";
+import { AdministrationAgentDocuments } from "./administration-agent-documents";
+import {
+  administrationOperationTools,
+  makeAdministrationAgentTools,
+} from "./administration-agent-tools";
+import {
+  AdministrationApiClient,
+  AdministrationApiTransport,
+} from "./administration-api-client";
+import { makeAdministrationAssistantApiLayer } from "./administration-assistant-api.server";
+
+const administrator: AdministratorAccountActor = {
+  accountId: customerAccountIdSchema.make("assistant-administrator-account"),
+  email: reservationCustomerEmailSchema.make(
+    testEmailAddress("assistant-administrator")
+  ),
+};
+const formerAdministratorId = customerAccountIdSchema.make(
+  "former-administrator-account"
+);
+const cliAdministrator: AdministratorAccountActor = {
+  accountId: customerAccountIdSchema.make("cli-administrator-account"),
+  email: testEmailAddress("cli-administrator"),
+};
+
+const clientId = customerAgentClientIdSchema.make(
+  "https://assistant.example/oauth/client.json"
+);
+const clientName = "Synthetic Assistant";
+const unknownClientId = customerAgentClientIdSchema.make(
+  "https://unknown.example/oauth/client.json"
+);
+const unreadableClientId = customerAgentClientIdSchema.make(
+  "https://unreadable.example/oauth/client.json"
+);
+const assistantChannel: AdministrationChannel = {
+  _tag: "AssistantConnection",
+  connectionId: Schema.decodeUnknownSync(AdministrationAssistantConnectionId)(
+    "01980000-0000-7000-8000-0000000000a7"
+  ),
+  oauthClientId: clientId,
+};
+
+// Synthetic credentials. A CLI bearer is 43 base64url characters; OAuth
+// access tokens are opaque strings or JWTs.
+const assistantToken = "assistant-administrator-access-token";
+const cliBearer = "c".repeat(43);
+const cliSession = {
+  id: CliSessionId.make("01980000-0000-7000-8000-0000000000c1"),
+  approvedBy: null,
+  approvedByEmail: null,
+  clientName: "test client",
+  cliVersion: "1.0.0",
+  buildTarget: "development",
+  createdAt: "2026-08-10T10:00:00.000Z",
+  lastUsedAt: "2026-08-10T10:00:00.000Z",
+  expiresAt: null,
+} as const;
+
+const grantOf = ({
+  account = administrator.accountId,
+  scopes = ["reservations:read", "administration"],
+  client = clientId,
+}: {
+  readonly account?: CustomerAgentGrant["accountId"];
+  readonly scopes?: ReadonlyArray<AgentScope>;
+  readonly client?: CustomerAgentGrant["clientId"];
+}): CustomerAgentGrant => ({
+  accountId: account,
+  clientId: client,
+  scopes: new Set(scopes),
+});
+
+type TokenState =
+  | { readonly kind: "valid"; readonly grant: CustomerAgentGrant }
+  | {
+      readonly kind: "refused";
+      readonly reason: CustomerAgentAuthorizationError["reason"];
+    };
+
+/** What verifying each access token yields; any other token is invalid. */
+const tokens = new Map<string, TokenState>([
+  [assistantToken, { kind: "valid", grant: grantOf({}) }],
+  [
+    "customer-assistant-access-token",
+    { kind: "valid", grant: grantOf({ scopes: ["reservations:read"] }) },
+  ],
+  [
+    "former-administrator-access-token",
+    { kind: "valid", grant: grantOf({ account: formerAdministratorId }) },
+  ],
+  [
+    "deleted-account-access-token",
+    { kind: "refused", reason: "account-unavailable" },
+  ],
+  [
+    "unknown-client-access-token",
+    { kind: "valid", grant: grantOf({ client: unknownClientId }) },
+  ],
+  [
+    "authorization-outage-access-token",
+    { kind: "refused", reason: "unavailable" },
+  ],
+  [
+    "directory-outage-access-token",
+    { kind: "valid", grant: grantOf({ client: unreadableClientId }) },
+  ],
+]);
+
+const databaseFailure = (query: string) =>
+  new EffectDrizzleQueryError({
+    query,
+    params: [],
+    cause: new Error("synthetic outage"),
+  });
+
+/**
+ * The services the assistant authentication reads, over fake token, grant,
+ * client and connection authorities. The administrator authorization is
+ * the real one, so scope and grant checks run as in production.
+ */
+const makeAssistantServices = ({
+  connectFailure,
+}: {
+  readonly connectFailure?: "fails" | "dies";
+} = {}) => {
+  const connects: Array<
+    Parameters<AdministratorAssistantConnections["Service"]["connect"]>[0]
+  > = [];
+  const verify = (
+    token: string
+  ): Effect.Effect<CustomerAgentGrant, CustomerAgentAuthorizationError> => {
+    const state = tokens.get(token) ?? {
+      kind: "refused",
+      reason: "invalid-token",
+    };
+    return state.kind === "valid"
+      ? Effect.succeed(state.grant)
+      : Effect.fail(
+          new CustomerAgentAuthorizationError({ reason: state.reason })
+        );
+  };
+  const agents = Layer.succeed(CustomerAgentAuthorization, {
+    authorize: verify,
+    currentUser: (token) =>
+      verify(token).pipe(
+        Effect.map((grant) => ({
+          accountId: grant.accountId,
+          email: administrator.email,
+          deletionRequested: false,
+          ...testSessionProfile,
+        })),
+        Effect.mapError(
+          (error) =>
+            new CustomerAccountAccessError({
+              reason:
+                error.reason === "unavailable"
+                  ? "unavailable"
+                  : "unauthenticated",
+            })
+        )
+      ),
+  });
+  const layer = Layer.mergeAll(
+    agents,
+    // The documents these tests read are linked nowhere.
+    Layer.succeed(AdministrationAgentDocuments, {
+      link: () => Effect.succeedNone,
+    }),
+    AdministratorAgentAuthorization.Default.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          agents,
+          Layer.mock(AccountRoleGrants, {
+            has: ({ accountId }) =>
+              Effect.succeed(accountId === administrator.accountId),
+          })
+        )
+      )
+    ),
+    Layer.succeed(CustomerAgentClientDirectory, {
+      find: (id) =>
+        id === unreadableClientId
+          ? Effect.fail(
+              new CustomerAgentAuthorizationError({ reason: "unavailable" })
+            )
+          : Effect.succeed(
+              id === clientId
+                ? Option.some({
+                    clientId,
+                    name: clientName,
+                    host: "assistant.example",
+                  })
+                : Option.none()
+            ),
+    }),
+    Layer.succeed(AdministratorAssistantConnections, {
+      connect: (input) => {
+        if (connectFailure === "fails") {
+          return Effect.fail(
+            databaseFailure("insert into administrator assistant connections")
+          );
+        }
+        if (connectFailure === "dies") {
+          return Effect.die(new Error("The assistant connection disappeared."));
+        }
+        return Effect.sync(() => {
+          connects.push(input);
+          return {
+            _tag: "AssistantConnection" as const,
+            connectionId: assistantChannel.connectionId,
+            oauthClientId: input.oauthClientId,
+          };
+        });
+      },
+    })
+  );
+  return { connects, layer };
+};
+
+/** A cancelled reservation an administrator may restore, after a partial refund. */
+const restorableReservation = (() => {
+  const detail = loadFixtureReservation("0198-admin-fixture-attention");
+  if (detail === null) {
+    throw new Error("No fixture reservation 0198-admin-fixture-attention.");
+  }
+  return {
+    ...detail,
+    canCancel: false,
+    canRestore: true,
+    restoration: {
+      cancellationEmailRecorded: true,
+      issuesNewAccess: true,
+      issuesNewInvoice: false,
+      clearsRefundRequirement: false,
+      refundedPayment: {
+        amount: { value: 25000, exponent: 2, currency: "CZK" },
+        coverage: "partial" as const,
+      },
+    },
+  };
+})();
+
+/**
+ * The domain services behind every instance. The CLI authentication accepts
+ * only `cliBearer`, so an instance that consults it would admit the CLI.
+ */
+const makeInstanceServices = ({
+  invoices = Layer.mock(InvoiceAdministrationService, {}),
+}: {
+  readonly invoices?: Layer.Layer<InvoiceAdministrationService>;
+} = {}) => {
+  const callers: Array<CurrentAdministrationCaller["Service"]> = [];
+  const backfills: Array<
+    Parameters<ReservationProductDetailsBackfill["Service"]["runBatch"]>[0]
+  > = [];
+  const sessionOwners: Array<string> = [];
+  const sessionAuthentications: Array<string> = [];
+  const reservationReads: Array<string> = [];
+  const restorations: Array<
+    Parameters<ReservationAdministrationService["Service"]["restore"]>[0]
+  > = [];
+  const layer = Layer.mergeAll(
+    Layer.mock(CliAuthentication, {
+      authenticateSession: (authorization) =>
+        Effect.suspend(() => {
+          sessionAuthentications.push(authorization);
+          return authorization === `Bearer ${cliBearer}`
+            ? Effect.succeed(cliSession)
+            : Effect.fail(
+                new CliSessionUnauthorized({
+                  message: "The CLI session is not valid.",
+                })
+              );
+        }),
+      sessionAdministrator: () => Effect.succeed(cliAdministrator),
+      listSessions: (owner) =>
+        Effect.sync(() => {
+          sessionOwners.push(owner);
+          return [];
+        }),
+    }),
+    Layer.mock(AdministrationRequestLedger, {
+      applyOnce: () => Effect.die("Unused CLI mutation ledger"),
+      applyOnceWithEffects: () =>
+        Effect.fail(
+          new CliMutationInProgress({
+            message: "This mutation is already in progress.",
+            requestId: Schema.decodeUnknownSync(CliMutationRequestId)(
+              "01980000-0000-7000-8000-0000000000b1"
+            ),
+          })
+        ),
+    }),
+    Layer.succeed(AdministrationActionLog, {
+      start: ({ caller }) =>
+        Effect.sync(() => {
+          callers.push(caller);
+          return "01980000-0000-7000-8000-0000000000e1";
+        }),
+      finish: () => Effect.void,
+    }),
+    Layer.mock(CliAuthenticationAdmission, {}),
+    Layer.mock(AdministrationService, {
+      loadReservation: (id) =>
+        Effect.sync(() => {
+          reservationReads.push(id);
+          return id === restorableReservation.reservation.id
+            ? restorableReservation
+            : null;
+        }),
+    }),
+    Layer.mock(AdministratorRoster, {}),
+    Layer.mock(LegacyAdministratorBackfill, {}),
+    Layer.mock(CampaignOperations, {}),
+    Layer.mock(ReservationAdministrationService, {
+      restore: (input) =>
+        Effect.sync(() => {
+          restorations.push(input);
+          return {
+            outcome: "restored",
+            email: "not_requested",
+            access: "issued",
+            invoice: null,
+          } as const;
+        }),
+    }),
+    Layer.succeed(ReservationProductDetailsBackfill, {
+      runBatch: (input) =>
+        Effect.sync(() => {
+          backfills.push(input);
+          return {
+            updated: 1,
+            alreadyComplete: 0,
+            unresolved: [],
+            nextCursor: null,
+          };
+        }),
+    }),
+    Layer.mock(ReservationAccessAdministration, {}),
+    Layer.mock(DiscountAdministration, {}),
+    GrantedAdministrator,
+    UnusedAdministrationCustomerDirectory,
+    UnusedWithdrawalService,
+    invoices,
+    Layer.mock(StandaloneAccessCodeAdministration, {}),
+    NodeHttpServer.layerHttpServices
+  );
+  return {
+    backfills,
+    callers,
+    layer,
+    reservationReads,
+    restorations,
+    sessionAuthentications,
+    sessionOwners,
+  };
+};
+
+const makeCliApiLayer = () =>
+  makeWorkspaceAdminApiLayer({
+    authentication: CliSessionAdministrationAuthenticationLive,
+    sessionAuthentication: CliBearerAuthenticationLive,
+    clientCompatibility: CliClientCompatibilityLive,
+  });
+
+const serveAssistant = (
+  options: {
+    readonly connectFailure?: "fails" | "dies";
+    readonly logs?: string[];
+    readonly invoices?: Layer.Layer<InvoiceAdministrationService>;
+  } = {}
+) => {
+  const assistant = makeAssistantServices(options);
+  const instance = makeInstanceServices({
+    ...(options.invoices && { invoices: options.invoices }),
+  });
+  const logs = options.logs;
+  const web = HttpRouter.toWebHandler(
+    makeAdministrationAssistantApiLayer().pipe(
+      Layer.provide(Layer.mergeAll(assistant.layer, instance.layer)),
+      Layer.provideMerge(
+        logs
+          ? Logger.layer([
+              Logger.make<unknown, void>(({ message }) => {
+                logs.push(JSON.stringify(message));
+              }),
+            ])
+          : Layer.empty
+      )
+    ),
+    { disableLogger: true }
+  );
+  return { ...assistant, ...instance, handler: web.handler, web };
+};
+
+type Handler = (request: Request) => Promise<Response>;
+
+const send = (
+  handler: Handler,
+  bearer: string,
+  init: RequestInit & { readonly path: string } = listSessions
+) =>
+  handler(
+    new Request(`https://workspace.deskohub.test/api/v1/cli${init.path}`, {
+      ...init,
+      headers: {
+        authorization: `Bearer ${bearer}`,
+        "content-type": "application/json",
+        ...init.headers,
+      },
+    })
+  );
+
+const listSessions = { path: "/sessions" };
+const currentSession = { path: "/session" };
+const deleteCode = {
+  path: "/discounts/mutations",
+  method: "POST",
+  body: JSON.stringify({
+    requestId: "01980000-0000-7000-8000-0000000000b1",
+    mutation: {
+      kind: "delete-code",
+      id: "01980000-0000-7000-8000-0000000000d1",
+    },
+  }),
+};
+
+const errorTagOf = async (response: Response) => {
+  const body: unknown = await response.json();
+  return Predicate.hasProperty(body, "_tag") ? body._tag : undefined;
+};
+
+describe("AdministratorAssistantAuthenticationLive", () => {
+  test("acts as the token's administrator on its assistant connection", async () => {
+    const { callers, connects, handler, sessionOwners, web } = serveAssistant();
+
+    const sessions = await send(handler, assistantToken, {
+      // Nothing in the request names the actor or the client.
+      path: `${listSessions.path}?oauthClientId=https://other.example/client.json&accountId=${cliAdministrator.accountId}`,
+      headers: {
+        "x-oauth-client-id": "https://other.example/client.json",
+        "x-client-name": "Spoofed Assistant",
+      },
+    });
+    const mutation = await send(handler, assistantToken, deleteCode);
+    await web.dispose();
+
+    expect(sessions.status).toBe(200);
+    expect(sessionOwners).toEqual([administrator.accountId]);
+    expect(mutation.status).toBe(409);
+    expect(callers).toEqual([
+      { actor: administrator, channel: assistantChannel },
+    ]);
+    expect(connects).toEqual([
+      { actor: administrator, oauthClientId: clientId, clientName },
+      { actor: administrator, oauthClientId: clientId, clientName },
+    ]);
+  });
+
+  test.each([
+    ["an unknown or expired token", "unknown-access-token", "invalid-token"],
+    [
+      "a deleted account",
+      "deleted-account-access-token",
+      "account-unavailable",
+    ],
+    [
+      "a grant without the administration scope",
+      "customer-assistant-access-token",
+      "missing-scope",
+    ],
+    [
+      "a revoked administrator grant",
+      "former-administrator-access-token",
+      "not-administrator",
+    ],
+    ["an unknown client", "unknown-client-access-token", "unknown-client"],
+  ])("refuses %s", async (_case, token, reason) => {
+    const logs: string[] = [];
+    const { callers, connects, handler, sessionOwners, web } = serveAssistant({
+      logs,
+    });
+
+    const sessions = await send(handler, token);
+    const mutation = await send(handler, token, deleteCode);
+    await web.dispose();
+
+    expect([sessions.status, await errorTagOf(sessions)]).toEqual([
+      401,
+      "CliSessionUnauthorized",
+    ]);
+    expect([mutation.status, await errorTagOf(mutation)]).toEqual([
+      401,
+      "CliSessionUnauthorized",
+    ]);
+    expect(sessionOwners).toEqual([]);
+    expect(callers).toEqual([]);
+    expect(connects).toEqual([]);
+    expect(logs.some((text) => text.includes(reason))).toBe(true);
+    expect(logs.some((text) => text.includes(token))).toBe(false);
+  });
+
+  test.each([
+    ["the token can't be verified", "authorization-outage-access-token", {}],
+    ["the client can't be read", "directory-outage-access-token", {}],
+    [
+      "the connection can't be recorded",
+      assistantToken,
+      { connectFailure: "fails" as const },
+    ],
+    [
+      "recording the connection dies",
+      assistantToken,
+      { connectFailure: "dies" as const },
+    ],
+  ])(
+    "reports the service unavailable when %s",
+    async (_case, token, options) => {
+      const logs: string[] = [];
+      const { callers, handler, sessionOwners, web } = serveAssistant({
+        ...options,
+        logs,
+      });
+
+      const response = await send(handler, token);
+      await web.dispose();
+
+      expect([response.status, await errorTagOf(response)]).toEqual([
+        503,
+        "CliServiceUnavailable",
+      ]);
+      expect(sessionOwners).toEqual([]);
+      expect(callers).toEqual([]);
+      expect(logs.some((text) => text.includes(token))).toBe(false);
+    }
+  );
+});
+
+describe("administration API instances", () => {
+  test("the assistant instance refuses a CLI bearer", async () => {
+    const { handler, sessionAuthentications, sessionOwners, web } =
+      serveAssistant();
+
+    const sessions = await send(handler, cliBearer);
+    const session = await send(handler, cliBearer, currentSession);
+    const assistantSession = await send(
+      handler,
+      assistantToken,
+      currentSession
+    );
+    await web.dispose();
+
+    expect([sessions.status, await errorTagOf(sessions)]).toEqual([
+      401,
+      "CliSessionUnauthorized",
+    ]);
+    expect([session.status, await errorTagOf(session)]).toEqual([
+      401,
+      "CliSessionUnauthorized",
+    ]);
+    expect([
+      assistantSession.status,
+      await errorTagOf(assistantSession),
+    ]).toEqual([401, "CliSessionUnauthorized"]);
+    expect(sessionAuthentications).toEqual([]);
+    expect(sessionOwners).toEqual([]);
+  });
+
+  test.each([
+    ["an opaque", "Opaque0AccessToken1Synthetic2Value"],
+    [
+      "a JWT",
+      "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzeW50aGV0aWMifQ.c3ludGhldGljLXNpZ25hdHVyZQ",
+    ],
+  ])("the CLI route refuses %s OAuth access token", async (_case, token) => {
+    for (const init of [listSessions, currentSession]) {
+      const response = await send(handleWorkspaceAdminApiRequest, token, init);
+
+      expect([response.status, await errorTagOf(response)]).toEqual([
+        401,
+        "CliSessionUnauthorized",
+      ]);
+    }
+  });
+
+  test("each instance keeps its own authentication in either build order", async () => {
+    const requests = [
+      [cliBearer, listSessions],
+      [cliBearer, currentSession],
+      [assistantToken, listSessions],
+      [assistantToken, currentSession],
+    ] as const;
+
+    for (const order of [
+      ["cli", "assistant"],
+      ["assistant", "cli"],
+    ] as const) {
+      const assistant = makeAssistantServices();
+      const instance = makeInstanceServices();
+      const services = Layer.mergeAll(assistant.layer, instance.layer);
+      const memoMap = Layer.makeMemoMapUnsafe();
+      const build = {
+        cli: () => makeCliApiLayer(),
+        assistant: () => makeAdministrationAssistantApiLayer(),
+      };
+      const webs = order.map((name) => ({
+        name,
+        web: HttpRouter.toWebHandler(
+          build[name]().pipe(Layer.provide(services)),
+          { disableLogger: true, memoMap }
+        ),
+      }));
+
+      const statuses: Array<string> = [];
+      for (const { name, web } of webs) {
+        for (const [bearer, init] of requests) {
+          const response = await send(web.handler, bearer, init);
+          statuses.push(
+            `${name} ${bearer === cliBearer ? "CLI bearer" : "OAuth token"} ${init.path} ${response.status}`
+          );
+        }
+      }
+      await Promise.all(webs.map(({ web }) => web.dispose()));
+
+      const expected = {
+        cli: [
+          "cli CLI bearer /sessions 200",
+          "cli CLI bearer /session 200",
+          "cli OAuth token /sessions 401",
+          "cli OAuth token /session 401",
+        ],
+        assistant: [
+          "assistant CLI bearer /sessions 401",
+          "assistant CLI bearer /session 401",
+          "assistant OAuth token /sessions 200",
+          "assistant OAuth token /session 401",
+        ],
+      };
+      expect(statuses).toEqual(order.flatMap((name) => expected[name]));
+      expect(instance.sessionOwners).toEqual(
+        order.map((name) =>
+          name === "cli" ? cliAdministrator.accountId : administrator.accountId
+        )
+      );
+      // Only the CLI instance consults CLI sessions.
+      expect(instance.sessionAuthentications).toEqual(
+        requests.map(([bearer]) => `Bearer ${bearer}`)
+      );
+    }
+  });
+});
+
+describe("administration tools through the assistant API", () => {
+  const caller: CustomerAgentCaller = {
+    accessToken: assistantToken,
+    grant: grantOf({}),
+  };
+  const backfillTool = makeAdministrationAgentTools(
+    administrationOperationTools
+  ).find(({ name }) => name === "admin_backfill_reservation_product_details");
+  if (backfillTool === undefined) throw new Error("No backfill tool.");
+
+  const callBackfill = (handler: Handler, args: Schema.Json) =>
+    backfillTool
+      .call(args, Option.some(caller))
+      .pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            makeAssistantServices().layer,
+            AdministrationApiClient.Default.pipe(
+              Layer.provide(Layer.succeed(AdministrationApiTransport, handler))
+            )
+          )
+        ),
+        Effect.runPromise
+      );
+
+  test("records a dry run, the preview's included, as no action, and the confirmed run as one", async () => {
+    const { backfills, callers, handler } = serveAssistant();
+
+    const preview = await callBackfill(handler, {
+      dryRun: false,
+      after: null,
+    });
+    const dryRun = await callBackfill(handler, { dryRun: true, after: null });
+
+    expect(preview).toMatchObject({
+      result: { outcome: "confirmation-required" },
+    });
+    expect(dryRun).toMatchObject({ result: { outcome: "dry-run" } });
+    expect(backfills).toEqual([
+      { dryRun: true, after: null },
+      { dryRun: true, after: null },
+    ]);
+    expect(callers).toEqual([]);
+
+    const applied = await callBackfill(handler, {
+      dryRun: false,
+      after: null,
+      confirm: true,
+    });
+
+    expect(applied).toMatchObject({ result: { outcome: "applied" } });
+    expect(backfills.at(-1)).toEqual({ dryRun: false, after: null });
+    expect(callers.map(({ channel }) => channel)).toEqual([assistantChannel]);
+  });
+
+  const restoreTool = makeAdministrationAgentTools(
+    administrationOperationTools
+  ).find(({ name }) => name === "admin_restore_reservation");
+  if (restoreTool === undefined) throw new Error("No restore tool.");
+
+  const callRestore = (handler: Handler, args: Schema.Json) =>
+    restoreTool
+      .call(args, Option.some(caller))
+      .pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            makeAssistantServices().layer,
+            AdministrationApiClient.Default.pipe(
+              Layer.provide(Layer.succeed(AdministrationApiTransport, handler))
+            )
+          )
+        ),
+        Effect.result,
+        Effect.runPromise
+      );
+
+  test("previews a restore with the reservation's refund and changes nothing without confirm: true", async () => {
+    const { callers, handler, reservationReads, restorations } =
+      serveAssistant();
+    const reservationId = restorableReservation.reservation.id;
+    const input = {
+      reservationId,
+      acknowledgeRefundedPayment: true,
+      sendRestorationEmail: true,
+    };
+
+    const previews = [
+      await callRestore(handler, input),
+      await callRestore(handler, { ...input, confirm: false }),
+    ];
+
+    for (const preview of previews) {
+      expect(preview).toMatchObject({
+        _tag: "Success",
+        success: {
+          result: {
+            outcome: "confirmation-required",
+            operation: "admin_restore_reservation",
+            input,
+            current: {
+              "administration.getReservation": {
+                canRestore: true,
+                restoration: {
+                  refundedPayment:
+                    restorableReservation.restoration.refundedPayment,
+                },
+              },
+            },
+          },
+        },
+      });
+    }
+    expect(reservationReads).toEqual([reservationId, reservationId]);
+    expect(restorations).toEqual([]);
+    expect(callers).toEqual([]);
+
+    const applied = await callRestore(handler, { ...input, confirm: true });
+
+    expect(applied).toMatchObject({
+      _tag: "Success",
+      success: {
+        result: {
+          outcome: "applied",
+          result: {
+            outcome: "restored",
+            email: "not_requested",
+            access: "issued",
+            invoice: null,
+          },
+        },
+      },
+    });
+    expect(restorations).toEqual([
+      { ...input, actor: { source: "assistant", administrator } },
+    ]);
+    expect(callers.map(({ channel }) => channel)).toEqual([assistantChannel]);
+  });
+
+  test("answers a restore preview of a missing reservation with the API's refusal", async () => {
+    const { callers, handler, restorations } = serveAssistant();
+
+    const preview = await callRestore(handler, {
+      reservationId: "01980000-0000-7000-8000-0000000000f1",
+      acknowledgeRefundedPayment: false,
+      sendRestorationEmail: false,
+    });
+
+    expect(preview).toMatchObject({
+      _tag: "Failure",
+      failure: { details: { code: "administration_failed" } },
+    });
+    expect(restorations).toEqual([]);
+    expect(callers).toEqual([]);
+  });
+});
+
+describe("invoice cancellation tools through the assistant API", () => {
+  const caller: CustomerAgentCaller = {
+    accessToken: assistantToken,
+    grant: grantOf({}),
+  };
+  const tools = makeAdministrationAgentTools(administrationOperationTools);
+  const invoiceId = Schema.decodeUnknownSync(AdministrationInvoiceId)(
+    "01980000-0000-7000-8000-0000000000f1"
+  );
+  const cancellation = {
+    cancelledAt: "2026-11-15T10:00:00Z",
+    cause: "invoice_cancellation",
+    source: "assistant",
+    actor: administrator.email,
+    correctiveDocumentNumber: "WS-OD-2026-000001",
+    correctiveDocumentIssuedAt: "2026-11-15T10:00:00Z",
+    correctiveDocumentPdfUrl: `/admin/invoices/${invoiceId}/corrective-document`,
+    notices: {
+      customer: "not_owed",
+      internal: "accepted",
+      needsAttention: false,
+    },
+  } as const;
+  const detail = invoiceAdministrationDetail({
+    id: invoiceId,
+    invoiceNumber: "WS-FV-2026-000009",
+    issuedAt: "2026-11-01T10:00:00Z",
+    customerName: "Synthetic Customer",
+    reservationId: null,
+    total: "1000",
+    currency: "CZK",
+    paymentStatus: "paid",
+    source: "admin-ui",
+    actor: null,
+    delivery: { customer: "accepted", internal: "accepted" },
+    needsAttention: false,
+    cancellation: null,
+    archivedAt: null,
+    replacesInvoiceId: null,
+    replacedByInvoiceId: null,
+    locale: "cs-CZ",
+    serviceDate: "2026-11-01",
+    dueDate: null,
+    paidOn: "2026-11-01",
+    variableSymbol: null,
+    lines: [{ description: "Space rental", price: "1000" }],
+    buyer: {
+      kind: "person",
+      legalName: "Synthetic Customer",
+      address: {
+        line1: "Test street 1",
+        city: "Prague",
+        postalCode: "100 00",
+        country: "CZ",
+      },
+    },
+    pdfUrl: `/admin/invoices/${invoiceId}/pdf`,
+    cancellationPlan: { customerNotice: "owed", reservation: "none" },
+  });
+  const serveInvoices = () => {
+    const changes: Array<{
+      readonly operation: string;
+      readonly input: unknown;
+    }> = [];
+    const invoices = Layer.mock(InvoiceAdministrationService, {
+      get: () => Effect.succeed(detail),
+      cancel: (input) =>
+        Effect.sync(() => {
+          changes.push({ operation: "cancel", input });
+          return {
+            invoiceId,
+            outcome: "cancelled",
+            cancellation,
+            reservation: null,
+          };
+        }),
+      archive: (input) =>
+        Effect.sync(() => {
+          changes.push({ operation: "archive", input });
+          return {
+            invoiceId,
+            archivedAt: "2026-11-15T11:00:00Z",
+            changed: true,
+          };
+        }),
+      getCorrectiveDocumentPdf: (_id, scope) =>
+        Effect.sync(() => {
+          changes.push({ operation: "read corrective document", input: scope });
+          return {
+            bytes: new Uint8Array([37, 80, 68, 70]),
+            fileName: "WS-OD-2026-000001.pdf",
+          };
+        }),
+    });
+    return { changes, ...serveAssistant({ invoices }) };
+  };
+  const call = (handler: Handler, name: string, args: Schema.Json) => {
+    const tool = tools.find((candidate) => candidate.name === name);
+    if (tool === undefined) throw new Error(`No tool ${name}.`);
+    return tool
+      .call(args, Option.some(caller))
+      .pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            makeAssistantServices().layer,
+            AdministrationApiClient.Default.pipe(
+              Layer.provide(Layer.succeed(AdministrationApiTransport, handler))
+            )
+          )
+        ),
+        Effect.runPromise
+      );
+  };
+
+  test("previews a cancellation and an archive with the invoice's plan, changing nothing", async () => {
+    const { callers, changes, handler } = serveInvoices();
+
+    const cancelPreview = await call(handler, "admin_cancel_invoice", {
+      invoiceId,
+      confirmedCustomerNotice: true,
+    });
+    const archivePreview = await call(handler, "admin_archive_invoice", {
+      invoiceId,
+    });
+
+    for (const preview of [cancelPreview, archivePreview]) {
+      expect(preview).toMatchObject({
+        result: {
+          outcome: "confirmation-required",
+          current: {
+            "administration.getInvoice": {
+              id: invoiceId,
+              cancellationPlan: detail.cancellationPlan,
+            },
+          },
+        },
+      });
+    }
+    expect(changes).toEqual([]);
+    expect(callers).toEqual([]);
+  });
+
+  test("cancels and archives on confirm as the assistant's administrator", async () => {
+    const { callers, changes, handler } = serveInvoices();
+    const actor = { source: "assistant", administrator };
+
+    const cancelled = await call(handler, "admin_cancel_invoice", {
+      invoiceId,
+      confirmedCustomerNotice: true,
+      confirm: true,
+    });
+    const archived = await call(handler, "admin_archive_invoice", {
+      invoiceId,
+      confirm: true,
+    });
+
+    expect(cancelled).toMatchObject({ result: { outcome: "applied" } });
+    expect(archived).toMatchObject({ result: { outcome: "applied" } });
+    expect(changes).toEqual([
+      {
+        operation: "cancel",
+        input: { invoiceId, actor, confirmedCustomerNotice: true },
+      },
+      { operation: "archive", input: { invoiceId, actor } },
+    ]);
+    expect(callers.map(({ channel }) => channel)).toEqual([
+      assistantChannel,
+      assistantChannel,
+    ]);
+  });
+
+  test("reads an archived invoice's credit note as an attached document", async () => {
+    const { changes, handler } = serveInvoices();
+
+    const read = await call(
+      handler,
+      "admin_get_invoice_corrective_document_pdf",
+      { invoiceId }
+    );
+
+    expect(read).toMatchObject({
+      result: { mimeType: "application/pdf", byteLength: 4 },
+    });
+    expect(changes).toEqual([
+      {
+        operation: "read corrective document",
+        input: { includeArchived: true },
+      },
+    ]);
+  });
+});

@@ -1,0 +1,67 @@
+import type { Metadata } from "next";
+import { connection } from "next/server";
+import { type ReactNode, Suspense } from "react";
+import { AccountLayoutShell } from "@/features/account/components/account-layout-shell";
+import { AccountLoading } from "@/features/account/components/account-loading";
+import { arePasskeysEnabled } from "@/features/account/server/account-release-gates.server";
+import { isCustomerSignedIn } from "@/features/account/server/customer-session.server";
+import type { Locale } from "@/features/i18n";
+import { runWithRequestLocale } from "@/features/i18n/server/request-locale";
+import { homeScreenAppMetadata } from "@/features/mobile-distribution/home-screen-app-metadata";
+import { InstallBar } from "@/features/mobile-distribution/install-bar";
+import { InstallLaunchRedirect } from "@/features/mobile-distribution/install-launch-redirect";
+import { isCoworkPassesPageOpenAfterConnection } from "@/features/passes/backend/cowork-passes-release-gate.server";
+import { areReferralsEnabled } from "@/features/referrals/referral-release-gate.server";
+import { PageNavigationBoundary } from "@/shared/components/page-navigation-boundary";
+
+export const metadata: Metadata = homeScreenAppMetadata;
+
+type AccountLayoutProps = {
+  readonly children: ReactNode;
+  readonly modal: ReactNode;
+};
+
+export default function AccountLayout({ children, modal }: AccountLayoutProps) {
+  return runWithRequestLocale((locale) => (
+    <Suspense fallback={<AccountLoading locale={locale} />}>
+      <AccountLayoutContent locale={locale} modal={modal}>
+        {children}
+      </AccountLayoutContent>
+    </Suspense>
+  ));
+}
+
+async function AccountLayoutContent({
+  children,
+  locale,
+  modal,
+}: AccountLayoutProps & { readonly locale: Locale }) {
+  await connection();
+
+  const [passkeysEnabled, referralsEnabled, passesEnabled, signedIn] =
+    await Promise.all([
+      arePasskeysEnabled(),
+      areReferralsEnabled(),
+      isCoworkPassesPageOpenAfterConnection(),
+      isCustomerSignedIn(),
+    ]);
+
+  return (
+    <>
+      <AccountLayoutShell
+        locale={locale}
+        passkeysEnabled={passkeysEnabled}
+        passesEnabled={passesEnabled}
+        referralsEnabled={referralsEnabled}
+        signedIn={signedIn}
+      >
+        <PageNavigationBoundary>
+          {children}
+          {modal}
+        </PageNavigationBoundary>
+      </AccountLayoutShell>
+      <InstallLaunchRedirect />
+      {signedIn && <InstallBar locale={locale} placement="page" />}
+    </>
+  );
+}

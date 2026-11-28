@@ -1,0 +1,128 @@
+import { Data, Effect, Schema, SchemaGetter, SchemaIssue } from "effect";
+import type {
+  ReservationInterval,
+  ReservationIntervalInput,
+} from "@/features/reservation/reservation-interval-domain";
+import {
+  isCoworkReservationInterval,
+  isSingleDayReservationInterval,
+} from "@/features/reservation/reservation-interval-domain";
+import { normalizeReservationIntervalFields } from "@/features/reservation/reservation-interval-normalization";
+import { workspaceSiteConstants } from "@/shared/utils/site-constants";
+import {
+  instantStringSchema,
+  localDateTimeSchema,
+  makeWholeHourInstantStringSchema,
+  temporalInstantToPlainDate,
+} from "@/shared/utils/temporal";
+import { getTouchedWorkspaceDateBounds } from "./reservation-date";
+
+export type {
+  ReservationInterval,
+  ReservationIntervalInput,
+} from "@/features/reservation/reservation-interval-domain";
+export { isCoworkReservationInterval, isSingleDayReservationInterval };
+
+export class ReservationIntervalError extends Data.TaggedError(
+  "ReservationIntervalError"
+)<{ readonly message: string; readonly cause?: unknown }> {}
+
+export const reservationTimestampInputSchema = Schema.Union([
+  localDateTimeSchema,
+  instantStringSchema,
+]);
+
+const reservationIntervalInputFields = {
+  startsAt: reservationTimestampInputSchema,
+  endsAt: reservationTimestampInputSchema,
+} as const;
+
+export const reservationIntervalInputSchema = Schema.Struct(
+  reservationIntervalInputFields
+);
+const decodeReservationIntervalInput = Schema.decodeUnknownSync(
+  reservationIntervalInputSchema
+);
+
+export const reservationIntervalSchema = reservationIntervalInputSchema.pipe(
+  Schema.decodeTo(
+    Schema.Struct({
+      startsAt: instantStringSchema,
+      endsAt: instantStringSchema,
+    }),
+    {
+      decode: SchemaGetter.transformEffect((input) =>
+        normalizeReservationIntervalFields(
+          input,
+          workspaceSiteConstants.location.timeZone
+        ).pipe(Effect.mapError((issue) => toSchemaIssue(input, issue)))
+      ),
+      encode: SchemaGetter.transform(decodeReservationIntervalInput),
+    }
+  )
+);
+
+export const wholeHourReservationInstantSchema =
+  makeWholeHourInstantStringSchema(workspaceSiteConstants.location.timeZone);
+
+export const coworkReservationIntervalSchema = reservationIntervalSchema.check(
+  Schema.makeFilter(isCoworkReservationInterval, {
+    message:
+      "Cowork reservations must use a full-day, Open Space, or overnight interval.",
+  })
+);
+
+export const getReservationIntervalNormalization = (
+  interval: ReservationIntervalInput
+) =>
+  normalizeReservationIntervalFields(
+    interval,
+    workspaceSiteConstants.location.timeZone
+  );
+
+export const normalizeReservationInterval = Effect.fn(
+  "normalizeReservationInterval"
+)(function* (value: ReservationIntervalInput) {
+  return yield* normalizeReservationIntervalFields(
+    value,
+    workspaceSiteConstants.location.timeZone
+  ).pipe(
+    Effect.mapError(
+      (cause) => new ReservationIntervalError({ message: cause.message, cause })
+    )
+  );
+});
+
+export const hasReservationIntervalEnded = (
+  interval: Pick<ReservationInterval, "endsAt">,
+  now = Temporal.Now.instant()
+) => Temporal.Instant.compare(Temporal.Instant.from(interval.endsAt), now) < 0;
+
+export const getReservationDate = ({
+  interval,
+  timeZone,
+}: {
+  readonly interval: ReservationInterval;
+  readonly timeZone: string;
+}) =>
+  temporalInstantToPlainDate({
+    instant: Temporal.Instant.from(interval.startsAt),
+    timeZone,
+  }).toString();
+
+/** The first and last Prague dates touched by a nonempty half-open interval. */
+export const getReservationDateBounds = (interval: ReservationInterval) =>
+  getTouchedWorkspaceDateBounds({
+    startsAt: Temporal.Instant.from(interval.startsAt),
+    endsAt: Temporal.Instant.from(interval.endsAt),
+  });
+
+const toSchemaIssue = (
+  input: ReservationIntervalInput,
+  cause: { readonly path: keyof ReservationInterval; readonly message: string }
+) => {
+  return new SchemaIssue.Pointer(
+    [cause.path],
+    new SchemaIssue.InvalidValue({ message: cause.message }, input)
+  );
+};

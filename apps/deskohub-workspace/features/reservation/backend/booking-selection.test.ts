@@ -1,0 +1,695 @@
+import "@/shared/testing/workspace-test-env";
+import { describe, expect, test } from "bun:test";
+import { type DotyposTable, DotyposTableSchema } from "@deskohub/dotypos";
+import { Effect, Layer, Schema } from "effect";
+import { OfficeReleaseGate } from "@/features/office/backend/office-release-gate";
+import { getShareableReservationUrl } from "@/features/reservation/backend/shareable-reservation-url";
+import type { MeetingRoomReservationDurationKey } from "@/features/reservation/meeting-room-reservation-duration";
+import { meetingRoomSelectionLink } from "@/features/reservation/meeting-room-selection-link";
+import { TeamTableReleaseGate } from "@/features/team-table/backend/team-table-release-gate";
+import { workspaceSiteConstants } from "@/shared/utils/site-constants";
+import { plainDateStringSchema } from "@/shared/utils/temporal";
+import { AdvisoryAvailabilityInventory } from "./availability-inventory";
+import {
+  type BookingSelectionInput,
+  BookingSelectionRejected,
+  getRebookingSelection,
+  resolveBookingQuoteSelection,
+  resolveMeetingRoomSelection,
+} from "./booking-selection";
+import { OvernightStayReleaseGate } from "./overnight-stay-release-gate";
+
+const pragueInstant = (local: string) =>
+  Temporal.PlainDateTime.from(local)
+    .toZonedDateTime(workspaceSiteConstants.location.timeZone)
+    .toInstant();
+
+// 15:20 in Prague, so some hourly bookings that began earlier today are
+// still open; checkout and reservation links keep a selection until it ends.
+const now = pragueInstant("2099-07-30T15:20");
+const today = plainDateStringSchema.make("2099-07-30");
+const tomorrow = plainDateStringSchema.make("2099-07-31");
+const latest = "2100-01-30";
+
+/**
+ * The office's Dotypos table is the only source of its seat maximum. The
+ * tests give it a capacity other than the live office's, so a maximum
+ * hard-coded anywhere on the way fails them.
+ */
+const officeSeatCapacity = 4;
+
+const officeTable = Schema.decodeSync(DotyposTableSchema)({
+  _cloudId: "cloud",
+  display: true,
+  enabled: true,
+  name: "office-1",
+  seats: String(officeSeatCapacity),
+  id: "office-1",
+  tags: ["reservation:office"],
+});
+
+const makeServices = ({
+  officeOpen = true,
+  overnightStayOpen = false,
+  tableOpen = false,
+  tables = [officeTable],
+}: {
+  readonly officeOpen?: boolean;
+  readonly overnightStayOpen?: boolean;
+  readonly tableOpen?: boolean;
+  readonly tables?: readonly DotyposTable[];
+} = {}) =>
+  Layer.mergeAll(
+    OfficeReleaseGate.fromDecision(officeOpen),
+    OvernightStayReleaseGate.fromDecision(overnightStayOpen),
+    TeamTableReleaseGate.fromDecision(tableOpen),
+    Layer.succeed(AdvisoryAvailabilityInventory, {
+      tables: Effect.succeed(tables),
+      listActiveReservationsOverlapping: () => Effect.succeed([]),
+      listLimitations: () => Effect.succeed([]),
+    })
+  );
+
+const quote = (selection: BookingSelectionInput, services = makeServices()) =>
+  Effect.runPromise(
+    resolveBookingQuoteSelection({ selection, locale: "en-US", now }).pipe(
+      Effect.provide(services)
+    )
+  );
+
+/** The rejection reason, or the lookup failure that is no rejection. */
+const rejectQuote = (
+  selection: BookingSelectionInput,
+  services = makeServices()
+) =>
+  Effect.runPromise(
+    resolveBookingQuoteSelection({ selection, locale: "en-US", now }).pipe(
+      Effect.flip,
+      Effect.map((error) =>
+        error instanceof BookingSelectionRejected ? error.reason : error
+      ),
+      Effect.provide(services)
+    )
+  );
+
+describe("resolveBookingQuoteSelection Team Table", () => {
+  const selection = {
+    family: "table",
+    date: today,
+    seats: 6,
+    startTime: "15:15",
+    endTime: "15:30",
+  } as const satisfies BookingSelectionInput;
+
+  test("quotes a slot whose end is still in the future on an exact capacity", async () => {
+    const table = Schema.decodeSync(DotyposTableSchema)({
+      _cloudId: "cloud",
+      display: true,
+      enabled: true,
+      name: "table-6",
+      seats: "6",
+      id: "table-6",
+      tags: ["reservation:table", "cowork:open-space"],
+    });
+    const services = makeServices({ tableOpen: true, tables: [table] });
+
+    const selected = await quote(selection, services);
+    expect(selected.reservation).toEqual({
+      kind: "table",
+      seats: 6,
+      startsAt: "2099-07-30T13:15:00Z",
+      endsAt: "2099-07-30T13:30:00Z",
+    });
+    expect(selected.reservationSelection).toEqual({
+      kind: "table",
+      date: today,
+      seats: 6,
+      startTime: "15:15",
+      endTime: "15:30",
+    });
+    await expect(
+      rejectQuote({ ...selection, seats: 5 }, services)
+    ).resolves.toEqual({ kind: "invalid-field", field: "seats" });
+  });
+
+  test("refuses direct selections when the release is closed", async () => {
+    await expect(rejectQuote(selection)).resolves.toEqual({
+      kind: "table-closed",
+    });
+  });
+});
+
+describe("resolveBookingQuoteSelection overnight stays", () => {
+  const reservedDesk = {
+    family: "cowork",
+    date: tomorrow,
+    tier: "reserved-desk",
+  } as const satisfies BookingSelectionInput;
+
+  test("books an overnight Reserved Desk at the day stay's price and service date while the gate is open", async () => {
+    const services = makeServices({ overnightStayOpen: true });
+    const overnight = await quote(
+      { ...reservedDesk, stay: "overnight" },
+      services
+    );
+    const day = await quote(reservedDesk, services);
+
+    expect(overnight.reservation).toEqual({
+      kind: "cowork",
+      entryTier: "reserved-desk",
+      date: tomorrow,
+      coffee: true,
+      stay: "overnight",
+    });
+    expect(overnight.reservationSelection).toMatchObject({ stay: "overnight" });
+    expect(overnight.request).toEqual(day.request);
+  });
+
+  test("rejects an overnight stay while the gate is closed", async () => {
+    expect(await rejectQuote({ ...reservedDesk, stay: "overnight" })).toEqual({
+      kind: "invalid-field",
+      field: "stay",
+    });
+  });
+
+  test("rejects an overnight Open Space", async () => {
+    expect(
+      await rejectQuote(
+        { ...reservedDesk, tier: "open-space", stay: "overnight" },
+        makeServices({ overnightStayOpen: true })
+      )
+    ).toEqual({ kind: "invalid-field", field: "stay" });
+  });
+
+  test("books a day stay without a stay key while the gate is closed", async () => {
+    const day = await quote({ ...reservedDesk, stay: "day" });
+    expect("stay" in day.reservation).toBe(false);
+  });
+});
+
+describe("resolveBookingQuoteSelection", () => {
+  test("resolves a cowork tier and date to the order the website books", async () => {
+    const selection = await quote({
+      family: "cowork",
+      date: tomorrow,
+      tier: "open-space",
+      coffee: true,
+    });
+
+    expect(selection.reservationSelection).toEqual({
+      kind: "cowork",
+      entryTier: "open-space",
+      date: tomorrow,
+      coffee: true,
+    });
+    expect(selection.reservation).toEqual({
+      kind: "cowork",
+      entryTier: "open-space",
+      date: tomorrow,
+      coffee: true,
+    });
+    expect(selection.request.locale).toBe("en-US");
+  });
+
+  test("includes coffee and keeps the monitor of a Reserved Desk", async () => {
+    const selection = await quote({
+      family: "cowork",
+      date: tomorrow,
+      tier: "reserved-desk",
+      monitorOption: "monitor",
+    });
+
+    expect(selection.reservation).toEqual({
+      kind: "cowork",
+      entryTier: "reserved-desk",
+      date: tomorrow,
+      coffee: true,
+      monitorOption: "monitor",
+    });
+  });
+
+  test("resolves a meeting-room start and duration to its Prague interval", async () => {
+    const selection = await quote({
+      family: "meeting-room",
+      date: today,
+      startTime: "16:00",
+      duration: "hour:1",
+    });
+
+    expect(selection.reservationSelection).toEqual({
+      kind: "meeting-room",
+      duration: "hour:1",
+      startDateTime: `${today}T16:00`,
+    });
+    expect(selection.reservation).toMatchObject({
+      kind: "meeting-room",
+      reservationDate: today,
+      startsAt: pragueInstant(`${today}T16:00`).toString(),
+      endsAt: pragueInstant(`${today}T17:00`).toString(),
+    });
+  });
+
+  test("resolves office days with one seat by default", async () => {
+    const selection = await quote({
+      family: "office",
+      date: tomorrow,
+      endDate: plainDateStringSchema.make("2099-08-01"),
+    });
+
+    expect(selection.reservationSelection).toEqual({
+      kind: "office",
+      startsOn: tomorrow,
+      dayCount: 2,
+      seats: 1,
+    });
+    expect(selection.reservation).toEqual({
+      kind: "office",
+      startsOn: tomorrow,
+      endsOn: "2099-08-01",
+      seats: 1,
+    });
+  });
+
+  test("resolves as many office seats as the office's Dotypos table has", async () => {
+    const selection = await quote({
+      family: "office",
+      date: tomorrow,
+      seats: officeSeatCapacity,
+    });
+
+    expect(selection.reservationSelection).toEqual({
+      kind: "office",
+      startsOn: tomorrow,
+      dayCount: 1,
+      seats: officeSeatCapacity,
+    });
+  });
+
+  const invalidFields = [
+    {
+      name: "a cowork selection without a tier",
+      selection: { family: "cowork", date: tomorrow },
+      field: "tier",
+    },
+    {
+      name: "a cowork date range",
+      selection: {
+        family: "cowork",
+        date: tomorrow,
+        endDate: plainDateStringSchema.make("2099-08-01"),
+        tier: "open-space",
+      },
+      field: "endDate",
+    },
+    {
+      name: "coffee on a Reserved Desk, which always includes it",
+      selection: {
+        family: "cowork",
+        date: tomorrow,
+        tier: "reserved-desk",
+        coffee: true,
+      },
+      field: "coffee",
+    },
+    {
+      name: "a monitor on an Open Space desk",
+      selection: {
+        family: "cowork",
+        date: tomorrow,
+        tier: "open-space",
+        monitorOption: "2x27-qhd",
+      },
+      field: "monitorOption",
+    },
+    {
+      name: "a meeting room without a duration",
+      selection: { family: "meeting-room", date: today, startTime: "16:00" },
+      field: "duration",
+    },
+    {
+      name: "an hourly meeting room without a start time",
+      selection: { family: "meeting-room", date: today, duration: "hour:1" },
+      field: "startTime",
+    },
+    {
+      name: "an office range that ends before it starts",
+      selection: {
+        family: "office",
+        date: plainDateStringSchema.make("2099-08-01"),
+        endDate: tomorrow,
+      },
+      field: "endDate",
+    },
+    {
+      name: "more office seats than the office has",
+      selection: {
+        family: "office",
+        date: tomorrow,
+        seats: officeSeatCapacity + 1,
+      },
+      field: "seats",
+    },
+  ] satisfies ReadonlyArray<{
+    readonly name: string;
+    readonly selection: BookingSelectionInput;
+    readonly field: string;
+  }>;
+
+  for (const { name, selection, field } of invalidFields) {
+    test(`rejects ${name} as an invalid ${field}`, async () => {
+      expect(await rejectQuote(selection)).toEqual({
+        kind: "invalid-field",
+        field,
+      });
+    });
+  }
+
+  test("rejects a cowork date past the booking horizon with the open range", async () => {
+    expect(
+      await rejectQuote({
+        family: "cowork",
+        date: plainDateStringSchema.make("2100-01-31"),
+        tier: "open-space",
+      })
+    ).toEqual({ kind: "date-out-of-range", earliest: today, latest });
+  });
+
+  test("rejects an office start in the past with the office horizon", async () => {
+    const rejection = await rejectQuote({
+      family: "office",
+      date: plainDateStringSchema.make("2099-07-29"),
+    });
+
+    expect(rejection).toMatchObject({
+      kind: "date-out-of-range",
+      earliest: today,
+    });
+  });
+
+  test("rejects an office selection while office reservations are closed", async () => {
+    expect(
+      await rejectQuote(
+        { family: "office", date: tomorrow },
+        makeServices({ officeOpen: false })
+      )
+    ).toEqual({ kind: "office-closed" });
+  });
+
+  test("keeps a failed office capacity lookup apart from a rejected selection", async () => {
+    const failure = await rejectQuote(
+      { family: "office", date: tomorrow },
+      makeServices({ tables: [] })
+    );
+
+    expect(failure).toMatchObject({ _tag: "OfficeTableUnconfigured" });
+  });
+});
+
+type MeetingRoomArguments = {
+  readonly date: string;
+  readonly startTime?: string;
+  readonly duration?: MeetingRoomReservationDurationKey;
+};
+
+const resolveSelection = (selection: MeetingRoomArguments, at = now) =>
+  Effect.runPromise(resolveMeetingRoomSelection({ ...selection, now: at }));
+
+const rejectSelection = (selection: MeetingRoomArguments) =>
+  Effect.runPromise(
+    resolveMeetingRoomSelection({ ...selection, now }).pipe(
+      Effect.flip,
+      Effect.map((error) => error.reason)
+    )
+  );
+
+/** The form values the reservation page shows for the selection's link. */
+const openReservationLink = (
+  selection: {
+    readonly durationKey: MeetingRoomReservationDurationKey;
+    readonly startDateTime: string;
+  },
+  at = now
+) =>
+  Effect.runPromise(
+    getShareableReservationUrl({
+      kind: "meeting-room",
+      duration: selection.durationKey,
+      startDateTime: selection.startDateTime,
+    })
+  ).then((url) =>
+    meetingRoomSelectionLink.read(new URL(url).searchParams, {
+      locale: "cs-CZ",
+      now: at,
+    })
+  );
+
+describe("resolveMeetingRoomSelection", () => {
+  const accepted = [
+    {
+      name: "a one-hour booking at the next whole hour",
+      selection: { date: today, startTime: "16:00", duration: "hour:1" },
+      startDateTime: `${today}T16:00`,
+    },
+    {
+      name: "a four-hour booking at the next whole hour",
+      selection: { date: today, startTime: "16:00", duration: "hour:4" },
+      startDateTime: `${today}T16:00`,
+    },
+    {
+      name: "a four-hour booking that began at 14:00",
+      selection: { date: today, startTime: "14:00", duration: "hour:4" },
+      startDateTime: `${today}T14:00`,
+    },
+    {
+      name: "a four-hour booking that began at 12:00",
+      selection: { date: today, startTime: "12:00", duration: "hour:4" },
+      startDateTime: `${today}T12:00`,
+    },
+    {
+      name: "a one-hour booking that began at 15:00",
+      selection: { date: today, startTime: "15:00", duration: "hour:1" },
+      startDateTime: `${today}T15:00`,
+    },
+    {
+      name: "a future hourly booking",
+      selection: { date: "2099-08-12", startTime: "09:00", duration: "hour:1" },
+      startDateTime: "2099-08-12T09:00",
+    },
+    {
+      name: "a future whole day",
+      selection: { date: "2099-08-12", duration: "day:1" },
+      startDateTime: "2099-08-12T00:00",
+    },
+    {
+      name: "today's whole day",
+      selection: { date: today, duration: "day:1" },
+      startDateTime: `${today}T00:00`,
+    },
+    {
+      name: "a whole day named with a start time",
+      selection: { date: today, startTime: "09:00", duration: "day:1" },
+      startDateTime: `${today}T00:00`,
+    },
+  ] as const;
+
+  for (const { name, selection, startDateTime } of accepted) {
+    test(`links ${name} to the same form selection`, async () => {
+      const resolved = await resolveSelection(selection);
+
+      expect(resolved).toMatchObject({
+        durationKey: selection.duration,
+        startDateTime,
+      });
+      expect(await openReservationLink(resolved)).toMatchObject({
+        duration: selection.duration,
+        startDateTime,
+      });
+    });
+  }
+
+  test("links today's whole day to the same form selection just before it ends", async () => {
+    const lastMinute = pragueInstant("2099-07-30T23:59");
+    const resolved = await resolveSelection(
+      { date: today, duration: "day:1" },
+      lastMinute
+    );
+
+    expect(await openReservationLink(resolved, lastMinute)).toMatchObject({
+      duration: "day:1",
+      startDateTime: `${today}T00:00`,
+    });
+  });
+
+  test("links a start exactly at now to the same form selection", async () => {
+    const atStart = pragueInstant("2099-07-30T16:00");
+    const resolved = await resolveSelection(
+      { date: today, startTime: "16:00", duration: "hour:1" },
+      atStart
+    );
+
+    expect(await openReservationLink(resolved, atStart)).toMatchObject({
+      duration: "hour:1",
+      startDateTime: `${today}T16:00`,
+    });
+  });
+
+  const ended = [
+    {
+      name: "a four-hour booking that ended at 15:00",
+      selection: { date: today, startTime: "11:00", duration: "hour:4" },
+      earliest: today,
+    },
+    {
+      name: "a one-hour booking that ended at 15:00",
+      selection: { date: today, startTime: "14:00", duration: "hour:1" },
+      earliest: today,
+    },
+    {
+      name: "yesterday's whole day",
+      selection: { date: "2099-07-29", duration: "day:1" },
+      earliest: today,
+    },
+  ] as const;
+
+  for (const { name, selection, earliest } of ended) {
+    test(`rejects ${name}`, async () => {
+      expect(await rejectSelection(selection)).toEqual({
+        kind: "date-out-of-range",
+        earliest,
+        latest,
+      });
+    });
+  }
+
+  test("rejects a start past the booking horizon", async () => {
+    expect(
+      await rejectSelection({
+        date: "2100-01-31",
+        startTime: "09:00",
+        duration: "hour:1",
+      })
+    ).toEqual({ kind: "date-out-of-range", earliest: today, latest });
+  });
+
+  test("rejects a missing duration", async () => {
+    expect(await rejectSelection({ date: today, startTime: "16:00" })).toEqual({
+      kind: "invalid-field",
+      field: "duration",
+    });
+  });
+
+  test("rejects an hourly booking without a whole-hour start", async () => {
+    for (const startTime of [undefined, "16:30"]) {
+      expect(
+        await rejectSelection({
+          date: today,
+          duration: "hour:1",
+          ...(startTime !== undefined && { startTime }),
+        })
+      ).toEqual({ kind: "invalid-field", field: "startTime" });
+    }
+  });
+
+  test("rejects an ambiguous start on the autumn DST change", async () => {
+    // Prague falls back from 03:00 to 02:00 on the last Sunday of October.
+    const octoberLastDay = Temporal.PlainDate.from("2099-10-31");
+    const fallBack = octoberLastDay.subtract({
+      days: octoberLastDay.dayOfWeek % 7,
+    });
+
+    expect(
+      await rejectSelection({
+        date: fallBack.toString(),
+        startTime: "02:00",
+        duration: "hour:1",
+      })
+    ).toEqual({ kind: "invalid-field", field: "startTime" });
+  });
+});
+
+describe("getRebookingSelection", () => {
+  test("books again exactly the selection a quote resolved", async () => {
+    const selections: readonly BookingSelectionInput[] = [
+      { family: "cowork", date: tomorrow, tier: "open-space", coffee: true },
+      { family: "cowork", date: tomorrow, tier: "open-space", coffee: false },
+      // Coffee comes with a Reserved Desk, so booking it again names none.
+      {
+        family: "cowork",
+        date: tomorrow,
+        tier: "reserved-desk",
+        monitorOption: "2x27-qhd",
+      },
+      {
+        family: "meeting-room",
+        date: today,
+        startTime: "16:00",
+        duration: "hour:4",
+      },
+      // A whole day starts at midnight, so it names no start time.
+      { family: "meeting-room", date: tomorrow, duration: "day:1" },
+      {
+        family: "office",
+        date: tomorrow,
+        endDate: plainDateStringSchema.make("2099-08-02"),
+        seats: 3,
+      },
+      { family: "office", date: tomorrow, seats: 1 },
+    ];
+
+    for (const selection of selections) {
+      const { reservationSelection } = await quote(selection);
+      expect(getRebookingSelection(reservationSelection)).toEqual({
+        selection,
+      });
+    }
+  });
+
+  test("keeps a meeting room's early setup beside its selection", () => {
+    expect(
+      getRebookingSelection({
+        kind: "meeting-room",
+        startDateTime: `${tomorrow}T09:00`,
+        duration: "hour:1",
+        earlySetup: true,
+      })
+    ).toEqual({
+      selection: {
+        family: "meeting-room",
+        date: tomorrow,
+        startTime: "09:00",
+        duration: "hour:1",
+      },
+      earlySetup: true,
+    });
+  });
+
+  test("names no monitor setup for a desk booked without one", () => {
+    expect(
+      getRebookingSelection({
+        kind: "cowork",
+        entryTier: "reserved-desk",
+        date: tomorrow,
+        coffee: true,
+        // The form's value for "no monitor".
+        monitorOption: "",
+      })
+    ).toEqual({
+      selection: { family: "cowork", date: tomorrow, tier: "reserved-desk" },
+    });
+  });
+
+  test("books nothing for a link that leaves a needed field open", () => {
+    expect(
+      getRebookingSelection({ kind: "cowork", entryTier: "open-space" })
+    ).toBeUndefined();
+    expect(
+      getRebookingSelection({
+        kind: "meeting-room",
+        startDateTime: `${tomorrow}T09:00`,
+      })
+    ).toBeUndefined();
+    expect(
+      getRebookingSelection({ kind: "office", startsOn: tomorrow })
+    ).toBeUndefined();
+  });
+});

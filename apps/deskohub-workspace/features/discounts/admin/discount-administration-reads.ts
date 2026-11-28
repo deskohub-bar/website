@@ -1,0 +1,703 @@
+import { type DotyposCustomer, DotyposService } from "@deskohub/dotypos";
+import { GoogleCalendarService } from "@deskohub/google-calendar";
+import { DateTime, Effect, Option } from "effect";
+import {
+  WorkspaceDatabase,
+  workspaceStatementConcurrency,
+} from "@/db/database.service";
+import type {
+  DiscountCode,
+  DiscountCodeClaimState,
+  DiscountCodeRedemption,
+  DiscountProductTarget,
+  PromotionCode,
+  StoredDiscount,
+  Voucher,
+  VoucherRedemption,
+} from "@/db/schema";
+import { AdministrationCustomerDirectory } from "@/features/administration/customer-directory.service";
+import { describeAdministrationCustomer } from "@/features/administration/customer-identity";
+import { degradeProviderRead } from "@/features/administration/provider-read-policy";
+import { listDiscountGroups } from "@/features/discounts/discount-groups";
+import type { DotyposCustomerId } from "@/features/reservation/dotypos-customer";
+import type { WorkspaceReservationId } from "@/features/reservation/persistence-contracts";
+import {
+  CalendarResourceConfig,
+  type SalesCalendarId,
+} from "@/shared/backend/config/calendar-resource.config";
+import { workspaceSiteConstants } from "@/shared/utils";
+import {
+  decodeStoredDiscountAdjustment,
+  type StoredDiscountAdjustment,
+} from "../discount-definition";
+import type { DiscountCodeId, VoucherId } from "../persistence-contracts";
+import { getAvailableVoucherCredit } from "../promotion-availability";
+import { toAdminCalendarSale } from "./admin-calendar-sale";
+import { toAdminDiscountGroup } from "./admin-discount-group";
+import type {
+  AdminDiscount,
+  AdminDiscountCode,
+  AdminDiscountCodeClaim,
+  AdminDotyposCustomer,
+  AdminVoucher,
+  AdminVoucherClaim,
+} from "./discount-administration.service";
+import { DiscountAdminNotFoundError } from "./discount-administration-errors";
+
+/**
+ * The read side of `DiscountAdministration`: page loads and the Dotypos and
+ * Google Calendar lookups behind them. Detail pages read audience customers
+ * from Dotypos side by side, which no file that opens transactions may state,
+ * so the reads live apart from the service's mutation transactions. Every read
+ * here runs outside a transaction.
+ */
+export const makeDiscountAdministrationReads = Effect.gen(function* () {
+  const { db } = yield* WorkspaceDatabase;
+  const calendar = yield* GoogleCalendarService;
+  const dotypos = yield* DotyposService;
+  const customerDirectory = yield* AdministrationCustomerDirectory;
+  const { salesCalendarId } = yield* CalendarResourceConfig;
+
+  const loadActiveCustomer = Effect.fn(
+    "DiscountAdministration.loadActiveCustomer"
+  )((customerId: DotyposCustomerId) =>
+    customerDirectory.find(customerId).pipe(
+      Effect.flatMap(
+        Option.match({
+          onNone: () =>
+            Effect.fail(
+              new DiscountAdminNotFoundError({
+                resource: { kind: "Dotypos customer", id: customerId },
+                message: "The Dotypos customer does not exist or is deleted.",
+              })
+            ),
+          onSome: Effect.succeed,
+        })
+      )
+    )
+  );
+
+  const loadDiscounts = Effect.fn("DiscountAdministration.loadDiscounts")(() =>
+    db.query.discounts
+      .findMany({
+        with: {
+          codes: {},
+          productTargets: {},
+        },
+      })
+      .pipe(
+        Effect.flatMap((rows) => Effect.forEach(rows, toAdminDiscount)),
+        Effect.map((discounts) =>
+          discounts.toSorted((left, right) =>
+            (left.labels["en-US"] ?? "").localeCompare(
+              right.labels["en-US"] ?? ""
+            )
+          )
+        )
+      )
+  );
+
+  const loadCodes = Effect.fn("DiscountAdministration.loadCodes")(() =>
+    db.query.discountCodes
+      .findMany({
+        with: {
+          promotion: { with: { customers: {} } },
+          redemptions: { with: { application: {} } },
+        },
+      })
+      .pipe(
+        Effect.map((rows) =>
+          rows
+            .map(toAdminDiscountCode)
+            .toSorted((left, right) => left.code.localeCompare(right.code))
+        )
+      )
+  );
+
+  const loadVouchers = Effect.fn("DiscountAdministration.loadVouchers")(() =>
+    db.query.vouchers
+      .findMany({
+        with: {
+          promotion: { with: { customers: {} } },
+          redemptions: { with: { application: {} } },
+        },
+      })
+      .pipe(
+        Effect.map((rows) =>
+          rows
+            .map(toAdminVoucher)
+            .toSorted((left, right) => left.code.localeCompare(right.code))
+        )
+      )
+  );
+
+  const loadCodesPage = Effect.fn("DiscountAdministration.loadCodesPage")(() =>
+    Effect.all(
+      {
+        codes: loadCodes(),
+        discounts: loadDiscounts(),
+      },
+      { concurrency: 2 }
+    )
+  );
+
+  const loadVouchersPage = Effect.fn("DiscountAdministration.loadVouchersPage")(
+    () => loadVouchers().pipe(Effect.map((vouchers) => ({ vouchers })))
+  );
+
+  const loadSalesPage = Effect.fn("DiscountAdministration.loadSalesPage")(() =>
+    loadDiscounts().pipe(
+      Effect.flatMap((discounts) =>
+        loadCalendarDashboard({
+          calendar,
+          discounts,
+          salesCalendarId,
+        }).pipe(Effect.map((calendar) => ({ calendar, discounts })))
+      )
+    )
+  );
+
+  const loadDashboard = Effect.fn("DiscountAdministration.loadDashboard")(() =>
+    Effect.all({
+      codesPage: loadCodesPage(),
+      vouchers: loadVouchers(),
+    }).pipe(
+      Effect.map(({ codesPage, vouchers }) => ({
+        ...codesPage,
+        vouchers,
+      })),
+      Effect.bind("calendar", ({ discounts }) =>
+        loadCalendarDashboard({
+          calendar,
+          discounts,
+          salesCalendarId,
+        })
+      ),
+      Effect.map(({ calendar, codes, discounts, vouchers }) => ({
+        calendar,
+        codes,
+        discounts,
+        vouchers,
+      }))
+    )
+  );
+
+  /**
+   * A promotion audience's customers in audience order. Deleted customers are
+   * still shown; a missing customer, or one Dotypos fails to return, is `null`.
+   */
+  const loadAudienceCustomers = (
+    audience: readonly { readonly dotyposCustomerId: DotyposCustomerId }[]
+  ) =>
+    Effect.all({
+      customersById: customerDirectory.findMany(
+        audience.map(({ dotyposCustomerId }) => dotyposCustomerId),
+        degradeProviderRead
+      ),
+      now: DateTime.nowAsDate,
+    }).pipe(
+      Effect.map(({ customersById, now }) =>
+        audience.map(({ dotyposCustomerId }) => {
+          const customer = customersById.get(dotyposCustomerId);
+          return {
+            customerId: dotyposCustomerId,
+            customer: customer ? toAdminDotyposCustomer(customer, now) : null,
+          };
+        })
+      )
+    );
+
+  const loadCodeDetail = Effect.fn("DiscountAdministration.loadCodeDetail")(
+    (input: { readonly codeId: DiscountCodeId }) =>
+      db.query.discountCodes
+        .findFirst({
+          where: { id: { eq: input.codeId } },
+          with: {
+            promotion: { with: { customers: {} } },
+            discount: {},
+            redemptions: {
+              with: {
+                application: {},
+              },
+            },
+          },
+        })
+        .pipe(
+          Effect.flatMap((row) =>
+            row
+              ? Effect.succeed(row)
+              : Effect.fail(
+                  new DiscountAdminNotFoundError({
+                    resource: {
+                      kind: "discount code",
+                      id: input.codeId,
+                    },
+                    message: "The discount code no longer exists.",
+                  })
+                )
+          ),
+          Effect.bindTo("row"),
+          Effect.bind("customers", ({ row }) =>
+            loadAudienceCustomers(row.promotion.customers)
+          ),
+          Effect.map(({ customers, row }) => ({
+            code: toAdminDiscountCode(row),
+            discountLabel: row.discount.labels["en-US"],
+            discountLabels: row.discount.labels,
+            customers,
+            claims: row.redemptions
+              .map(toAdminDiscountCodeClaim)
+              .toSorted((left, right) =>
+                Temporal.Instant.compare(right.reservedAt, left.reservedAt)
+              ),
+          }))
+        )
+  );
+
+  const loadVoucherDetail = Effect.fn(
+    "DiscountAdministration.loadVoucherDetail"
+  )((input: { readonly voucherId: VoucherId }) =>
+    db.query.vouchers
+      .findFirst({
+        where: { id: { eq: input.voucherId } },
+        with: {
+          promotion: { with: { customers: {} } },
+          redemptions: { with: { application: {} } },
+        },
+      })
+      .pipe(
+        Effect.flatMap((row) =>
+          row
+            ? Effect.succeed(row)
+            : Effect.fail(
+                new DiscountAdminNotFoundError({
+                  resource: { kind: "voucher", id: input.voucherId },
+                  message: "The voucher no longer exists.",
+                })
+              )
+        ),
+        Effect.bindTo("row"),
+        Effect.bind("customers", ({ row }) =>
+          loadAudienceCustomers(row.promotion.customers)
+        ),
+        Effect.map(({ customers, row }) => ({
+          voucher: toAdminVoucher(row),
+          customers,
+          claims: row.redemptions
+            .map(toAdminVoucherClaim)
+            .toSorted((left, right) =>
+              Temporal.Instant.compare(right.reservedAt, left.reservedAt)
+            ),
+        }))
+      )
+  );
+
+  const loadCustomerDiscountSections = Effect.fn(
+    "DiscountAdministration.loadCustomerDiscountSections"
+  )((input: { readonly customerId: DotyposCustomerId }) =>
+    Effect.all({
+      discountGroups: dotypos.getDiscountGroups(),
+      codeRows: db.query.discountCodes.findMany({
+        with: {
+          promotion: { with: { customers: {} } },
+          discount: {},
+          redemptions: {
+            with: {
+              application: {},
+            },
+          },
+        },
+      }),
+      voucherRows: db.query.vouchers.findMany({
+        with: {
+          promotion: { with: { customers: {} } },
+          redemptions: { with: { application: {} } },
+        },
+      }),
+    }).pipe(
+      Effect.bind("codes", ({ codeRows }) =>
+        Effect.forEach(codeRows, (row) =>
+          toDiscountAdjustment(row.discount).pipe(
+            Effect.map((discountAdjustment) => ({
+              ...toAdminDiscountCode(row),
+              discountAdjustment,
+              discountLabel: row.discount.labels["en-US"],
+              discountLabels: row.discount.labels,
+              eligible: row.promotion.customers.some(
+                ({ dotyposCustomerId }) =>
+                  dotyposCustomerId === input.customerId
+              ),
+            }))
+          )
+        )
+      ),
+      Effect.map(({ codeRows, codes, discountGroups, voucherRows }) => ({
+        discountGroups: discountGroups
+          .flatMap(toAdminDiscountGroup)
+          .toSorted((left, right) => left.name.localeCompare(right.name)),
+        codes: codes.toSorted((left, right) =>
+          left.code.localeCompare(right.code)
+        ),
+        claims: codeRows
+          .flatMap((row) =>
+            row.redemptions
+              .filter(
+                ({ dotyposCustomerId }) =>
+                  dotyposCustomerId === input.customerId
+              )
+              .map(toAdminDiscountCodeClaim)
+          )
+          .toSorted((left, right) =>
+            Temporal.Instant.compare(right.reservedAt, left.reservedAt)
+          ),
+        vouchers: voucherRows
+          .map((row) => ({
+            ...toAdminVoucher(row),
+            eligible: row.promotion.customers.some(
+              ({ dotyposCustomerId }) => dotyposCustomerId === input.customerId
+            ),
+          }))
+          .toSorted((left, right) => left.code.localeCompare(right.code)),
+        voucherClaims: voucherRows
+          .flatMap((row) =>
+            row.redemptions
+              .filter(
+                ({ dotyposCustomerId }) =>
+                  dotyposCustomerId === input.customerId
+              )
+              .map(toAdminVoucherClaim)
+          )
+          .toSorted((left, right) =>
+            Temporal.Instant.compare(right.reservedAt, left.reservedAt)
+          ),
+      }))
+    )
+  );
+
+  const loadCustomerProfile = Effect.fn(
+    "DiscountAdministration.loadCustomerProfile"
+  )((input: { readonly customerId: DotyposCustomerId }) =>
+    Effect.all({
+      customer: loadActiveCustomer(input.customerId),
+      sections: loadCustomerDiscountSections(input),
+      now: DateTime.nowAsDate,
+    }).pipe(
+      Effect.map(({ customer, sections, now }) => ({
+        customer: toAdminDotyposCustomer(customer, now),
+        ...sections,
+      }))
+    )
+  );
+
+  const loadCustomerCodeCreation = Effect.fn(
+    "DiscountAdministration.loadCustomerCodeCreation"
+  )((input: { readonly customerId: DotyposCustomerId }) =>
+    Effect.flatMap(workspaceStatementConcurrency, (concurrency) =>
+      Effect.all(
+        {
+          customer: loadActiveCustomer(input.customerId),
+          discounts: loadDiscounts(),
+          now: DateTime.nowAsDate,
+        },
+        { concurrency }
+      )
+    ).pipe(
+      Effect.map(({ customer, discounts, now }) => ({
+        customer: toAdminDotyposCustomer(customer, now),
+        discounts: discounts.map(({ id, labels }) => ({ id, labels })),
+      }))
+    )
+  );
+
+  const loadCustomerVoucherCreation = Effect.fn(
+    "DiscountAdministration.loadCustomerVoucherCreation"
+  )((input: { readonly customerId: DotyposCustomerId }) =>
+    Effect.all({
+      customer: loadActiveCustomer(input.customerId),
+      now: DateTime.nowAsDate,
+    }).pipe(
+      Effect.map(({ customer, now }) => ({
+        customer: toAdminDotyposCustomer(customer, now),
+      }))
+    )
+  );
+
+  return {
+    loadActiveCustomer,
+    listDiscountGroups: Effect.fn("DiscountAdministration.listDiscountGroups")(
+      () =>
+        listDiscountGroups.pipe(Effect.provideService(DotyposService, dotypos))
+    ),
+    loadCodeDetail,
+    loadCodesPage,
+    loadCustomerCodeCreation,
+    loadCustomerDiscountSections,
+    loadCustomerProfile,
+    loadCustomerVoucherCreation,
+    loadDashboard,
+    loadSalesPage,
+    loadVoucherDetail,
+    loadVouchersPage,
+  };
+});
+
+type AdminDiscountRow = StoredDiscount & {
+  readonly productTargets: readonly DiscountProductTarget[];
+  readonly codes: readonly DiscountCode[];
+};
+
+type AdminDiscountCodeRow = DiscountCode & {
+  readonly promotion: PromotionCode & {
+    readonly customers: readonly {
+      readonly dotyposCustomerId: DotyposCustomerId;
+    }[];
+  };
+  readonly redemptions: readonly (DiscountCodeRedemption & {
+    readonly application: {
+      readonly appliedAmountValue: number;
+      readonly appliedAmountExponent: number;
+      readonly appliedAmountCurrency: string;
+    };
+  })[];
+};
+
+const toAdminDiscountCode = (row: AdminDiscountCodeRow): AdminDiscountCode => {
+  const usage = getAdminDiscountCodeUsage({
+    maxUses: row.maxUses,
+    states: row.redemptions.map(({ state }) => state),
+  });
+  return {
+    id: row.id,
+    discountId: row.discountId,
+    code: String(row.promotion.code),
+    enabled: row.promotion.enabled,
+    validFrom: row.promotion.validFrom,
+    validUntil: row.promotion.validUntil,
+    maxUses: row.maxUses,
+    maxUsesPerCustomer: row.maxUsesPerCustomer,
+    serviceDateFrom: row.serviceDateFrom,
+    serviceDateUntil: row.serviceDateUntil,
+    audienceSize: row.promotion.customers.length,
+    audienceCustomerIds: row.promotion.customers.map(
+      ({ dotyposCustomerId }) => dotyposCustomerId
+    ),
+    ...usage,
+    createdAt: row.promotion.createdAt,
+    updatedAt: row.promotion.updatedAt,
+  };
+};
+
+type AdminVoucherRow = Voucher & {
+  readonly promotion: PromotionCode & {
+    readonly customers: readonly {
+      readonly dotyposCustomerId: DotyposCustomerId;
+    }[];
+  };
+  readonly redemptions: readonly (VoucherRedemption & {
+    readonly application: {
+      readonly appliedAmountValue: number;
+      readonly appliedAmountExponent: number;
+      readonly appliedAmountCurrency: string;
+    };
+  })[];
+};
+
+const toAdminVoucher = (row: AdminVoucherRow): AdminVoucher => {
+  const issuedCredit = {
+    value: row.issuedAmountValue,
+    exponent: row.issuedAmountExponent,
+    currency: row.issuedAmountCurrency,
+  };
+  const usedValue = row.redemptions
+    .filter(({ state }) => state === "reserved" || state === "redeemed")
+    .reduce((total, claim) => total + claim.application.appliedAmountValue, 0);
+  const usage = getAdminDiscountCodeUsage({
+    maxUses: null,
+    states: row.redemptions.map(({ state }) => state),
+  });
+  return {
+    id: row.id,
+    code: String(row.promotion.code),
+    enabled: row.promotion.enabled,
+    validFrom: row.promotion.validFrom,
+    validUntil: row.promotion.validUntil,
+    issuedCredit,
+    remainingCredit: {
+      ...issuedCredit,
+      value: Math.max(
+        0,
+        getAvailableVoucherCredit(issuedCredit, usedValue).value
+      ),
+    },
+    audienceSize: row.promotion.customers.length,
+    audienceCustomerIds: row.promotion.customers.map(
+      ({ dotyposCustomerId }) => dotyposCustomerId
+    ),
+    reservedUses: usage.reservedUses,
+    redeemedUses: usage.redeemedUses,
+    releasedUses: usage.releasedUses,
+    createdAt: row.promotion.createdAt,
+    updatedAt: row.promotion.updatedAt,
+  };
+};
+
+export const getAdminDiscountCodeUsage = (input: {
+  readonly maxUses: number | null;
+  readonly states: readonly DiscountCodeClaimState[];
+}) => {
+  const reservedUses = input.states.filter(
+    (state) => state === "reserved"
+  ).length;
+  const redeemedUses = input.states.filter(
+    (state) => state === "redeemed"
+  ).length;
+  const releasedUses = input.states.filter(
+    (state) => state === "released"
+  ).length;
+
+  return {
+    reservedUses,
+    redeemedUses,
+    releasedUses,
+    remainingUses:
+      input.maxUses === null
+        ? null
+        : Math.max(0, input.maxUses - reservedUses - redeemedUses),
+  };
+};
+
+/** A Dotypos customer as discount administration shows it, named at `now`, the time it was read. */
+export const toAdminDotyposCustomer = (
+  customer: DotyposCustomer,
+  now: Date
+): AdminDotyposCustomer => ({
+  ...describeAdministrationCustomer(customer, now),
+  discountGroupId: customer._discountGroupId ?? null,
+});
+
+const toAdminDiscountCodeClaim = (
+  row: DiscountCodeRedemption & {
+    readonly application: {
+      readonly workspaceReservationId: WorkspaceReservationId | null;
+      readonly appliedAmountValue: number;
+      readonly appliedAmountExponent: number;
+      readonly appliedAmountCurrency: string;
+    };
+  }
+): AdminDiscountCodeClaim => ({
+  id: row.id,
+  codeId: row.codeId,
+  dotyposCustomerId: row.dotyposCustomerId,
+  state: row.state,
+  paymentAttemptId: row.paymentAttemptId,
+  workspaceReservationId: row.application.workspaceReservationId,
+  appliedAmount: {
+    value: row.application.appliedAmountValue,
+    exponent: row.application.appliedAmountExponent,
+    currency: row.application.appliedAmountCurrency,
+  },
+  reservationExpiresAt: row.reservationExpiresAt,
+  reservedAt: row.reservedAt,
+  redeemedAt: row.redeemedAt,
+  releasedAt: row.releasedAt,
+  releaseReason: row.releaseReason,
+});
+
+const toAdminVoucherClaim = (
+  row: VoucherRedemption & {
+    readonly application: {
+      readonly workspaceReservationId: WorkspaceReservationId | null;
+      readonly appliedAmountValue: number;
+      readonly appliedAmountExponent: number;
+      readonly appliedAmountCurrency: string;
+    };
+  }
+): AdminVoucherClaim => ({
+  id: row.id,
+  voucherId: row.voucherId,
+  dotyposCustomerId: row.dotyposCustomerId,
+  state: row.state,
+  paymentAttemptId: row.paymentAttemptId,
+  workspaceReservationId: row.application.workspaceReservationId,
+  appliedAmount: {
+    value: row.application.appliedAmountValue,
+    exponent: row.application.appliedAmountExponent,
+    currency: row.application.appliedAmountCurrency,
+  },
+  reservationExpiresAt: row.reservationExpiresAt,
+  reservedAt: row.reservedAt,
+  redeemedAt: row.redeemedAt,
+  releasedAt: row.releasedAt,
+  releaseReason: row.releaseReason,
+});
+
+/**
+ * A listed discount's adjustment. Stored rows hold exactly one adjustment, so
+ * a row that does not decode is a defect.
+ */
+const toDiscountAdjustment = (row: StoredDiscountAdjustment) =>
+  decodeStoredDiscountAdjustment({ row }).pipe(Effect.orDie);
+
+const toAdminDiscount = (row: AdminDiscountRow) =>
+  toDiscountAdjustment(row).pipe(
+    Effect.map(
+      (adjustment): AdminDiscount => ({
+        id: row.id,
+        labels: row.labels,
+        adjustment,
+        products: row.productTargets.map(({ productTarget }) => productTarget),
+        codeCount: row.codes.length,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      })
+    )
+  );
+
+const loadCalendarDashboard = (input: {
+  readonly calendar: GoogleCalendarService["Service"];
+  readonly discounts: readonly AdminDiscount[];
+  readonly salesCalendarId: SalesCalendarId;
+}) => {
+  const today = Temporal.Now.plainDateISO(
+    workspaceSiteConstants.location.timeZone
+  );
+  const from = today.subtract({ days: 30 }).toString();
+  const to = today.add({ years: 1 }).toString();
+  const calendarUrl = `https://calendar.google.com/calendar/u/0/r?cid=${encodeURIComponent(input.salesCalendarId)}`;
+
+  return input.calendar
+    .listEvents({
+      calendarId: input.salesCalendarId,
+      from,
+      to,
+    })
+    .pipe(
+      Effect.map((events) => ({
+        events: events
+          .map((event) =>
+            toAdminCalendarSale({
+              calendarUrl,
+              discounts: input.discounts,
+              event,
+            })
+          )
+          .toSorted((left, right) => left.start.localeCompare(right.start)),
+        unavailable: false,
+        calendarUrl,
+        from,
+        to,
+      })),
+      Effect.tapError((cause) =>
+        Effect.logError("Discount administration Calendar load failed", {
+          cause,
+        })
+      ),
+      Effect.orElseSucceed(() => ({
+        events: [],
+        unavailable: true,
+        calendarUrl,
+        from,
+        to,
+      }))
+    );
+};

@@ -1,0 +1,186 @@
+import { Schema } from "effect";
+import { HttpApiSchema } from "effect/http-api";
+
+/** A Prague calendar date, YYYY-MM-DD. */
+export const CustomerPlainDate = Schema.String.check(
+  Schema.isPattern(/^\d{4}-\d{2}-\d{2}$/)
+).annotate({
+  identifier: "CustomerPlainDate",
+  description: "Prague calendar date in YYYY-MM-DD format.",
+});
+
+export const CustomerReservationFamily = Schema.Literals([
+  "cowork",
+  "meeting-room",
+  "office",
+]).annotate({ identifier: "CustomerReservationFamily" });
+export type CustomerReservationFamily = typeof CustomerReservationFamily.Type;
+
+/** The cowork tiers a customer can book now. */
+export const CustomerBookableCoworkTier = Schema.Literals([
+  "open-space",
+  "reserved-desk",
+]).annotate({ identifier: "CustomerBookableCoworkTier" });
+export type CustomerBookableCoworkTier = typeof CustomerBookableCoworkTier.Type;
+
+/**
+ * How long a Reserved Desk is held from its arrival date: a whole Prague
+ * calendar day, or overnight from the offering's overnight start time on the
+ * arrival date to its end time the next date.
+ */
+export const CustomerCoworkStay = Schema.Literals([
+  "day",
+  "overnight",
+]).annotate({
+  identifier: "CustomerCoworkStay",
+  description:
+    "day (the arrival date's Prague calendar day) or overnight (noon on the arrival date to noon the next date, Prague time). Reserved Desk only.",
+});
+export type CustomerCoworkStay = typeof CustomerCoworkStay.Type;
+
+export const CustomerMonitorOption = Schema.Literals([
+  "2x27-qhd",
+  "2x32-qhd",
+  "2x27-4k",
+  "2x32-4k",
+]).annotate({ identifier: "CustomerMonitorOption" });
+export type CustomerMonitorOption = typeof CustomerMonitorOption.Type;
+
+export const CustomerMeetingRoomDuration = Schema.Literals([
+  "hour:1",
+  "hour:4",
+  "day:1",
+]).annotate({
+  identifier: "CustomerMeetingRoomDuration",
+  description:
+    "hour:1 (one hour), hour:4 (four hours), or day:1 (a whole Prague calendar day).",
+});
+export type CustomerMeetingRoomDuration =
+  typeof CustomerMeetingRoomDuration.Type;
+
+/** A Prague time of day on the hour, HH:mm. */
+export const CustomerStartTime = Schema.String.check(
+  Schema.isPattern(/^\d{2}:\d{2}$/)
+).annotate({
+  identifier: "CustomerStartTime",
+  description: "Prague start time in HH:mm, such as 09:00.",
+});
+
+const officeSeats = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1));
+
+const passId = Schema.String.check(Schema.isUUID());
+
+/** The fields a selection's query string carries alike in every encoding. */
+const selectionFields = {
+  family: CustomerReservationFamily,
+  /** For an office, the first date. */
+  date: CustomerPlainDate,
+  /** Office only: the last date, inclusive. Defaults to `date`. */
+  endDate: Schema.optionalKey(CustomerPlainDate),
+  /** Meeting room only, except for the whole-day booking. */
+  startTime: Schema.optionalKey(CustomerStartTime),
+  /** Meeting room only. */
+  duration: Schema.optionalKey(CustomerMeetingRoomDuration),
+  /** Cowork only, required. */
+  tier: Schema.optionalKey(CustomerBookableCoworkTier),
+  /** Cowork Reserved Desk only: a monitor workstation configuration. */
+  monitorOption: Schema.optionalKey(CustomerMonitorOption),
+  /**
+   * Cowork Reserved Desk only: the stay, while its offering advertises an
+   * overnight stay. Defaults to a day stay; `date` is the arrival date.
+   */
+  stay: Schema.optionalKey(CustomerCoworkStay),
+};
+
+/**
+ * One complete, priceable booking: a cowork tier and date, a meeting-room
+ * start and duration, or office dates and seats. The server checks it the way
+ * the booking pages accept it.
+ */
+export const CustomerReservationSelection = Schema.Struct({
+  ...selectionFields,
+  /**
+   * Office only: the number of seats. Defaults to 1. A checkout that sends
+   * `people` sends their count here: one seat per person.
+   */
+  seats: Schema.optionalKey(officeSeats),
+  /** Cowork Open Space only: add coffee. Reserved Desk includes it. */
+  coffee: Schema.optionalKey(Schema.Boolean),
+}).annotate({ identifier: "CustomerReservationSelection" });
+
+/** The selection a customer submits, including an optional funding choice. */
+export const CustomerBookingSelection = Schema.Struct({
+  ...CustomerReservationSelection.fields,
+  /** Cowork only: book for the holder using one entry from this pack. */
+  funding: Schema.optionalKey(
+    Schema.Struct({ kind: Schema.Literal("entry"), passId })
+  ),
+}).annotate({ identifier: "CustomerBookingSelection" });
+export type CustomerBookingSelection = typeof CustomerBookingSelection.Type;
+
+/**
+ * Who is coming to an office or Team Table: the checkout's contact while
+ * `contactAttends`, and the people added by email address in `invitees`, in
+ * the order the booker added them. At least one person comes, the selected
+ * seats bound the count, and an address appears once and
+ * never as the contact's own. Each invitee gets their own access email once
+ * the order is paid.
+ */
+export const CustomerOfficePeople = Schema.Struct({
+  contactAttends: Schema.Boolean,
+  invitees: Schema.Array(Schema.String.check(Schema.isMaxLength(255))),
+}).annotate({ identifier: "CustomerOfficePeople" });
+export type CustomerOfficePeople = typeof CustomerOfficePeople.Type;
+
+/** `CustomerBookingSelection` as a GET request's query string carries it. */
+export const CustomerBookingSelectionQuery = Schema.Struct({
+  ...selectionFields,
+  seats: Schema.optionalKey(
+    Schema.FiniteFromString.pipe(Schema.decodeTo(officeSeats))
+  ),
+  coffee: Schema.optionalKey(Schema.Literals(["true", "false"])),
+  /** The holder's Entry pack to quote for this cowork selection. */
+  passId: Schema.optionalKey(passId),
+});
+
+// Errors
+
+/**
+ * The selection can't use the requested funding or hold the space it needs
+ * (`availability_changed`), or another submission of the same checkout
+ * holds it (`checkout_conflict`). Quote again and start a new checkout.
+ */
+export class CustomerSelectionUnavailable extends Schema.TaggedError<CustomerSelectionUnavailable>()(
+  "CustomerSelectionUnavailable",
+  { reason: Schema.Literals(["availability_changed", "checkout_conflict"]) }
+) {
+  static schema = this.pipe(HttpApiSchema.status("Conflict"));
+}
+
+/**
+ * The selection or query doesn't name a booking the product offers: a field
+ * a family needs is missing, or one it doesn't take is set. `field` names it
+ * when one does.
+ */
+export class CustomerBookingSelectionInvalid extends Schema.TaggedError<CustomerBookingSelectionInvalid>()(
+  "CustomerBookingSelectionInvalid",
+  { field: Schema.optionalKey(Schema.String) }
+) {
+  static schema = this.pipe(HttpApiSchema.status("BadRequest"));
+}
+
+/** The date is outside what can be booked now: from `earliest` to `latest`. */
+export class CustomerBookingDateOutOfRange extends Schema.TaggedError<CustomerBookingDateOutOfRange>()(
+  "CustomerBookingDateOutOfRange",
+  { earliest: CustomerPlainDate, latest: CustomerPlainDate }
+) {
+  static schema = this.pipe(HttpApiSchema.status("UnprocessableEntity"));
+}
+
+/** The family can't be booked now, such as while office reservations are closed. */
+export class CustomerOfferingUnavailable extends Schema.TaggedError<CustomerOfferingUnavailable>()(
+  "CustomerOfferingUnavailable",
+  { family: Schema.Literal("office") }
+) {
+  static schema = this.pipe(HttpApiSchema.status("NotFound"));
+}

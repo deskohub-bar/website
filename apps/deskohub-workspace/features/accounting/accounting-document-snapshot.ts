@@ -1,0 +1,304 @@
+export {
+  type AccountingSnapshotKeyId,
+  accountingSnapshotKeyIdSchema,
+} from "@deskohub/workspace-domain/features/accounting/accounting-document-snapshot";
+
+import {
+  type DotyposCustomerId,
+  DotyposCustomerIdSchema,
+  type DotyposReservationId,
+  DotyposReservationIdSchema,
+} from "@deskohub/dotypos";
+import { supportedLocales } from "@deskohub/i18n/locale-registry";
+import { Match, Schema } from "effect";
+import type { PreparedCustomerQuote } from "@/features/checkout/backend/checkout/checkout-pricing.service";
+import { coworkReservationQuoteSchema } from "@/features/checkout/reservation-quote-cowork";
+import { meetingRoomReservationQuoteSchema } from "@/features/checkout/reservation-quote-meeting-room";
+import { officeReservationQuoteSchema } from "@/features/checkout/reservation-quote-office";
+import { tableReservationQuoteSchema } from "@/features/checkout/reservation-quote-table";
+import { discountQuoteCodec } from "@/features/discounts/contracts";
+import type { Locale } from "@/features/i18n";
+import { orderIdSchema } from "@/features/order";
+import {
+  entryPackProductSchema,
+  unlimitedPassProductSchema,
+} from "@/features/passes/pass-offer";
+import { getMeetingRoomReservationDate } from "@/features/reservation/meeting-room-reservation-time";
+import { officeReservationDetailsSchema } from "@/features/reservation/office-reservation";
+import {
+  type WorkspaceReservationId,
+  workspaceReservationIdSchema,
+} from "@/features/reservation/persistence-contracts";
+import {
+  defaultReservationBillingSelection,
+  getReservationInvoiceBuyer,
+  reservationBillingSelectionSchema,
+} from "@/features/reservation/reservation-billing";
+import { getWorkspaceDate } from "@/features/reservation/reservation-date";
+import {
+  getTableReservationDetails,
+  tableReservationDetailsSchema,
+} from "@/features/reservation/table-reservation";
+import {
+  vatStatuses,
+  workspaceSiteConstants,
+} from "@/shared/utils/site-constants";
+import {
+  instantStringSchema,
+  plainDateStringSchema,
+} from "@/shared/utils/temporal";
+import {
+  companyRegistrationIdSchema,
+  vatRegistrationIdSchema,
+} from "./billing-identity";
+
+export {
+  companyRegistrationIdSchema,
+  vatRegistrationIdSchema,
+} from "./billing-identity";
+
+const accountingBuyerAddressSchema = Schema.Struct({
+  line1: Schema.optionalKey(Schema.NonEmptyString),
+  line2: Schema.optionalKey(Schema.NonEmptyString),
+  city: Schema.optionalKey(Schema.NonEmptyString),
+  postalCode: Schema.optionalKey(Schema.NonEmptyString),
+  country: Schema.optionalKey(Schema.NonEmptyString),
+});
+
+const personalAccountingBuyerSchema = Schema.Struct({
+  kind: Schema.Literal("person"),
+  legalName: Schema.NonEmptyString,
+  address: Schema.optionalKey(accountingBuyerAddressSchema),
+});
+
+const businessAccountingBuyerSchema = Schema.Struct({
+  kind: Schema.Literal("business"),
+  legalName: Schema.NonEmptyString,
+  companyId: companyRegistrationIdSchema,
+  vatId: Schema.optionalKey(vatRegistrationIdSchema),
+  address: Schema.Struct({
+    line1: Schema.NonEmptyString,
+    line2: Schema.optionalKey(Schema.NonEmptyString),
+    city: Schema.NonEmptyString,
+    postalCode: Schema.NonEmptyString,
+    country: Schema.NonEmptyString,
+  }),
+});
+
+const accountingBuyerSchema = Schema.Union([
+  personalAccountingBuyerSchema,
+  businessAccountingBuyerSchema,
+]);
+
+const accountingSupplierSchema = Schema.Struct({
+  legalName: Schema.NonEmptyString,
+  companyId: companyRegistrationIdSchema,
+  vatStatus: Schema.Literals(vatStatuses),
+  address: Schema.Struct({
+    street: Schema.NonEmptyString,
+    cityDistrict: Schema.NonEmptyString,
+    city: Schema.NonEmptyString,
+    postalCode: Schema.NonEmptyString,
+    country: Schema.NonEmptyString,
+  }),
+  contactEmail: Schema.NonEmptyString,
+});
+
+export const accountingDocumentIdentitySchema = Schema.Struct({
+  workspaceReservationId: workspaceReservationIdSchema,
+  dotyposReservationId: DotyposReservationIdSchema,
+  dotyposCustomerId: DotyposCustomerIdSchema,
+  locale: Schema.Literals(supportedLocales),
+  supplier: accountingSupplierSchema,
+  buyer: accountingBuyerSchema,
+});
+
+const accountingDocumentDeliverySchema = Schema.Struct({
+  email: Schema.Trim.check(Schema.isNonEmpty()),
+});
+
+export const coworkAccountingDocumentSnapshotSchema = Schema.Struct({
+  ...accountingDocumentIdentitySchema.fields,
+  billing: Schema.optionalKey(reservationBillingSelectionSchema),
+  delivery: Schema.optionalKey(accountingDocumentDeliverySchema),
+  reservation: Schema.Struct({
+    kind: Schema.Literal("cowork"),
+    date: plainDateStringSchema,
+  }),
+  quote: coworkReservationQuoteSchema,
+});
+
+export const meetingRoomAccountingDocumentSnapshotSchema = Schema.Struct({
+  ...accountingDocumentIdentitySchema.fields,
+  billing: Schema.optionalKey(reservationBillingSelectionSchema),
+  delivery: Schema.optionalKey(accountingDocumentDeliverySchema),
+  reservation: Schema.Struct({
+    kind: Schema.Literal("meeting-room"),
+    startsAt: instantStringSchema,
+    endsAt: instantStringSchema,
+  }),
+  quote: meetingRoomReservationQuoteSchema,
+});
+
+export const officeAccountingDocumentSnapshotSchema = Schema.Struct({
+  ...accountingDocumentIdentitySchema.fields,
+  billing: Schema.optionalKey(reservationBillingSelectionSchema),
+  delivery: Schema.optionalKey(accountingDocumentDeliverySchema),
+  reservation: officeReservationDetailsSchema,
+  quote: officeReservationQuoteSchema,
+});
+
+export const tableAccountingDocumentSnapshotSchema = Schema.Struct({
+  ...accountingDocumentIdentitySchema.fields,
+  billing: Schema.optionalKey(reservationBillingSelectionSchema),
+  delivery: Schema.optionalKey(accountingDocumentDeliverySchema),
+  reservation: tableReservationDetailsSchema,
+  quote: tableReservationQuoteSchema,
+});
+
+export const accountingDocumentSnapshotSchema = Schema.Union([
+  coworkAccountingDocumentSnapshotSchema,
+  meetingRoomAccountingDocumentSnapshotSchema,
+  officeAccountingDocumentSnapshotSchema,
+  tableAccountingDocumentSnapshotSchema,
+]).annotate({
+  identifier: "AccountingDocumentSnapshot",
+  description:
+    "Immutable billing and accepted-price facts used to issue an accounting document.",
+});
+
+export type AccountingDocumentSnapshot =
+  typeof accountingDocumentSnapshotSchema.Type;
+
+const passPurchaseAccountingSnapshotFacts = Schema.Struct({
+  orderId: orderIdSchema,
+  dotyposCustomerId: accountingDocumentIdentitySchema.fields.dotyposCustomerId,
+  locale: accountingDocumentIdentitySchema.fields.locale,
+  supplier: accountingSupplierSchema,
+  buyer: accountingBuyerSchema,
+  billing: reservationBillingSelectionSchema,
+  delivery: accountingDocumentDeliverySchema,
+  product: Schema.Union([entryPackProductSchema, unlimitedPassProductSchema]),
+  serviceDate: plainDateStringSchema,
+  quote: discountQuoteCodec,
+});
+
+export const storedPassPurchaseAccountingSnapshotSchema = Schema.Struct({
+  ...passPurchaseAccountingSnapshotFacts.fields,
+  unlimitedCoffee: Schema.optionalKey(Schema.Literal(true)),
+});
+
+export const passPurchaseAccountingSnapshotSchema = Schema.Struct({
+  ...passPurchaseAccountingSnapshotFacts.fields,
+  coffeeAmountMinor: Schema.optionalKey(
+    Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+  ),
+});
+
+export type PassPurchaseAccountingSnapshot =
+  typeof passPurchaseAccountingSnapshotSchema.Type;
+
+/**
+ * Prague date the snapshot's reservation starts. Discount-code service dates
+ * are judged on it, so an overnight or multi-day reservation's later days
+ * never count.
+ */
+export const getAccountingDocumentSnapshotFirstServiceDate = (
+  snapshot: AccountingDocumentSnapshot
+): string =>
+  Match.value(snapshot.reservation).pipe(
+    Match.discriminatorsExhaustive("kind")({
+      cowork: (reservation) => reservation.date,
+      "meeting-room": getMeetingRoomReservationDate,
+      office: (reservation) => reservation.startsOn,
+      table: ({ startsAt }) =>
+        plainDateStringSchema.make(
+          getWorkspaceDate(Temporal.Instant.from(startsAt)).toString()
+        ),
+    })
+  );
+
+export const encodeStoredAccountingDocumentSnapshot = Schema.encodeSync(
+  accountingDocumentSnapshotSchema
+);
+
+export const decodeStoredAccountingDocumentSnapshot =
+  Schema.decodeUnknownEffect(accountingDocumentSnapshotSchema, {
+    onExcessProperty: "error",
+  });
+
+export const workspaceAccountingSupplier: typeof accountingSupplierSchema.Type =
+  {
+    legalName: workspaceSiteConstants.brand.legalName,
+    companyId: companyRegistrationIdSchema.make(
+      workspaceSiteConstants.company.identificationNumber
+    ),
+    vatStatus: workspaceSiteConstants.company.vatStatus,
+    address: workspaceSiteConstants.location.address,
+    contactEmail: workspaceSiteConstants.contact.infoEmail,
+  };
+
+export const makeAccountingDocumentSnapshot = (input: {
+  readonly workspaceReservationId: WorkspaceReservationId;
+  readonly dotyposReservationId: DotyposReservationId;
+  readonly dotyposCustomerId: DotyposCustomerId;
+  readonly locale: Locale;
+  readonly prepared: PreparedCustomerQuote;
+}): AccountingDocumentSnapshot => {
+  const billing =
+    input.prepared.reservation.billing ?? defaultReservationBillingSelection;
+  const buyer = getReservationInvoiceBuyer({
+    billing,
+    customerName: input.prepared.reservation.name,
+  });
+  const identity = {
+    workspaceReservationId: input.workspaceReservationId,
+    dotyposReservationId: input.dotyposReservationId,
+    dotyposCustomerId: input.dotyposCustomerId,
+    locale: input.locale,
+    supplier: workspaceAccountingSupplier,
+    buyer: buyer ?? {
+      kind: "person" as const,
+      legalName: input.prepared.reservation.name,
+    },
+    billing,
+    delivery: { email: input.prepared.reservation.email },
+  };
+
+  return Match.value(input.prepared).pipe(
+    Match.discriminatorsExhaustive("kind")({
+      cowork: ({ quote, reservation }) => ({
+        ...identity,
+        reservation: {
+          kind: "cowork" as const,
+          date: reservation.date,
+        },
+        quote,
+      }),
+      "meeting-room": ({ quote, reservation }) => ({
+        ...identity,
+        reservation: {
+          kind: "meeting-room" as const,
+          startsAt: reservation.startsAt,
+          endsAt: reservation.endsAt,
+        },
+        quote,
+      }),
+      table: ({ quote, reservation }) => ({
+        ...identity,
+        reservation: getTableReservationDetails(reservation),
+        quote,
+      }),
+      office: ({ quote, reservation }) => ({
+        ...identity,
+        reservation: {
+          kind: "office" as const,
+          startsOn: reservation.startsOn,
+          endsOn: reservation.endsOn,
+          seats: reservation.seats,
+        },
+        quote,
+      }),
+    })
+  );
+};

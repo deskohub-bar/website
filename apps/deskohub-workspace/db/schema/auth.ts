@@ -1,0 +1,18 @@
+export {
+  authAccount,
+  authOauthAccessToken,
+  authOauthClient,
+  authOauthClientAssertion,
+  authOauthClientResource,
+  authOauthConsent,
+  authOauthRefreshToken,
+  authOauthResource,
+  authPasskey,
+  authRateLimit,
+  authRelations,
+  authSchema,
+  authSession,
+  authUser,
+  authVerification,
+  drizzleAuthTables,
+} from "@deskohub/workspace-backend/db/schema/auth";

@@ -1,0 +1,174 @@
+import { Effect, Match, Schema } from "effect";
+import {
+  type CustomerReservationHistory,
+  CustomerReservationHistoryService,
+  type CustomerReservationParty,
+  type CustomerReservationSummary,
+  currentReservationHistoryAccount,
+} from "@/features/account";
+import { getReservationSummaryStay } from "@/features/account/reservation-summary-stay";
+import { workspaceCoworkTiers } from "@/features/checkout/product-catalog";
+import { coworkStaySchema } from "@/features/reservation/cowork-stay";
+import { agentToolLocaleField, defineSignedInAgentTool } from "./agent-tool";
+import { AgentToolError } from "./agent-tool-error";
+import { CurrentCustomerAgentGrant } from "./customer-agent-caller";
+
+const inputSchema = Schema.Struct({ locale: agentToolLocaleField });
+
+const reservationSchema = Schema.Struct({
+  order_id: Schema.optionalKey(
+    Schema.String.annotate({
+      description:
+        "The order ID for get_reservation_status; absent for reservations not booked on the website.",
+    })
+  ),
+  family: Schema.Literals([
+    "cowork",
+    "meeting-room",
+    "office",
+    "table",
+    "other",
+  ]),
+  tier: Schema.optionalKey(Schema.Literals(workspaceCoworkTiers)),
+  stay: Schema.optionalKey(
+    coworkStaySchema.annotate({
+      description:
+        "Cowork only, when its time can be read: overnight for a Reserved Desk held from noon on the arrival date to noon the next date (Prague time), otherwise day.",
+    })
+  ),
+  starts_at: Schema.NullOr(Schema.String),
+  ends_at: Schema.NullOr(Schema.String),
+  setup_starts_at: Schema.optionalKey(
+    Schema.String.annotate({
+      description:
+        "Meeting room booked with early setup only: when the customer may arrive to set up, before starts_at.",
+    })
+  ),
+  seats: Schema.NullOr(Schema.Finite),
+  status: Schema.Literals([
+    "cancelled",
+    "confirmed",
+    "pending",
+    "requires-attention",
+  ]),
+  party: Schema.Literals([
+    "own",
+    "booked_for_other",
+    "booked_by_other",
+  ]).annotate({
+    description:
+      "own: the customer booked it for themselves. booked_for_other: the customer booked it for someone else. booked_by_other: someone else booked it for the customer.",
+  }),
+});
+
+const outputSchema = Schema.Struct({
+  current: Schema.Array(reservationSchema),
+  past: Schema.Array(reservationSchema),
+  unavailable: Schema.Array(reservationSchema).annotate({
+    description: "Reservations whose details can't be shown right now.",
+  }),
+});
+
+type ListMyReservationsResult = typeof outputSchema.Type;
+
+export const listMyReservationsTool = defineSignedInAgentTool({
+  name: "list_my_reservations",
+  title: "List my Deskohub Workspace reservations",
+  description:
+    "Lists the signed-in customer's reservations as their account page shows them: current and past, with family, time, seats, and status. Other people's names and contact details are never included.",
+  scope: "reservations:read",
+  readOnly: true,
+  unavailableCode: "reservations_unavailable",
+  input: inputSchema,
+  output: outputSchema,
+  run: Effect.fn("agentTools.listMyReservations")(() =>
+    Effect.Do.pipe(
+      Effect.bind("account", () => readHistoryAccount),
+      Effect.bind("history", ({ account }) =>
+        CustomerReservationHistoryService.pipe(
+          // The tool never returns names, so it skips their uncached read.
+          Effect.flatMap((histories) =>
+            histories.load(account, { includePartyNames: false })
+          ),
+          Effect.mapError(
+            AgentToolError.unavailable("reservations_unavailable")
+          )
+        )
+      ),
+      Effect.flatMap(({ history }) => toListResult(history))
+    )
+  ),
+});
+
+/** The grant's account history (`currentReservationHistoryAccount`). */
+const readHistoryAccount = CurrentCustomerAgentGrant.pipe(
+  Effect.flatMap((grant) =>
+    currentReservationHistoryAccount(grant.accountId).pipe(
+      Effect.mapError(AgentToolError.refused("account_unavailable"))
+    )
+  )
+);
+
+const toListResult = (
+  history: CustomerReservationHistory
+): Effect.Effect<ListMyReservationsResult, AgentToolError> =>
+  Match.value(history).pipe(
+    Match.discriminatorsExhaustive("kind")({
+      available: ({ groups }) =>
+        Effect.succeed({
+          current: groups.current.map(toReservation),
+          past: groups.past.map(toReservation),
+          unavailable: groups.unavailable.map(toReservation),
+        }),
+      unavailable: ({ reason }) =>
+        Effect.fail(
+          Match.value(reason).pipe(
+            Match.when("provider-unavailable", () =>
+              AgentToolError.unavailable("reservations_unavailable")(reason)
+            ),
+            Match.when("email-unverified", () =>
+              AgentToolError.refused("account_unavailable")()
+            ),
+            Match.when("link-required", () =>
+              AgentToolError.refused("profile_incomplete")()
+            ),
+            Match.exhaustive
+          )
+        ),
+    })
+  );
+
+const toReservation = (
+  reservation: CustomerReservationSummary
+): ListMyReservationsResult["current"][number] => {
+  const stay = getReservationSummaryStay(reservation);
+  return {
+    ...(reservation.workspaceReservationId && {
+      order_id: reservation.workspaceReservationId,
+    }),
+    family: reservation.product.kind,
+    ...(reservation.product.kind === "cowork" && {
+      tier: reservation.product.tier,
+    }),
+    ...(stay && { stay }),
+    starts_at: reservation.startsAt,
+    ends_at: reservation.endsAt,
+    ...(reservation.setupStartsAt && {
+      setup_starts_at: reservation.setupStartsAt,
+    }),
+    seats: reservation.seats,
+    status: reservation.status,
+    party: toParty(reservation.party),
+  };
+};
+
+const toParty = (party: CustomerReservationParty | undefined) =>
+  party
+    ? Match.value(party).pipe(
+        Match.discriminatorsExhaustive("kind")({
+          "booked-for": () => "booked_for_other" as const,
+          "booked-by": () => "booked_by_other" as const,
+          "booked-by-deleted-account": () => "booked_by_other" as const,
+        })
+      )
+    : ("own" as const);

@@ -1,0 +1,306 @@
+import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { ok } from "node:assert/strict";
+import { Schema } from "effect";
+import { isValidElement, type ReactElement, Suspense } from "react";
+import {
+  renderComponentElement,
+  requireElement,
+} from "@/shared/testing/route-element.test-utils";
+
+const events: string[] = [];
+const notFound = mock(() => {
+  throw new Error("NEXT_NOT_FOUND");
+});
+const arePasskeysEnabled = mock(() => Promise.resolve(true));
+const areReferralsEnabled = mock(() => Promise.resolve(true));
+const isCoworkPassesPageOpenAfterConnection = mock(() => Promise.resolve(true));
+const connection = mock(() => Promise.resolve());
+const getRequestPathname = mock(() =>
+  Promise.resolve<string | undefined>("/en-US/account")
+);
+const loadCustomerAccountPage = mock(() =>
+  Promise.resolve({ kind: "unavailable" as const })
+);
+const loadCustomerAccountPasses = mock((_locale: string) =>
+  Promise.resolve({ kind: "empty" as const })
+);
+const loadCustomerInvoiceHistory = mock((_locale: string) =>
+  Promise.resolve({ kind: "empty" as const })
+);
+const AccountPage = mock(() => null);
+const AccountContentLoading = mock(() => null);
+
+mock.module("next/navigation", () => ({ notFound }));
+mock.module("next/server", () => ({ connection }));
+mock.module("@/features/account/server/account-release-gates.server", () => ({
+  arePasskeysEnabled,
+}));
+mock.module("@/features/referrals/referral-release-gate.server", () => ({
+  areReferralsEnabled,
+}));
+mock.module(
+  "@/features/passes/backend/cowork-passes-release-gate.server",
+  () => ({
+    isCoworkPassesPageOpenAfterConnection,
+  })
+);
+mock.module("@/shared/backend/utils/request-pathname", () => ({
+  getRequestPathname,
+}));
+mock.module("@/features/account/page-data.server", () => ({
+  loadCustomerAccountPage,
+}));
+mock.module("@/features/account/account-passes.server", () => ({
+  loadCustomerAccountPasses,
+}));
+mock.module("@/features/account/account-unlimited-passes.server", () => ({
+  loadCustomerAccountUnlimitedPasses: async () => [],
+}));
+mock.module("@/features/account/invoice-history.server", () => ({
+  loadCustomerInvoiceHistory,
+}));
+mock.module("@/features/account/components/account-page", () => ({
+  AccountPage,
+}));
+mock.module("@/features/account/components/account-loading", () => ({
+  AccountContentLoading,
+}));
+const i18n = await import("@/features/i18n");
+mock.module("@/features/i18n", () => ({
+  ...i18n,
+  m: {
+    accountMetadataDescription: () => "synthetic-description",
+    accountSectionBilling: () => "synthetic-billing",
+    accountSectionMetadataTitle: ({ section }: { readonly section: string }) =>
+      `${section} | synthetic-title`,
+  },
+}));
+
+const { AccountSectionPathCheck, AccountSections, getAccountSectionMetadata } =
+  await import("./account-section-route");
+
+const isProps = Schema.is(Schema.Record(Schema.String, Schema.Unknown));
+
+const renderSuspended = (boundary: ReactElement) => {
+  ok(boundary.type === Suspense && isProps(boundary.props));
+  const { children, fallback } = boundary.props;
+  ok(isValidElement(children));
+  return {
+    fallback,
+    content: async () => {
+      const output = await renderComponentElement(children);
+      return output === null ? null : requireElement<unknown>(output);
+    },
+  };
+};
+
+const renderSections = () =>
+  renderSuspended(AccountSections({ locale: "en-US" }));
+
+const renderPathCheck = (section: string) =>
+  renderSuspended(
+    AccountSectionPathCheck({ section: Promise.resolve(section) })
+  );
+
+const loadPageData = async (
+  page: ReactElement | null,
+  name: "loadInvoiceHistory" | "loadPasses"
+) => {
+  ok(page?.type === AccountPage && isProps(page.props));
+  const { props } = page;
+  const load = props[name];
+  ok(load instanceof Function);
+  await load();
+};
+
+describe("customer account route boundary", () => {
+  beforeEach(() => {
+    events.length = 0;
+    notFound.mockReset();
+    notFound.mockImplementation(() => {
+      throw new Error("NEXT_NOT_FOUND");
+    });
+    arePasskeysEnabled.mockReset();
+    arePasskeysEnabled.mockImplementation(async () => {
+      events.push("passkeys");
+      return true;
+    });
+    areReferralsEnabled.mockReset();
+    areReferralsEnabled.mockImplementation(async () => {
+      events.push("referrals");
+      return true;
+    });
+    isCoworkPassesPageOpenAfterConnection.mockReset();
+    isCoworkPassesPageOpenAfterConnection.mockImplementation(async () => {
+      events.push("passes");
+      return true;
+    });
+    connection.mockReset();
+    connection.mockImplementation(async () => {
+      events.push("connection");
+    });
+    getRequestPathname.mockReset();
+    getRequestPathname.mockImplementation(async () => {
+      events.push("pathname");
+      return "/en-US/account";
+    });
+    loadCustomerAccountPage.mockClear();
+    loadCustomerAccountPage.mockImplementation(async () => {
+      events.push("load");
+      return { kind: "unavailable" as const };
+    });
+    loadCustomerAccountPasses.mockClear();
+    AccountPage.mockClear();
+  });
+
+  test("loads private account data after connection", async () => {
+    const { content, fallback } = renderSections();
+
+    expect(fallback).toMatchObject({
+      type: AccountContentLoading,
+      props: { locale: "en-US" },
+    });
+    expect(events).toEqual([]);
+
+    const output = await content();
+
+    expect(events).toEqual([
+      "connection",
+      "pathname",
+      "passkeys",
+      "referrals",
+      "passes",
+      "load",
+    ]);
+    expect(loadCustomerAccountPage).toHaveBeenCalledWith();
+    expect(output).toMatchObject({
+      type: AccountPage,
+      props: { locale: "en-US", state: { kind: "unavailable" } },
+    });
+  });
+
+  test("lets the page start loading the invoice history in its locale", async () => {
+    const output = await renderSections().content();
+    loadCustomerInvoiceHistory.mockClear();
+
+    await loadPageData(output, "loadInvoiceHistory");
+
+    expect(loadCustomerInvoiceHistory).toHaveBeenCalledWith("en-US");
+  });
+
+  test("lets the released Passes section load in its locale after rendering", async () => {
+    getRequestPathname.mockImplementation(async () => "/en-US/account/passes");
+    const output = await renderSections().content();
+
+    expect(loadCustomerAccountPasses).not.toHaveBeenCalled();
+    await loadPageData(output, "loadPasses");
+    expect(loadCustomerAccountPasses).toHaveBeenCalledWith("en-US");
+  });
+
+  test.each([
+    "/en-US/account/",
+    "/en-US/account/security",
+    "/en-US/account/referrals",
+    "/en-US/account/danger",
+  ])("loads the account page at %s", async (pathname) => {
+    getRequestPathname.mockImplementation(async () => pathname);
+
+    expect(await renderSections().content()).toMatchObject({
+      type: AccountPage,
+    });
+  });
+
+  // A signed-out visitor's account page redirects to sign-in, so the check
+  // must settle before the account loads.
+  test.each([
+    ["an unknown section", "/en-US/account/unknown"],
+    ["a section in another case", "/en-US/account/Profile"],
+    ["a nested path", "/en-US/account/profile/extra"],
+    ["another locale's account", "/cs-CZ/account/profile"],
+    ["a request the proxy did not hand on", undefined],
+  ])(
+    "returns not found for %s without loading the account",
+    async (_, pathname) => {
+      getRequestPathname.mockImplementation(async () => pathname);
+
+      await expect(renderSections().content()).rejects.toThrow(
+        "NEXT_NOT_FOUND"
+      );
+      expect(loadCustomerAccountPage).not.toHaveBeenCalled();
+      expect(AccountPage).not.toHaveBeenCalled();
+    }
+  );
+
+  test.each([
+    ["referrals", areReferralsEnabled],
+    ["security", arePasskeysEnabled],
+    ["passes", isCoworkPassesPageOpenAfterConnection],
+  ] as const)(
+    "returns not found for the withheld %s section without loading the account",
+    async (section, flag) => {
+      getRequestPathname.mockImplementation(
+        async () => `/en-US/account/${section}`
+      );
+      flag.mockImplementation(async () => false);
+
+      await expect(renderSections().content()).rejects.toThrow(
+        "NEXT_NOT_FOUND"
+      );
+      expect(loadCustomerAccountPage).not.toHaveBeenCalled();
+    }
+  );
+
+  test("leaves a released section's path to the sections' account page", async () => {
+    const { content, fallback } = renderPathCheck("security");
+
+    expect(fallback).toBeNull();
+    expect(await content()).toBeNull();
+    expect(events).toEqual(["connection", "passkeys", "referrals", "passes"]);
+    expect(loadCustomerAccountPage).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    "unknown",
+    "Profile",
+    "deleted",
+    // Legal & Privacy is its own page; this route never renders it.
+    "legal",
+  ])("returns not found for the %s segment", async (section) => {
+    await expect(renderPathCheck(section).content()).rejects.toThrow(
+      "NEXT_NOT_FOUND"
+    );
+    expect(events).toEqual(["connection"]);
+  });
+
+  test.each([
+    ["referrals", areReferralsEnabled, "referrals"],
+    ["security", arePasskeysEnabled, "passkeys"],
+    ["passes", isCoworkPassesPageOpenAfterConnection, "passes"],
+  ] as const)(
+    "returns not found for the withheld %s section",
+    async (section, flag, event) => {
+      flag.mockImplementation(async () => {
+        events.push(event);
+        return false;
+      });
+
+      await expect(renderPathCheck(section).content()).rejects.toThrow(
+        "NEXT_NOT_FOUND"
+      );
+    }
+  );
+
+  test("titles a section's page with the section's label", () => {
+    expect(getAccountSectionMetadata("en-US", "billing")).toEqual({
+      title: "synthetic-billing | synthetic-title",
+      description: "synthetic-description",
+      robots: { index: false, follow: false },
+    });
+    expect(() => getAccountSectionMetadata("en-US", "unknown")).toThrow(
+      "NEXT_NOT_FOUND"
+    );
+    expect(() => getAccountSectionMetadata("en-US", "legal")).toThrow(
+      "NEXT_NOT_FOUND"
+    );
+  });
+});

@@ -1,0 +1,309 @@
+name: Workspace GCP sandbox smoke
+
+# Manual only. The default `read-only` mode proves GitHub federation reaches
+# the approved sandbox project and runs read-only project, billing, state
+# bucket, API and log-routing checks; it changes nothing in Google Cloud.
+# `hosted-proof` runs the Slice 1-B hosted proof (#1452, #1453) of the
+# IAM-private Cloud Run topology end to end and always tears down; `cleanup-only` runs just that teardown and the
+# post-destroy inventory. Mutating modes run only from main, which the
+# sandbox workload identity provider also requires.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: read-only checks, the full hosted proof, or teardown only
+        type: choice
+        default: read-only
+        options:
+          - read-only
+          - hosted-proof
+          - cleanup-only
+
+permissions:
+  contents: read
+
+# One sandbox run at a time, and never cancel one in progress: a cancelled
+# release or Alchemy apply would leave the writer lock and state in doubt.
+concurrency:
+  group: workspace-gcp-sandbox
+  cancel-in-progress: false
+
+env:
+  SANDBOX_PROOF_MODE: ${{ inputs.mode }}
+  SANDBOX_EXPECTED_PROJECT_ID: deskohub-workspace-sandbox
+  SANDBOX_EXPECTED_PROJECT_NUMBER: "759037106024"
+  SANDBOX_EXPECTED_STATE_BUCKET: deskohub-workspace-sandbox-workspace-state
+  SANDBOX_REGION: europe-west1
+  SANDBOX_PROOF_RUNNER: packages/workspace-infrastructure/scripts/sandbox-hosted-proof.sh
+
+jobs:
+  smoke:
+    name: Sandbox ${{ inputs.mode }}
+    runs-on: ubuntu-latest
+    # The Alchemy access token lives one hour; the runner refreshes it from
+    # the federated gcloud credentials for later steps. Each mode's limit
+    # covers the sum of its step ceilings plus setup, so a slow proof cannot
+    # cut teardown short.
+    timeout-minutes: ${{ inputs.mode == 'hosted-proof' && 260 || inputs.mode == 'cleanup-only' && 60 || 10 }}
+    environment: workspace-gcp-sandbox
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GCP_SANDBOX_PROJECT_ID: ${{ vars.GCP_SANDBOX_PROJECT_ID }}
+      GCP_SANDBOX_WIF_PROVIDER: ${{ vars.GCP_SANDBOX_WIF_PROVIDER }}
+      GCP_SANDBOX_DEPLOY_SA: ${{ vars.GCP_SANDBOX_DEPLOY_SA }}
+      GCP_SANDBOX_STATE_BUCKET: ${{ vars.GCP_SANDBOX_STATE_BUCKET }}
+    steps:
+      - name: Require sandbox configuration
+        run: |
+          for name in GCP_SANDBOX_PROJECT_ID GCP_SANDBOX_WIF_PROVIDER GCP_SANDBOX_DEPLOY_SA GCP_SANDBOX_STATE_BUCKET; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Set the $name variable on the workspace-gcp-sandbox environment."
+              exit 1
+            fi
+          done
+          case "$GCP_SANDBOX_DEPLOY_SA" in
+            *"@${GCP_SANDBOX_PROJECT_ID}.iam.gserviceaccount.com") ;;
+            *)
+              echo "::error::The deploy service account must belong to the sandbox project."
+              exit 1
+              ;;
+          esac
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Before any credential exists: main only, approved identifiers only.
+      - name: Guard the mutating mode
+        id: guard
+        if: inputs.mode != 'read-only'
+        run: bash "$SANDBOX_PROOF_RUNNER" guard
+
+      # gcloud uses the federated credentials file.
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          project_id: ${{ vars.GCP_SANDBOX_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_SANDBOX_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SANDBOX_DEPLOY_SA }}
+
+      # Alchemy beta.87 rejects federated credential files: it reads
+      # GOOGLE_ACCESS_TOKEN with GOOGLE_PROJECT_ID instead. This step keeps
+      # the credentials file above in place.
+      - name: Mint the Alchemy access token
+        id: alchemy-auth
+        if: inputs.mode != 'read-only'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          project_id: ${{ vars.GCP_SANDBOX_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_SANDBOX_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SANDBOX_DEPLOY_SA }}
+          token_format: access_token
+          access_token_lifetime: 3600s
+          create_credentials_file: false
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Prove the federated identity and project
+        run: |
+          account="$(gcloud auth list --filter=status:ACTIVE --format='value(account)')"
+          if [ "$account" != "$GCP_SANDBOX_DEPLOY_SA" ]; then
+            echo "::error::Active account is not the sandbox deploy service account."
+            exit 1
+          fi
+          project="$(gcloud projects describe "$GCP_SANDBOX_PROJECT_ID" --format='value(projectId)')"
+          if [ "$project" != "$GCP_SANDBOX_PROJECT_ID" ]; then
+            echo "::error::The deploy identity cannot read the approved sandbox project."
+            exit 1
+          fi
+          gcloud projects describe "$GCP_SANDBOX_PROJECT_ID" \
+            --format='value(labels.workspace-sandbox-max-spend,labels.workspace-sandbox-teardown)'
+
+      - name: Check billing
+        env:
+          CLOUDSDK_BILLING_QUOTA_PROJECT: ${{ vars.GCP_SANDBOX_PROJECT_ID }}
+        run: |
+          billing="$(gcloud billing projects describe "$GCP_SANDBOX_PROJECT_ID" --format='value(billingEnabled)')"
+          if [ "$billing" != "True" ]; then
+            echo "::error::Billing is not enabled on the sandbox project."
+            exit 1
+          fi
+
+      - name: Check the state bucket
+        run: |
+          versioning="$(gcloud storage buckets describe "gs://${GCP_SANDBOX_STATE_BUCKET}" --format='value(versioning_enabled)')"
+          if [ "$versioning" != "True" ]; then
+            echo "::error::The state bucket must have object versioning enabled."
+            exit 1
+          fi
+          gcloud storage ls "gs://${GCP_SANDBOX_STATE_BUCKET}" > /dev/null
+
+      - name: List enabled APIs and log routing
+        run: bash "$SANDBOX_PROOF_RUNNER" readonly-inventory
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        if: inputs.mode != 'read-only'
+        with:
+          bun-version: 1.4.4
+
+      - name: Install dependencies
+        if: inputs.mode != 'read-only'
+        run: bun install --frozen-lockfile
+
+      - name: Verify the live sandbox and write the stack config
+        id: preflight
+        if: inputs.mode != 'read-only'
+        env:
+          GOOGLE_ACCESS_TOKEN: ${{ steps.alchemy-auth.outputs.access_token }}
+        run: bash "$SANDBOX_PROOF_RUNNER" preflight
+
+      - name: Take the baseline inventory
+        if: inputs.mode == 'hosted-proof'
+        timeout-minutes: 5
+        run: bash "$SANDBOX_PROOF_RUNNER" baseline-inventory
+
+      - name: Apply the sandbox foundation
+        if: inputs.mode == 'hosted-proof'
+        timeout-minutes: 15
+        env:
+          GOOGLE_ACCESS_TOKEN: ${{ steps.alchemy-auth.outputs.access_token }}
+        run: bash "$SANDBOX_PROOF_RUNNER" foundation
+
+      - name: Build and push the Workspace API proof images
+        if: inputs.mode == 'hosted-proof'
+        timeout-minutes: 20
+        env:
+          GOOGLE_ACCESS_TOKEN: ${{ steps.alchemy-auth.outputs.access_token }}
+        run: bash "$SANDBOX_PROOF_RUNNER" images
+
+      # Records the three service URLs; workspace-api's is the `api_url`
+      # output every ID token below is minted for.
+      - name: Deliver probe v1
+        id: deliver-v1
+        if: inputs.mode == 'hosted-proof'
+        timeout-minutes: 20
+        env:
+          GOOGLE_ACCESS_TOKEN: ${{ steps.alchemy-auth.outputs.access_token }}
+        run: bash "$SANDBOX_PROOF_RUNNER" deliver-v1
+
+      - name: Prove every service refuses unauthenticated callers
+        if: inputs.mode == 'hosted-proof'
+        timeout-minutes: 5
+        env:
+          GOOGLE_ACCESS_TOKEN: ${{ steps.alchemy-auth.outputs.access_token }}
+        run: bash "$SANDBOX_PROOF_RUNNER" private-access
+
+      # The deployer's ID token for workspace-api: an output GitHub masks,
+      # which the runner moves into a private file and never prints. It
+      # lives one hour, so restore-v1 gets a fresh one.
+      - name: Mint the workspace-api ID token
+        id: api-id-token
+        if: inputs.mode == 'hosted-proof'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          project_id: ${{ vars.GCP_SANDBOX_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_SANDBOX_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SANDBOX_DEPLOY_SA }}
+          token_format: id_token
+          id_token_audience: ${{ steps.deliver-v1.outputs.api_url }}
+          create_credentials_file: false
+
+      - name: Prove Workspace API RPC and synthetic email preferences
+        if: inputs.mode == 'hosted-proof'
+        timeout-minutes: 10
+        env:
+          GOOGLE_ACCESS_TOKEN: ${{ steps.alchemy-auth.outputs.access_token }}
+          SANDBOX_API_ID_TOKEN: ${{ steps.api-id-token.outputs.id_token }}
+        run: bash "$SANDBOX_PROOF_RUNNER" rpc-probe
+
+      - name: Drive the workers through Cloud Tasks and Cloud Scheduler
+        if: inputs.mode == 'hosted-proof'
+        timeout-minutes: 15
+        env:
+          GOOGLE_ACCESS_TOKEN: ${{ steps.alchemy-auth.outputs.access_token }}
+        run: bash "$SANDBOX_PROOF_RUNNER" worker-probe
+
+      - name: Deliver probe v2
+        if: inputs.mode == 'hosted-proof'
+        timeout-minutes: 15
+        env:
+          GOOGLE_ACCESS_TOKEN: ${{ steps.alchemy-auth.outputs.access_token }}
+        run: bash "$SANDBOX_PROOF_RUNNER" deliver-v2
+
+      - name: Detect and repair drift
+        if: inputs.mode == 'hosted-proof'
+        timeout-minutes: 15
+        env:
+          GOOGLE_ACCESS_TOKEN: ${{ steps.alchemy-auth.outputs.access_token }}
+        run: bash "$SANDBOX_PROOF_RUNNER" drift
+
+      - name: Interrupt a deliver and recover
+        if: inputs.mode == 'hosted-proof'
+        timeout-minutes: 25
+        env:
+          GOOGLE_ACCESS_TOKEN: ${{ steps.alchemy-auth.outputs.access_token }}
+        run: bash "$SANDBOX_PROOF_RUNNER" interrupt-recover
+
+      - name: Snapshot and restore the Alchemy state
+        if: inputs.mode == 'hosted-proof'
+        timeout-minutes: 20
+        env:
+          GOOGLE_ACCESS_TOKEN: ${{ steps.alchemy-auth.outputs.access_token }}
+        run: bash "$SANDBOX_PROOF_RUNNER" state-snapshot-restore
+
+      - name: Mint a fresh workspace-api ID token for the restore
+        id: api-id-token-restore
+        if: inputs.mode == 'hosted-proof'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          project_id: ${{ vars.GCP_SANDBOX_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_SANDBOX_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SANDBOX_DEPLOY_SA }}
+          token_format: id_token
+          id_token_audience: ${{ steps.deliver-v1.outputs.api_url }}
+          create_credentials_file: false
+
+      - name: Restore release v1
+        if: inputs.mode == 'hosted-proof'
+        timeout-minutes: 15
+        env:
+          GOOGLE_ACCESS_TOKEN: ${{ steps.alchemy-auth.outputs.access_token }}
+          SANDBOX_API_ID_TOKEN: ${{ steps.api-id-token-restore.outputs.id_token }}
+        run: bash "$SANDBOX_PROOF_RUNNER" restore-v1
+
+      - name: Check the marker reached no log or trace
+        if: inputs.mode == 'hosted-proof'
+        timeout-minutes: 20
+        env:
+          GOOGLE_ACCESS_TOKEN: ${{ steps.alchemy-auth.outputs.access_token }}
+        run: bash "$SANDBOX_PROOF_RUNNER" telemetry-privacy
+
+      # Teardown runs after any failure or cancellation of a mutating mode
+      # once the guard and preflight passed. The stack goes under the
+      # writer lock: a lock this run cannot prove dead, or a
+      # failed locked destroy, leaves the stack for an operator and a
+      # cleanup-only rerun.
+      - name: Destroy the sandbox stack
+        if: always() && inputs.mode != 'read-only' && steps.preflight.outcome == 'success'
+        timeout-minutes: 30
+        env:
+          GOOGLE_ACCESS_TOKEN: ${{ steps.alchemy-auth.outputs.access_token }}
+        run: bash "$SANDBOX_PROOF_RUNNER" stack-destroy
+
+      - name: Take the post-destroy inventory
+        if: always() && inputs.mode != 'read-only' && steps.preflight.outcome == 'success'
+        timeout-minutes: 5
+        env:
+          GOOGLE_ACCESS_TOKEN: ${{ steps.alchemy-auth.outputs.access_token }}
+        run: bash "$SANDBOX_PROOF_RUNNER" post-destroy-inventory
+
+      - name: Upload the proof record
+        if: always() && inputs.mode != 'read-only' && steps.guard.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: workspace-sandbox-${{ inputs.mode }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sandbox-proof
+          if-no-files-found: warn
+          retention-days: 30

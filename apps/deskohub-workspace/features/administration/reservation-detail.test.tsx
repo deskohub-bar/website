@@ -1,0 +1,336 @@
+import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
+import { DotyposCustomerIdSchema } from "@deskohub/dotypos";
+import { testEmailAddress } from "@deskohub/test-email";
+import { within } from "@testing-library/react";
+import { prerender } from "react-dom/static";
+import type { Locale } from "@/features/i18n";
+import { RouteLocaleProvider } from "@/features/i18n/route-locale";
+import { workspaceUseAction } from "@/shared/testing/workspace-component-module-mocks";
+import {
+  registerWorkspaceComponentTestEnv,
+  unregisterWorkspaceComponentTestEnv,
+} from "@/shared/testing/workspace-component-test-env";
+import type { AdministrationReservationDetail as ReservationDetailData } from "./administration.service";
+import { inactiveCustomerDisplayNames } from "./customer-name";
+import { fioPendingRefund } from "./fio-settlement.fixtures";
+import { loadFixtureReservation } from "./fixtures";
+import { formatAdministrationDateTime } from "./formatters";
+import { m } from "./i18n";
+
+mock.module("server-only", () => ({}));
+mock.module("next/server", () => ({ connection: () => Promise.resolve() }));
+let locale: Locale = "cs-CZ";
+
+mock.module("@/features/passes/admin/pass-page-data.server", () => ({
+  loadReservationPassLinks: () => Promise.resolve(undefined),
+}));
+
+mock.module("@/features/i18n/server/request-locale", () => ({
+  getRequestLocale: () => Promise.resolve(locale),
+}));
+
+const loadFioMovements = mock(() =>
+  Promise.resolve<readonly (typeof fioPendingRefund)[]>([])
+);
+mock.module("./fio-settlement-page-data.server", () => ({
+  loadAdministrationFioMovements: loadFioMovements,
+}));
+mock.module("./fio-refund-action", () => ({
+  recordFioManualRefund: mock(),
+}));
+mock.module("./actions", () => ({
+  settleAdministrationReservationWithdrawal: mock(),
+  cancelAdministrationReservation: mock(),
+  mutateReservationAccess: mock(),
+  restoreAdministrationReservation: mock(),
+}));
+
+let detail: ReservationDetailData | null = null;
+
+mock.module("./page-data.server", () => ({
+  loadAdministrationReservation: () => Promise.resolve(detail),
+}));
+
+async function prerenderReservationDetail() {
+  const { AdministrationReservationDetail } = await import(
+    "./reservation-detail"
+  );
+  const { prelude } = await prerender(
+    <RouteLocaleProvider locale={locale}>
+      <AdministrationReservationDetail
+        params={Promise.resolve({ reservationId: "unused" })}
+      />
+    </RouteLocaleProvider>,
+    // Inline every completed boundary instead of streaming hidden segments.
+    { progressiveChunkSize: Number.POSITIVE_INFINITY }
+  );
+  const container = document.createElement("div");
+  container.innerHTML = await new Response(prelude).text();
+  return within(container);
+}
+
+describe("AdministrationReservationDetail", () => {
+  beforeAll(() => {
+    registerWorkspaceComponentTestEnv();
+    workspaceUseAction.mockReturnValue({
+      execute: mock(),
+      isExecuting: false,
+    });
+  });
+  afterAll(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await unregisterWorkspaceComponentTestEnv();
+  });
+
+  test("renders the reservation detail in Czech on a Czech route", async () => {
+    locale = "cs-CZ";
+    const fixture = loadFixtureReservation("0198-admin-fixture-attention");
+    expect(fixture).not.toBeNull();
+    if (!fixture) return;
+    detail = {
+      ...fixture,
+      operatorNotice: {
+        kind: "late_payment_refund_required",
+        status: "error",
+      },
+      discounts: [],
+      otherCustomerReservations: [],
+    };
+
+    const view = await prerenderReservationDetail();
+
+    expect(view.getByRole("heading", { level: 1 }).textContent).toBe(
+      "Zasedací místnost"
+    );
+    expect(view.getByRole("alert").textContent).toContain(
+      "Pozdní platba – nutné vrátit peníze"
+    );
+    expect(view.getByRole("alert").textContent).toContain(
+      "Rezervaci nevyřizujte a platbu vraťte v Nexi."
+    );
+    for (const heading of [
+      "Průběh rezervace",
+      "Podrobnosti rezervace",
+      "Platební záznamy",
+      "Historie",
+    ]) {
+      expect(view.getByRole("heading", { name: heading })).toBeDefined();
+    }
+    expect(view.getByText("Dotypos: potvrzená")).toBeDefined();
+    expect(view.getByText("Začátek")).toBeDefined();
+    expect(view.getByText("Žádné další rezervace.")).toBeDefined();
+    expect(view.getByText("Nebyla uplatněna žádná sleva.")).toBeDefined();
+    expect(view.getByText("Záznam rezervace")).toBeDefined();
+    const history = view.getByRole("list", { name: "Historie rezervace" });
+    expect(
+      within(history).getByText("Rezervace byla zablokována")
+    ).toBeDefined();
+    expect(
+      within(history).getByText("Potvrzení zákazníkovi selhalo")
+    ).toBeDefined();
+    expect(view.queryByText("Reservation details")).toBeNull();
+    expect(view.queryByText("Rezervaci vytvořil účet")).toBeNull();
+  });
+
+  test("shows an early-setup meeting room's setup start beside its booked start", async () => {
+    locale = "en-US";
+    const fixture = loadFixtureReservation("0198-admin-fixture-attention");
+    if (!fixture) throw new Error("Missing reservation fixture");
+    const startsAt = "2026-08-10T08:00:00Z";
+    const setupStartsAt = "2026-08-10T07:45:00Z";
+    const renderTimes = async (setup: string | null) => {
+      detail = {
+        ...fixture,
+        reservation: {
+          ...fixture.reservation,
+          startsAt,
+          setupStartsAt: setup,
+        },
+      };
+      return prerenderReservationDetail();
+    };
+
+    const early = await renderTimes(setupStartsAt);
+    expect(
+      early.getByText(formatAdministrationDateTime(startsAt, locale))
+    ).toBeDefined();
+    expect(
+      early.getByText(formatAdministrationDateTime(setupStartsAt, locale))
+    ).toBeDefined();
+
+    const onTime = await renderTimes(null);
+    expect(
+      onTime.getByText(formatAdministrationDateTime(startsAt, locale))
+    ).toBeDefined();
+    expect(
+      onTime.queryByText(formatAdministrationDateTime(setupStartsAt, locale))
+    ).toBeNull();
+  });
+
+  test("offers restoring exactly when the detail says the reservation can be restored", async () => {
+    locale = "en-US";
+    const fixture = loadFixtureReservation("0198-admin-fixture-attention");
+    if (!fixture) throw new Error("Missing reservation fixture");
+    const restoration = {
+      cancellationEmailRecorded: true,
+      issuesNewAccess: true,
+      clearsRefundRequirement: false,
+      refundedPayment: null,
+    };
+    const offers = async (
+      state: Pick<
+        ReservationDetailData,
+        "canCancel" | "canRestore" | "restoration"
+      >
+    ) => {
+      detail = { ...fixture, ...state };
+      const view = await prerenderReservationDetail();
+      const offered = (name: string) =>
+        view.queryByRole("button", { name }) !== null;
+      return {
+        cancel: offered(
+          m.administrationReservationCancellationOpen({}, { locale })
+        ),
+        restore: offered(
+          m.administrationReservationRestorationOpen({}, { locale })
+        ),
+      };
+    };
+
+    expect(
+      await offers({ canCancel: false, canRestore: true, restoration })
+    ).toEqual({ cancel: false, restore: true });
+    expect(
+      await offers({ canCancel: true, canRestore: false, restoration: null })
+    ).toEqual({ cancel: true, restore: false });
+    expect(
+      await offers({ canCancel: false, canRestore: false, restoration })
+    ).toEqual({ cancel: false, restore: false });
+  });
+
+  const authorEmail = testEmailAddress("ada.author");
+  const authorCases = [
+    {
+      locale: "en-US",
+      label: "Booked by",
+      deleted: "Deleted account",
+      unavailable: "Author details unavailable",
+      unnamed: "Unnamed customer",
+    },
+    {
+      locale: "cs-CZ",
+      label: "Rezervaci vytvořil účet",
+      deleted: "Smazaný účet",
+      unavailable: "Údaje o autorovi nejsou k dispozici",
+      unnamed: "Zákazník bez jména",
+    },
+  ] as const;
+
+  for (const copy of authorCases) {
+    test(`shows who booked the reservation for someone else in ${copy.locale}`, async () => {
+      locale = copy.locale;
+      const fixture = loadFixtureReservation("0198-admin-fixture-attention");
+      if (!fixture) throw new Error("Missing reservation fixture");
+      const renderAuthor = async (author: ReservationDetailData["author"]) => {
+        detail = { ...fixture, author };
+        const view = await prerenderReservationDetail();
+        const label = view.getByText(copy.label);
+        const value = label.nextElementSibling;
+        if (!(value instanceof HTMLElement)) {
+          throw new Error("Missing Booked by value");
+        }
+        return within(value);
+      };
+
+      const named = await renderAuthor({
+        kind: "account",
+        customerId: DotyposCustomerIdSchema.make("customer-ada"),
+        displayName: "Ada Author",
+        hasName: true,
+        email: authorEmail,
+      });
+      expect(
+        named.getByRole("link", { name: "Ada Author" }).getAttribute("href")
+      ).toBe(`/${copy.locale}/admin/customers/customer-ada`);
+      expect(named.getByText(authorEmail)).toBeDefined();
+
+      const unnamed = await renderAuthor({
+        kind: "account",
+        customerId: null,
+        displayName: "Unnamed customer",
+        hasName: false,
+        email: authorEmail,
+      });
+      expect(unnamed.getByText(copy.unnamed)).toBeDefined();
+      expect(unnamed.queryByRole("link")).toBeNull();
+
+      expect(
+        (await renderAuthor({ kind: "deleted" })).getByText(copy.deleted)
+      ).toBeDefined();
+      expect(
+        (await renderAuthor({ kind: "unavailable" })).getByText(
+          copy.unavailable
+        )
+      ).toBeDefined();
+    });
+  }
+
+  test.each(["deleted", "expired"] as const)(
+    "shows no contact row for an author whose customer is %s",
+    async (lifecycle) => {
+      locale = "en-US";
+      const fixture = loadFixtureReservation("0198-admin-fixture-attention");
+      if (!fixture) throw new Error("Missing reservation fixture");
+      const renderAuthorValue = async (email: string) => {
+        detail = {
+          ...fixture,
+          author: {
+            kind: "account",
+            customerId: DotyposCustomerIdSchema.make("customer-ada"),
+            displayName: inactiveCustomerDisplayNames[lifecycle],
+            hasName: false,
+            lifecycle,
+            email,
+          },
+        };
+        const view = await prerenderReservationDetail();
+        const value = view.getByText(authorCases[0].label).nextElementSibling;
+        if (!(value instanceof HTMLElement)) {
+          throw new Error("Missing Booked by value");
+        }
+        return value;
+      };
+
+      const withEmail = await renderAuthorValue(authorEmail);
+      const withoutEmail = await renderAuthorValue("");
+
+      expect(within(withEmail).getByText(authorEmail)).toBeDefined();
+      expect(withoutEmail.childElementCount).toBe(
+        withEmail.childElementCount - 1
+      );
+      expect(within(withoutEmail).queryByRole("link")).toBeNull();
+    }
+  );
+
+  test("shows the recorded Fio refund and keeps its evidence on the reservation", async () => {
+    locale = "en-US";
+    detail = loadFixtureReservation("0198-admin-fixture-attention");
+    const refundedAt = Temporal.Instant.from("2026-11-20T10:42:00Z");
+    loadFioMovements.mockResolvedValueOnce([
+      { ...fioPendingRefund, disposition: "refunded", refundedAt },
+    ]);
+
+    const view = await prerenderReservationDetail();
+
+    expect(view.getByText("Manual refund recorded")).toBeTruthy();
+    expect(view.getByText(fioPendingRefund.movementId)).toBeTruthy();
+    expect(
+      view.getByText(
+        formatAdministrationDateTime(refundedAt.toString(), locale)
+      )
+    ).toBeTruthy();
+    expect(
+      view.queryByRole("button", { name: "Record manual refund" })
+    ).toBeNull();
+  });
+});

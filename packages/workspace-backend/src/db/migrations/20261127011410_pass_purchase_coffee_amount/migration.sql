@@ -1,0 +1,2 @@
+ALTER TABLE "accounting_document_snapshots" ADD COLUMN "coffee_amount_minor" integer;--> statement-breakpoint
+ALTER TABLE "accounting_document_snapshots" ADD CONSTRAINT "accounting_document_snapshots_coffee_amount_check" CHECK ("coffee_amount_minor" IS NULL OR ("workspace_reservation_id" IS NULL AND "coffee_amount_minor" >= 0));

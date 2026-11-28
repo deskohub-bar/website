@@ -1,0 +1,78 @@
+import type {
+  LegalEvidenceAcknowledgements,
+  LegalEvidenceEventId,
+} from "@deskohub/workspace-domain/features/checkout/legal-evidence";
+import type { OrderId } from "@deskohub/workspace-domain/features/order/order";
+import type { WorkspaceReservationId } from "@deskohub/workspace-domain/features/reservation/persistence-contracts";
+import { sql } from "drizzle-orm";
+import {
+  boolean,
+  check,
+  index,
+  jsonb,
+  pgTable,
+  text,
+} from "drizzle-orm/pg-core";
+import { instant } from "../instant";
+import { postgresUuidV7 } from "../uuid-v7";
+import { orders } from "./orders";
+import { workspaceReservations } from "./workspace-reservations";
+
+export const legalEvidenceEvents = pgTable(
+  "legal_evidence_events",
+  {
+    id: text("id")
+      .primaryKey()
+      .default(postgresUuidV7)
+      .$type<LegalEvidenceEventId>(),
+    workspaceReservationId: text("workspace_reservation_id")
+      .$type<WorkspaceReservationId>()
+      .references(() => workspaceReservations.id, { onDelete: "set null" }),
+    /**
+     * The order whose checkout accepted the document. For a reservation order
+     * it equals `workspace_reservation_id`. A trigger fills it from the
+     * reservation on insert when the writer leaves it out (writers from
+     * before the order key, during a rolling deployment). Evidence outlives
+     * its order, so deleting the order clears it.
+     */
+    orderId: text("order_id")
+      .$type<OrderId>()
+      .references(() => orders.id, { onDelete: "set null" }),
+    documentKey: text("document_key").notNull(),
+    documentPath: text("document_path").notNull(),
+    documentHash: text("document_hash").notNull(),
+    hashAlgorithm: text("hash_algorithm").notNull().$type<"sha256">(),
+    accepted: boolean("accepted").notNull(),
+    acceptedAt: instant("accepted_at").notNull(),
+    locale: text("locale").notNull(),
+    source: text("source").notNull(),
+    /**
+     * Acknowledgements recorded with the accepted document; `{}` when none
+     * were given. NULL marks events recorded before acknowledgements were
+     * persisted, whose acknowledgements are unknown.
+     */
+    acknowledgements:
+      jsonb("acknowledgements").$type<LegalEvidenceAcknowledgements>(),
+    createdAt: instant("created_at").notNull().default(sql`now()`),
+  },
+  (t) => [
+    check(
+      "legal_evidence_events_hash_algorithm_check",
+      sql`${t.hashAlgorithm} = 'sha256'`
+    ),
+    check(
+      "legal_evidence_events_acknowledgements_check",
+      sql`${t.acknowledgements} is null or jsonb_typeof(${t.acknowledgements}) = 'object'`
+    ),
+    index("legal_evidence_events_workspace_reservation_idx").on(
+      t.workspaceReservationId
+    ),
+    index("legal_evidence_events_order_idx").on(t.orderId),
+    check(
+      "legal_evidence_events_reservation_order_match_check",
+      sql`${t.workspaceReservationId} is null or ${t.orderId} is null or ${t.orderId} = ${t.workspaceReservationId}`
+    ),
+  ]
+);
+
+export type LegalEvidenceEvent = typeof legalEvidenceEvents.$inferSelect;

@@ -1,0 +1,140 @@
+import { Effect } from "effect";
+import { FetchHttpClient, type HttpClient } from "effect/http";
+import { nativeBuildVersion } from "expo-application";
+import * as Linking from "expo-linking";
+import * as Updates from "expo-updates";
+import { useEffect, useState } from "react";
+import { AppState, Platform } from "react-native";
+import { installingPackageName } from "../../modules/install-source";
+import { trackUpdateApplied } from "../analytics/events";
+import { useAnalyticsConsent } from "../consent/use-analytics-consent";
+import { deviceCapabilitiesLayer } from "../customer-api/device-capabilities-layer";
+import { recordAppliedUpdate } from "./applied-update";
+import { type NativeUpdateOffer, nextNativeUpdate } from "./native-release";
+import type { ReadyUpdate } from "./ota-update";
+import {
+  planUpdateCheck,
+  runUpdateCheck,
+  scheduleUpdateChecks,
+} from "./update-check";
+import {
+  dismissUpdatePrompt,
+  noUpdatePromptDismissals,
+  selectUpdatePrompt,
+  type UpdatePrompt,
+  updatePromptWaitsForConsent,
+} from "./update-prompt";
+import { configuredWorkspaceUpdateUrls } from "./workspace-update-urls";
+
+// The app's one runtime edge for update work: every Effect here runs in the
+// background, and none reports a failure to the visitor.
+const runInBackground = (
+  effect: Effect.Effect<unknown, unknown, HttpClient.HttpClient>
+): void => {
+  Effect.runFork(
+    effect.pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Update prompt work failed", cause)
+      ),
+      Effect.provide(FetchHttpClient.layer)
+    )
+  );
+};
+
+const openNativeDownload = (versionName: string) =>
+  Effect.tryPromise(() =>
+    Linking.openURL(configuredWorkspaceUpdateUrls.androidApkUrl(versionName))
+  );
+
+const restartIntoUpdate = Effect.tryPromise(() => Updates.reloadAsync());
+
+/**
+ * Records an update this launch applied, checks for a newer APK on launch,
+ * and checks for a JS update, a rollback and a newer APK when the app
+ * returns to the foreground (`scheduleUpdateChecks`). Returns the one prompt
+ * to show, none while the analytics consent prompt waits for an answer. Accepting restarts into
+ * the downloaded or embedded update, or downloads the offered APK;
+ * dismissing hides that offer for the rest of the session.
+ */
+export function useUpdatePrompt(): {
+  readonly prompt: UpdatePrompt | undefined;
+  readonly accept: () => void;
+  readonly dismiss: () => void;
+} {
+  const [readyUpdate, setReadyUpdate] = useState<ReadyUpdate>();
+  const [nativeUpdate, setNativeUpdate] = useState<NativeUpdateOffer>();
+  const [dismissals, setDismissals] = useState(noUpdatePromptDismissals);
+
+  useEffect(() => {
+    // Debug and dev-client builds load JS from Metro: expo-updates is
+    // disabled there or rejects every check, so they skip the JS update.
+    const plan = planUpdateCheck({
+      platform: Platform.OS,
+      otaUpdatesEnabled: Updates.isEnabled && !__DEV__,
+      installingPackageName: installingPackageName(),
+    });
+    if (!(plan.otaUpdate || plan.nativeRelease)) {
+      return;
+    }
+    if (plan.otaUpdate) {
+      runInBackground(
+        recordAppliedUpdate(Updates, trackUpdateApplied).pipe(
+          Effect.provide(deviceCapabilitiesLayer)
+        )
+      );
+    }
+    return scheduleUpdateChecks({
+      plan,
+      appState: AppState,
+      now: Date.now,
+      check: (checks) =>
+        runInBackground(
+          runUpdateCheck({
+            plan: checks,
+            updates: Updates,
+            installedBuildVersion: nativeBuildVersion,
+            latestReleaseUrl: configuredWorkspaceUpdateUrls.latestReleaseUrl,
+            // A downloaded update or rollback stays ready until the restart,
+            // so a later empty or failed check keeps it, and a newer one
+            // replaces it: the next start launches only the newest.
+            onReadyUpdate: (update) => {
+              if (update !== undefined) {
+                setReadyUpdate(update);
+              }
+            },
+            onNativeRelease: (check) =>
+              setNativeUpdate((previous) => nextNativeUpdate(previous, check)),
+          })
+        ),
+    });
+  }, []);
+
+  const consent = useAnalyticsConsent();
+  const prompt = updatePromptWaitsForConsent(consent.status)
+    ? undefined
+    : selectUpdatePrompt({
+        nativeUpdate,
+        readyUpdate,
+        runsEmbeddedUpdate: Updates.isEmbeddedLaunch,
+        dismissals,
+      });
+
+  return {
+    prompt,
+    accept: () => {
+      if (prompt === undefined) {
+        return;
+      }
+      runInBackground(
+        prompt.kind === "native-release"
+          ? openNativeDownload(prompt.versionName)
+          : restartIntoUpdate
+      );
+    },
+    dismiss: () => {
+      if (prompt !== undefined) {
+        setDismissals((current) => dismissUpdatePrompt(current, prompt));
+      }
+    },
+  };
+}

@@ -1,0 +1,37 @@
+---
+type Props = {
+  className: string;
+  description: string;
+  heading: string;
+  kicker: string;
+  label: string;
+} & (
+  | { href: string; closedStamp?: never }
+  | { closedStamp: string; href?: never }
+);
+
+const { className, closedStamp, description, heading, href, kicker, label } =
+  Astro.props;
+const isClosed = href === undefined;
+const Panel = isClosed ? "div" : "a";
+---
+
+<Panel
+  class:list={["portal-panel", { "portal-panel-closed": isClosed }, className]}
+  href={href}
+  aria-disabled={isClosed ? "true" : undefined}
+>
+  {isClosed && (
+    <div class="portal-closed-stamp-wrap">
+      <span class="portal-closed-stamp" role="status">
+        <span class="portal-closed-stamp-text">{closedStamp}</span>
+      </span>
+    </div>
+  )}
+  <span class="portal-panel-inner">
+    <span class="portal-kicker">{kicker}</span>
+    <span class="portal-heading">{heading}</span>
+    <span class="portal-description">{description}</span>
+    <span class="portal-label">{label}</span>
+  </span>
+</Panel>

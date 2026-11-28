@@ -1,0 +1,301 @@
+import { expect, mock, test } from "bun:test";
+import { Effect, Layer } from "effect";
+import { FetchHttpClient } from "effect/http";
+import type { WorkspaceE2EConfig } from "./config";
+import {
+  assertPreviewAuthSessionReady,
+  assertPreviewEndpointsReady,
+  assertPreviewJpegReady,
+  assertPreviewPaymentProvider,
+  isPreviewPageAvailable,
+} from "./preview-readiness";
+import { workspaceE2ETimeouts } from "./timeouts";
+
+test.each(["nexi", "mock", "fallback"] as const)(
+  "checks %s readiness on the exact protected preview origin",
+  async (paymentProvider) => {
+    const requests: Array<{ headers: Headers; url: string }> = [];
+    const fetchMock = mock(
+      async (input: URL | RequestInfo, init?: RequestInit) => {
+        const request =
+          input instanceof Request ? input : new Request(input, init);
+        requests.push({
+          headers: request.headers,
+          url: request.url,
+        });
+        return Response.json({ paymentProvider, status: "ok" });
+      }
+    );
+    await Effect.runPromise(
+      assertPreviewPaymentProvider({
+        ...makeConfig("test-protection-bypass"),
+        paymentProvider,
+      }).pipe(Effect.provide(makeFetchHttpClientLayer(fetchMock)))
+    );
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.url).toBe(
+      "https://deskohub-workspace-a1b2c3d4e-deskohub-bar.vercel.app/api/webhooks/nexi"
+    );
+    expect(requests[0]?.headers.get("x-vercel-protection-bypass")).toBe(
+      "test-protection-bypass"
+    );
+  }
+);
+
+test.each([
+  [Response.json({ paymentProvider: "mock" }), "is mock, expected nexi"],
+  [
+    Response.json({ paymentProvider: "fallback" }),
+    "is fallback, expected nexi",
+  ],
+  [
+    Response.json({ paymentProvider: "unsupported" }),
+    "recognized payment provider",
+  ],
+  [Response.json({ status: "ok" }), "recognized payment provider"],
+  [new Response("not JSON"), "invalid payment provider response"],
+  [new Response(null, { status: 302 }), "readiness check failed with 302"],
+] as const)(
+  "rejects an unverified preview provider",
+  async (response, message) => {
+    const fetchMock = mock(
+      async (_input: URL | RequestInfo, init?: RequestInit) => {
+        expect(init?.redirect).toBe("manual");
+        return response;
+      }
+    );
+    const exit = await Effect.runPromiseExit(
+      assertPreviewPaymentProvider(makeConfig()).pipe(
+        Effect.provide(makeFetchHttpClientLayer(fetchMock))
+      )
+    );
+    expect(exit._tag).toBe("Failure");
+    if (exit._tag === "Failure") expect(String(exit.cause)).toContain(message);
+  }
+);
+
+test("checks that the generated map endpoint returns a JPEG payload", async () => {
+  const fetchMock = mock(
+    async () =>
+      new Response(Uint8Array.from([0xff, 0xd8, 0xff, 0xd9]), {
+        status: 200,
+        headers: { "content-type": "image/jpeg" },
+      })
+  );
+
+  await Effect.runPromise(
+    assertPreviewJpegReady(
+      makeConfig("test-protection-bypass"),
+      "/workspace-location-map.jpeg"
+    ).pipe(Effect.provide(makeFetchHttpClientLayer(fetchMock)))
+  );
+
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+});
+
+test("starts all preview readiness requests before any request completes", async () => {
+  let startedRequestCount = 0;
+  let releaseRequests: () => void = () => undefined;
+  const allRequestsStarted = new Promise<void>((resolve) => {
+    releaseRequests = resolve;
+  });
+  const fetchMock = mock(async (input: URL | RequestInfo) => {
+    startedRequestCount += 1;
+    if (startedRequestCount === 4) releaseRequests();
+    await allRequestsStarted;
+
+    if (String(input).endsWith(".jpeg")) {
+      return new Response(Uint8Array.from([0xff, 0xd8, 0xff, 0xd9]), {
+        headers: { "content-type": "image/jpeg" },
+        status: 200,
+      });
+    }
+    if (String(input).endsWith("/api/auth/get-session")) {
+      return new Response("null", {
+        status: 200,
+        headers: { "cache-control": "private, no-store" },
+      });
+    }
+    if (String(input).endsWith("/api/webhooks/nexi")) {
+      return Response.json({ paymentProvider: "nexi" });
+    }
+    return new Response(null, { status: 200 });
+  });
+
+  await Effect.runPromise(
+    assertPreviewEndpointsReady(makeConfig()).pipe(
+      Effect.provide(makeFetchHttpClientLayer(fetchMock))
+    )
+  );
+
+  expect(startedRequestCount).toBe(4);
+});
+
+test("requires a healthy null auth session with private/no-store on the exact preview", async () => {
+  const requests: Array<{ headers: Headers; url: string }> = [];
+  const fetchMock = mock(
+    async (input: URL | RequestInfo, init?: RequestInit) => {
+      const request =
+        input instanceof Request ? input : new Request(input, init);
+      requests.push({ headers: request.headers, url: request.url });
+      return new Response("null", {
+        status: 200,
+        headers: { "cache-control": "private, no-store" },
+      });
+    }
+  );
+
+  await Effect.runPromise(
+    assertPreviewAuthSessionReady(makeConfig("test-protection-bypass")).pipe(
+      Effect.provide(makeFetchHttpClientLayer(fetchMock))
+    )
+  );
+
+  expect(requests).toHaveLength(1);
+  expect(requests[0]?.url).toBe(
+    "https://deskohub-workspace-a1b2c3d4e-deskohub-bar.vercel.app/api/auth/get-session"
+  );
+  expect(requests[0]?.headers.get("x-vercel-protection-bypass")).toBe(
+    "test-protection-bypass"
+  );
+});
+
+test("rejects an auth session response without the private/no-store classification", async () => {
+  const fetchMock = mock(
+    async () =>
+      new Response("null", {
+        status: 200,
+        headers: { "cache-control": "no-store" },
+      })
+  );
+
+  await expect(
+    Effect.runPromise(
+      assertPreviewAuthSessionReady(makeConfig()).pipe(
+        Effect.provide(makeFetchHttpClientLayer(fetchMock))
+      )
+    )
+  ).rejects.toThrow("private, no-store");
+});
+
+test("rejects an authenticated-looking auth session response during readiness", async () => {
+  const fetchMock = mock(
+    async () =>
+      new Response('{"user":{"id":"someone"}}', {
+        status: 200,
+        headers: { "cache-control": "private, no-store" },
+      })
+  );
+
+  await expect(
+    Effect.runPromise(
+      assertPreviewAuthSessionReady(makeConfig()).pipe(
+        Effect.provide(makeFetchHttpClientLayer(fetchMock))
+      )
+    )
+  ).rejects.toThrow("null session");
+});
+
+test("recognizes a rendered feature-gated preview page", async () => {
+  const fetchMock = mock(
+    async () =>
+      new Response(
+        '<main data-office-base-price>Office reservation</main><script>self.__next_f.push(["This page could not be found."])</script>',
+        { status: 200 }
+      )
+  );
+
+  await expect(
+    Effect.runPromise(
+      isPreviewPageAvailable(
+        makeConfig(),
+        "/en-US/reservation/office",
+        "data-office-base-price"
+      ).pipe(Effect.provide(makeFetchHttpClientLayer(fetchMock)))
+    )
+  ).resolves.toBe(true);
+});
+
+test("recognizes a rendered not-found response for a disabled preview page", async () => {
+  const fetchMock = mock(
+    async () =>
+      new Response('<h1 class="next-error-h1">404</h1>', {
+        status: 200,
+      })
+  );
+
+  await expect(
+    Effect.runPromise(
+      isPreviewPageAvailable(
+        makeConfig(),
+        "/en-US/reservation/office",
+        "data-office-base-price"
+      ).pipe(Effect.provide(makeFetchHttpClientLayer(fetchMock)))
+    )
+  ).resolves.toBe(false);
+});
+
+test("rejects a server error streamed with a 200 instead of disabling E2E coverage", async () => {
+  const fetchMock = mock(
+    async () =>
+      new Response(
+        '<section aria-busy="true">Reserve a private office.</section><template data-dgst="2871029386"></template>',
+        { status: 200 }
+      )
+  );
+
+  await expect(
+    Effect.runPromise(
+      isPreviewPageAvailable(
+        makeConfig(),
+        "/en-US/reservation/office",
+        "data-office-base-price"
+      ).pipe(Effect.provide(makeFetchHttpClientLayer(fetchMock)))
+    )
+  ).rejects.toThrow("did not render its expected content");
+});
+
+test("rejects an HTML error document returned by the generated map endpoint", async () => {
+  const fetchMock = mock(
+    async () =>
+      new Response("<html>map generation failed</html>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      })
+  );
+
+  await expect(
+    Effect.runPromise(
+      assertPreviewJpegReady(makeConfig(), "/workspace-location-map.jpeg").pipe(
+        Effect.provide(makeFetchHttpClientLayer(fetchMock))
+      )
+    )
+  ).rejects.toThrow("instead of image/jpeg");
+});
+
+const makeFetchHttpClientLayer = (
+  fetchImplementation: (
+    ...args: Parameters<typeof fetch>
+  ) => ReturnType<typeof fetch>
+) =>
+  FetchHttpClient.layer.pipe(
+    Layer.provide(
+      Layer.succeed(
+        FetchHttpClient.Fetch,
+        Object.assign(fetchImplementation, {
+          preconnect: () => {
+            throw new Error("Unexpected preview preconnect");
+          },
+        })
+      )
+    )
+  );
+
+const makeConfig = (bypassSecret?: string): WorkspaceE2EConfig => ({
+  baseUrl: "https://deskohub-workspace-a1b2c3d4e-deskohub-bar.vercel.app",
+  bypassSecret,
+  expectedHost: "deskohub-workspace-a1b2c3d4e-deskohub-bar.vercel.app",
+  paymentProvider: "nexi",
+  timeouts: workspaceE2ETimeouts,
+});

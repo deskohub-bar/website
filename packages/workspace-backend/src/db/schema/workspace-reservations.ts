@@ -1,0 +1,318 @@
+import type {
+  DotyposCustomerId,
+  DotyposReservationId,
+  DotyposTableId,
+} from "@deskohub/dotypos";
+import type { EmailDeliveryId } from "@deskohub/email";
+import type { SupportedLocale as Locale } from "@deskohub/i18n/locale-registry";
+import { supportedLocales } from "@deskohub/i18n/locale-registry";
+import type { NexiCorrelationId } from "@deskohub/nexi";
+import type { CustomerAccountId } from "@deskohub/workspace-domain/features/account/customer-account";
+import type {
+  CheckoutAttemptKey,
+  CheckoutSessionKey,
+  PaymentAttemptId,
+} from "@deskohub/workspace-domain/features/checkout/checkout-identifiers";
+import {
+  type PaymentReturnTarget,
+  paymentReturnTargets,
+} from "@deskohub/workspace-domain/features/checkout/payment-return-target";
+import {
+  type OrderId,
+  orderFulfillmentStates,
+  reservationPaymentStates,
+} from "@deskohub/workspace-domain/features/order/order";
+import type { AgentSelectionKey } from "@deskohub/workspace-domain/features/reservation/agent-selection-key";
+import type { WorkspaceReservationId } from "@deskohub/workspace-domain/features/reservation/persistence-contracts";
+import {
+  type ReservationPurpose,
+  reservationPurposeSchema,
+} from "@deskohub/workspace-domain/features/reservation/reservation-purpose";
+import type { PlainDate } from "@deskohub/workspace-domain/shared/utils/temporal";
+import { sql } from "drizzle-orm";
+import {
+  boolean,
+  check,
+  date,
+  index,
+  jsonb,
+  pgTable,
+  text,
+  uniqueIndex,
+  uuid,
+} from "drizzle-orm/pg-core";
+import { instant } from "../instant";
+import { postgresUuidV7 } from "../uuid-v7";
+import { customerAccounts } from "./customer-accounts";
+import { passPurchases } from "./pass-purchases";
+import { quotedSqlList } from "./sql-list";
+
+export const reservationStates = [
+  "draft",
+  "creating_hold",
+  "held",
+  "hold_expired",
+  "confirming",
+  "confirmed",
+  "cancelling",
+  "cancelled",
+  "cancellation_failed",
+] as const;
+
+/**
+ * Why a reservation's cancellation was claimed, recorded when it is first
+ * claimed and kept by every later claim of the same cancellation:
+ * - `hold_expired`, `late_payment`, `payment_retry`: the unpaid-hold release
+ *   reasons that claim it;
+ * - `operator`: an administrator cancelled it;
+ * - `customer_withdrawal`: the customer withdrew from the contract;
+ * - `checkout_superseded`: a newer submission of its checkout session (the
+ *   customer's edit, or an agent's rotated session) replaced it.
+ * Null for cancellations recorded before causes were (their origin is unknown).
+ */
+const reservationCancellationCauses = [
+  "hold_expired",
+  "late_payment",
+  "payment_retry",
+  "operator",
+  "checkout_superseded",
+  "customer_withdrawal",
+] as const;
+
+export type ReservationCancellationCause =
+  (typeof reservationCancellationCauses)[number];
+
+export const paymentStates = reservationPaymentStates;
+
+export const fulfillmentStates = orderFulfillmentStates;
+
+export type ReservationState = (typeof reservationStates)[number];
+export type PaymentState = (typeof paymentStates)[number];
+export type FulfillmentState = (typeof fulfillmentStates)[number];
+
+const reservationStatesRequiringDotyposReservationId = [
+  "held",
+  "confirming",
+  "confirmed",
+  "cancelling",
+  "cancelled",
+  "cancellation_failed",
+] as const satisfies readonly ReservationState[];
+
+export const activeCheckoutSessionIndex =
+  "workspace_reservations_active_session_unique_idx";
+
+export const workspaceReservations = pgTable(
+  "workspace_reservations",
+  {
+    id: text("id")
+      .primaryKey()
+      .default(postgresUuidV7)
+      .$type<WorkspaceReservationId>(),
+    passId: text("pass_id")
+      .$type<OrderId>()
+      .references(() => passPurchases.id),
+    serviceDate: date("service_date", { mode: "string" }).$type<PlainDate>(),
+    passDayTableId: text("pass_day_table_id").$type<DotyposTableId>(),
+    passDayHoldRequestedAt: instant("pass_day_hold_requested_at"),
+    passDayHoldGeneration: uuid("pass_day_hold_generation"),
+    checkoutSessionKey: text("checkout_session_key")
+      .notNull()
+      .default(postgresUuidV7)
+      .$type<CheckoutSessionKey>(),
+    checkoutAttemptKey: text("checkout_attempt_key")
+      .notNull()
+      .$type<CheckoutAttemptKey>(),
+    correlationId: text("correlation_id")
+      .notNull()
+      .unique()
+      .default(postgresUuidV7)
+      .$type<NexiCorrelationId>(),
+    dotyposCustomerId: text("dotypos_customer_id")
+      .notNull()
+      .$type<DotyposCustomerId>(),
+    /**
+     * The customer account that made the reservation. Its tombstone keeps
+     * naming it after the account is deleted.
+     */
+    authorAccountId: text("author_account_id")
+      .notNull()
+      .references(() => customerAccounts.id, { onDelete: "restrict" })
+      .$type<CustomerAccountId>(),
+    /**
+     * The OAuth client ID of the customer's AI agent that started this
+     * reservation through the customer MCP server; null for reservations made
+     * on the site.
+     */
+    agentClientId: text("agent_client_id"),
+    /**
+     * The agent booking request this reservation answers: a digest of the
+     * account, the agent client, and the complete selection. An identical
+     * repeated request finds its reservation by it. Null for reservations made
+     * on the site and for agent reservations made before the column.
+     */
+    agentSelectionKey: text("agent_selection_key").$type<AgentSelectionKey>(),
+    reservationPurpose: text("reservation_purpose").$type<ReservationPurpose>(),
+    dotyposReservationId: text(
+      "dotypos_reservation_id"
+    ).$type<DotyposReservationId>(),
+    reservationState: text("reservation_state")
+      .notNull()
+      .$type<ReservationState>(),
+    paymentState: text("payment_state").notNull().$type<PaymentState>(),
+    fulfillmentState: text("fulfillment_state")
+      .notNull()
+      .$type<FulfillmentState>(),
+    activePaymentAttemptId: text(
+      "active_payment_attempt_id"
+    ).$type<PaymentAttemptId>(),
+    activeCustomerEmailDeliveryId: text(
+      "active_customer_email_delivery_id"
+    ).$type<EmailDeliveryId>(),
+    activeCustomerEmailDeliveryLocale: text(
+      "active_customer_email_delivery_locale"
+    ).$type<Locale>(),
+    /** Null before retention. An empty string retains an email with no table list. */
+    activeCustomerEmailDeliveryOpenSpaceTables: text(
+      "active_customer_email_delivery_open_space_tables"
+    ),
+    reservationDetails: jsonb("reservation_details").notNull(),
+    /**
+     * For an Office or Team Table with a people list, whether its contact
+     * takes a seat. Kept apart from the invitee
+     * rows, which the retention purge deletes or reduces.
+     */
+    officeContactAttends: boolean("office_contact_attends"),
+    locale: text("locale").notNull(),
+    /**
+     * The app the last submission that returned a payment page asked the
+     * hosted payment to return to; null returns to the site's status page.
+     */
+    paymentReturnTarget: text(
+      "payment_return_target"
+    ).$type<PaymentReturnTarget>(),
+    reservationHoldExpiresAt: instant("reservation_hold_expires_at"),
+    reservationHoldExpiredAt: instant("reservation_hold_expired_at"),
+    reservationCreatedAt: instant("reservation_created_at"),
+    reservationConfirmedAt: instant("reservation_confirmed_at"),
+    reservationCancelledAt: instant("reservation_cancelled_at"),
+    cancellationCause:
+      text("cancellation_cause").$type<ReservationCancellationCause>(),
+    /**
+     * When the customer's cancellation email went out for the current
+     * cancellation; null when none was sent or recorded. A restore clears it.
+     */
+    cancellationEmailSentAt: instant("cancellation_email_sent_at"),
+    paidAt: instant("paid_at"),
+    fulfilledAt: instant("fulfilled_at"),
+    fulfillmentFailedAt: instant("fulfillment_failed_at"),
+    failureCode: text("failure_code"),
+    fulfillmentFailureCode: text("fulfillment_failure_code"),
+    createdAt: instant("created_at").notNull().default(sql`now()`),
+    updatedAt: instant("updated_at").notNull().default(sql`now()`),
+  },
+  (t) => [
+    check(
+      "workspace_reservations_pass_day_check",
+      sql`(${t.passId} is null and ${t.serviceDate} is null and ${t.passDayTableId} is null
+          and ${t.passDayHoldRequestedAt} is null and ${t.passDayHoldGeneration} is null)
+        or (${t.passId} is not null and ${t.serviceDate} is not null and ${t.passDayTableId} is not null
+          and ${t.activePaymentAttemptId} is null and ${t.activeCustomerEmailDeliveryId} is null)`
+    ),
+    uniqueIndex("workspace_reservations_pass_date_idx")
+      .on(t.passId, t.serviceDate)
+      .where(sql`${t.passId} is not null`),
+    check(
+      "workspace_reservations_reservation_state_check",
+      sql`${t.reservationState} in (${quotedSqlList(reservationStates)})`
+    ),
+    check(
+      "workspace_reservations_payment_state_check",
+      sql`${t.paymentState} in (${quotedSqlList(paymentStates)})`
+    ),
+    check(
+      "workspace_reservations_fulfillment_state_check",
+      sql`${t.fulfillmentState} in (${quotedSqlList(fulfillmentStates)})`
+    ),
+    check(
+      "workspace_reservations_locale_check",
+      sql`${t.locale} in (${quotedSqlList(supportedLocales)})`
+    ),
+    check(
+      "workspace_reservations_purpose_check",
+      sql`${t.reservationPurpose} is null or ${t.reservationPurpose} in (${quotedSqlList(reservationPurposeSchema.literals)})`
+    ),
+    check(
+      "workspace_reservations_payment_return_target_check",
+      sql`${t.paymentReturnTarget} is null or ${t.paymentReturnTarget} in (${quotedSqlList(paymentReturnTargets)})`
+    ),
+    check(
+      "workspace_reservations_hold_id_check",
+      sql`${t.reservationState} not in (${quotedSqlList(reservationStatesRequiringDotyposReservationId)}) or ${t.dotyposReservationId} is not null`
+    ),
+    check(
+      "workspace_reservations_paid_at_check",
+      sql`${t.paymentState} <> 'paid' or ${t.paidAt} is not null`
+    ),
+    check(
+      "workspace_reservations_agent_selection_check",
+      sql`${t.agentSelectionKey} is null or ${t.agentClientId} is not null`
+    ),
+    check(
+      "workspace_reservations_fulfilled_check",
+      sql`${t.fulfillmentState} <> 'fulfilled' or ${t.fulfilledAt} is not null`
+    ),
+    check(
+      "workspace_reservations_fulfillment_failed_check",
+      sql`${t.fulfillmentState} <> 'failed' or (${t.fulfillmentFailedAt} is not null and ${t.fulfillmentFailureCode} is not null)`
+    ),
+    check(
+      "workspace_reservations_awaiting_delivery_check",
+      sql`${t.fulfillmentState} <> 'awaiting_delivery' or ${t.activeCustomerEmailDeliveryId} is not null`
+    ),
+    check(
+      "workspace_reservations_active_email_delivery_state_check",
+      sql`${t.activeCustomerEmailDeliveryId} is null or ${t.fulfillmentState} in (${quotedSqlList(
+        [
+          "processing",
+          "awaiting_delivery",
+          "failed",
+          "fulfilled",
+        ] satisfies readonly FulfillmentState[]
+      )})`
+    ),
+    uniqueIndex("workspace_reservations_attempt_key_unique_idx").on(
+      t.checkoutAttemptKey
+    ),
+    uniqueIndex(activeCheckoutSessionIndex)
+      .on(t.checkoutSessionKey)
+      .where(sql`${t.reservationState} <> 'cancelled'`),
+    index("workspace_reservations_author_account_idx").on(t.authorAccountId),
+    index("workspace_reservations_agent_selection_idx")
+      .on(t.agentSelectionKey, t.createdAt)
+      .where(sql`${t.agentSelectionKey} is not null`),
+    index("workspace_reservations_checkout_session_idx").on(
+      t.checkoutSessionKey,
+      t.createdAt
+    ),
+    uniqueIndex("workspace_reservations_dotypos_reservation_unique_idx")
+      .on(t.dotyposReservationId)
+      .where(sql`${t.dotyposReservationId} is not null`),
+    uniqueIndex("workspace_reservations_active_email_delivery_unique_idx")
+      .on(t.activeCustomerEmailDeliveryId)
+      .where(sql`${t.activeCustomerEmailDeliveryId} is not null`),
+    index("workspace_reservations_states_idx").on(
+      t.reservationState,
+      t.paymentState,
+      t.fulfillmentState
+    ),
+    index("workspace_reservations_expired_holds_idx")
+      .on(t.reservationHoldExpiresAt)
+      .where(sql`${t.reservationState} = 'held'`),
+    index("workspace_reservations_dotypos_customer_idx").on(
+      t.dotyposCustomerId
+    ),
+  ]
+);
+
+export type WorkspaceReservationRow = typeof workspaceReservations.$inferSelect;

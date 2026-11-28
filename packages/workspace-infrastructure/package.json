@@ -1,0 +1,25 @@
+{
+  "name": "@deskohub/workspace-infrastructure",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "lint": "cd ../.. && biome check packages/workspace-infrastructure",
+    "release": "bun release.run.ts",
+    "test": "bun test",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "dependencies": {
+    "@alchemy.run/gcp": "2.0.0-beta.87",
+    "@deskohub/workspace-cloud-run": "workspace:*",
+    "@deskohub/workspace-rpc": "workspace:*",
+    "@effect/platform-bun": "4.1.4",
+    "@effect/platform-node": "4.1.4",
+    "alchemy": "2.0.0-beta.87",
+    "effect": "4.1.4"
+  },
+  "devDependencies": {
+    "@deskohub/test-email": "workspace:*",
+    "typescript": "npm:@typescript/typescript6@6.0.2"
+  }
+}

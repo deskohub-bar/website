@@ -1,0 +1,27 @@
+# Build context of apps/deskohub-workspace/Dockerfile: the repository root,
+# without dependencies, build output, local environment files or VCS data.
+**/node_modules
+**/.next
+**/.turbo
+**/.vercel
+**/coverage
+**/*.tsbuildinfo
+**/.env
+**/.env.*
+!**/.env.example
+**/*.local*
+**/.DS_Store
+.git
+.github
+.idea
+.vscode
+.opencode
+.playwright-mcp
+.skillopt-sleep
+apps/dhw/dist
+apps/deskohub-mobile/android
+apps/deskohub-mobile/ios
+apps/deskohub-mobile/dist
+apps/deskohub-workspace/test-results
+apps/deskohub-workspace/playwright-report
+apps/deskohub-workspace/public/app

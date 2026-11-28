@@ -1,0 +1,7 @@
+ALTER TABLE "email_campaign_automation_runs" ADD COLUMN "trigger_pass_id" text;--> statement-breakpoint
+ALTER TABLE "email_campaign_automation_runs" ADD COLUMN "pass_reminder_context" jsonb;--> statement-breakpoint
+CREATE UNIQUE INDEX "email_campaign_automation_runs_one_open_customer_run_idx" ON "email_campaign_automation_runs" ("campaign_id","dotypos_customer_id") WHERE "status" <> 'ended' and "trigger_pass_id" is null;--> statement-breakpoint
+CREATE UNIQUE INDEX "email_campaign_automation_runs_one_pass_run_idx" ON "email_campaign_automation_runs" ("trigger_pass_id") WHERE "trigger_pass_id" is not null;--> statement-breakpoint
+ALTER TABLE "email_campaign_automation_runs" ADD CONSTRAINT "email_campaign_automation_runs_uvm3UnjpWtuk_fkey" FOREIGN KEY ("trigger_pass_id") REFERENCES "pass_purchases"("id");--> statement-breakpoint
+ALTER TABLE "email_campaign_automation_runs" ADD CONSTRAINT "email_campaign_automation_runs_pass_trigger_check" CHECK (("trigger_kind" in ('entry-pack-expiring', 'unlimited-ending')) = ("trigger_pass_id" is not null) and ("trigger_pass_id" is null) = ("pass_reminder_context" is null));--> statement-breakpoint
+ALTER TABLE "email_campaign_automation_runs" DROP CONSTRAINT "email_campaign_automation_runs_trigger_kind_check", ADD CONSTRAINT "email_campaign_automation_runs_trigger_kind_check" CHECK ("trigger_kind" in ('schedule', 'reservation-booked', 'reservation-cancelled', 'reservation-started', 'reservation-finished', 'account-created', 'entry-pack-expiring', 'unlimited-ending'));

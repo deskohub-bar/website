@@ -1,0 +1,11 @@
+[Unit]
+Description=Collect Deskohub reports and assign GitHub issues to T3 workers
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Projects/deskohub
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+StateDirectory=deskohub-issue-pool
+UMask=0077
+ExecStart=/usr/bin/flock -n %S/deskohub-issue-pool/pass.lock %h/.bun/bin/bun scripts/issue-pool/service.ts --apply --state %S/deskohub-issue-pool/pool.sqlite --project %h/Projects/deskohub --vercel-fetch-script %h/.agents/skills/vercel-comments/scripts/fetch-comments.sh
+TimeoutStartSec=10min

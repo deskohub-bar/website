@@ -1,0 +1,327 @@
+import "server-only";
+
+import {
+  CustomerRateLimited,
+  CustomerServiceUnavailable,
+  type CustomerSession,
+  type WorkspaceCustomerApiWithTeamTable,
+} from "@deskohub/workspace-customer-api";
+import { Duration, Effect, Match } from "effect";
+import type { HttpApi, HttpApiEndpoint, HttpApiGroup } from "effect/http-api";
+import {
+  RequestBudget,
+  type RequestBudgetPolicy,
+} from "@/shared/backend/request-budget/request-budget.service";
+import { budgetKeyDigest } from "@/shared/backend/request-budget/request-budget-key";
+
+/**
+ * What an endpoint costs beyond its general request budget:
+ * `workspace-only` reads only the Workspace database and Better Auth, or
+ * also calls a public provider whose allowance no site budget tracks;
+ * `catalog-read` reads the booking catalog's shared snapshots;
+ * `account-read`, `dotypos-read` and `dotypos-mutation` may call Dotypos,
+ * whose allowance the whole site shares, and spend that kind's budget.
+ */
+export type CustomerRequestBudgetClass =
+  | "workspace-only"
+  | "catalog-read"
+  | "account-read"
+  | "dotypos-read"
+  | "dotypos-mutation";
+
+type CustomerApiGroup =
+  typeof WorkspaceCustomerApiWithTeamTable extends HttpApi.HttpApi<
+    infer _Id,
+    infer Groups
+  >
+    ? Groups
+    : never;
+
+/** Every endpoint of every group, by group then endpoint name. */
+export type CustomerApiEndpointClassification = {
+  readonly [Group in CustomerApiGroup as HttpApiGroup.Identifier<Group>]: Record<
+    HttpApiEndpoint.Identifier<HttpApiGroup.Endpoints<Group>>,
+    CustomerRequestBudgetClass
+  >;
+};
+
+/**
+ * The budget class of every customer API endpoint. A new endpoint is a type
+ * error here until it is classified. An endpoint is Dotypos-backed when it,
+ * or the account resolution it starts with, can call Dotypos: resolving an
+ * account that isn't linked yet looks its customer up, and may reactivate
+ * an expired one. A Dotypos-backed GET is a read; every other method is a
+ * mutation (`customer-request-budget.test.ts` checks it against the
+ * contract). The account and reservation reads the app repeats, on every
+ * load, every history visit and while a settling order's status polls, are
+ * account reads; the account's other Dotypos-backed reads are Dotypos reads.
+ * The booking catalog's reads are catalog reads: they read the shared
+ * snapshots, which call Dotypos only when they miss, and a booking compares
+ * several dates and prices before it checks out.
+ */
+export const customerRequestBudgetClasses = {
+  account: {
+    // The account's profile, and the lookup that links an unlinked account.
+    getAccount: "account-read",
+    updateProfile: "dotypos-mutation",
+    completeProfile: "dotypos-mutation",
+    // Resolves the account's Dotypos customer the avatar belongs to.
+    uploadAvatar: "dotypos-mutation",
+    removeAvatar: "dotypos-mutation",
+    // Better Auth's own tables.
+    updateLocale: "workspace-only",
+    listPasskeys: "workspace-only",
+    listAssistantConnections: "workspace-only",
+    // Consent belongs to the account's Dotypos customer.
+    getMarketingPreferences: "dotypos-read",
+    saveMarketingPreferences: "dotypos-mutation",
+    // Referral standing and savings follow the account's Dotypos customer.
+    getReferrals: "dotypos-read",
+    acknowledgeSignupReferral: "dotypos-mutation",
+    // The archive reads the Dotypos profile and pages the reservations.
+    getDataExport: "dotypos-read",
+    // Deletion expires the Dotypos customer.
+    requestDeletion: "dotypos-mutation",
+    // The analytics consent ledger and Better Auth; a withdrawal's PostHog
+    // person anonymisation runs after the response and never calls Dotypos.
+    syncAnalyticsConsent: "workspace-only",
+    getAnalyticsPreference: "workspace-only",
+    saveAnalyticsPreference: "workspace-only",
+  },
+  reservations: {
+    // Reservation details are read live from Dotypos; the status refresh
+    // and the door code also call the payment and lock providers, as the
+    // history does for today's door codes, from the records it read.
+    listReservations: "account-read",
+    getReservationStatus: "account-read",
+    getReservationAccess: "account-read",
+    // The invited orders, read live like the history the app loads beside it.
+    listInvitedReservations: "account-read",
+    // Authorizes the booker against the live order, then sends an email.
+    resendInvitation: "dotypos-mutation",
+    // Authorizing the invoice can resolve the account's Dotypos customer.
+    getReservationInvoice: "dotypos-read",
+    // Authorizes like the invoice, then records the page's return target.
+    reopenPaymentPage: "dotypos-mutation",
+    // May book the order's spot again in Dotypos and asks the payment provider.
+    retryPayment: "dotypos-mutation",
+    // The space's address is the site's own constant.
+    getEstablishment: "workspace-only",
+    // Reads the reservation live from Dotypos to price the withdrawal; the
+    // app asks once per withdrawal, never while polling.
+    getWithdrawalQuote: "dotypos-read",
+    // Records the withdrawal, then cancels the Dotypos booking.
+    withdrawFromReservation: "dotypos-mutation",
+  },
+  invoices: {
+    // Authorizing any of these reads can resolve the account's Dotypos
+    // customer; the app reads them when the customer opens the list or
+    // downloads an invoice or a cancelled invoice's credit note.
+    listInvoices: "dotypos-read",
+    getInvoicePdf: "dotypos-read",
+    getCorrectiveDocumentPdf: "dotypos-read",
+  },
+  companies: {
+    // One request to the public business registry (ARES), which needs no
+    // account resolution and no Dotypos call; the general budget bounds it,
+    // as the website's lookup has no budget of its own.
+    lookupCompany: "workspace-only",
+  },
+  passes: {
+    listPassOffers: "workspace-only",
+    listPasses: "dotypos-read",
+    getPassBookingOptions: "workspace-only",
+    getUnlimitedAccess: "account-read",
+    getReservationPassFunding: "workspace-only",
+    resendPassInvitation: "workspace-only",
+    getUnlimitedStartDates: "catalog-read",
+    beginPassPurchase: "dotypos-mutation",
+    getPassPurchaseStatus: "account-read",
+    submitPassPurchase: "dotypos-mutation",
+    updatePassPurchasePrice: "dotypos-mutation",
+  },
+  booking: {
+    // The office's seat maximum reads the shared table snapshot, which
+    // reads Dotypos when it misses.
+    listOfferings: "catalog-read",
+    // The shared table and reservation snapshots, read from Dotypos on a
+    // miss.
+    getAvailability: "catalog-read",
+    getMeetingRoomStartTimes: "catalog-read",
+    getMeetingRoomUnavailableDates: "catalog-read",
+    // An office quote checks the seats against the shared table snapshot.
+    getQuote: "catalog-read",
+    // The published documents' versions.
+    listLegalDocuments: "workspace-only",
+    // A booking spends two to four Dotypos mutations: the hold, an
+    // optional code, the submission, and one retry after a price change.
+    // Removing a code reprices like entering one.
+    createCheckout: "dotypos-mutation",
+    applyCheckoutDiscountCode: "dotypos-mutation",
+    clearCheckoutDiscountCode: "dotypos-mutation",
+    submitCheckout: "dotypos-mutation",
+    // Reseals the signed checkout state only.
+    acceptCheckoutPriceChange: "workspace-only",
+  },
+  teamTable: {
+    listOfferings: "catalog-read",
+    getAvailability: "catalog-read",
+    getSlots: "catalog-read",
+    // Quoting an exact interval reads live capacity before signing.
+    getQuote: "dotypos-read",
+    createCheckout: "dotypos-mutation",
+    getStatus: "account-read",
+    addInvitees: "dotypos-mutation",
+  },
+} as const satisfies CustomerApiEndpointClassification;
+
+/**
+ * Requests one account may make, whatever they cost: a bound for a runaway
+ * or looping client. Opening the account and its sections takes about six
+ * requests, and comparing dates and prices before a booking takes a few per
+ * date, so this leaves room for a busy session, never binds before the
+ * catalog budget, and stops a loop within minutes.
+ */
+const generalBudget = { limit: 120, window: Duration.minutes(10) };
+
+/**
+ * Booking catalog reads one account may make: offerings, availability,
+ * meeting-room start times and quotes. One date costs about three, so this
+ * covers comparing dozens of dates. They read the shared snapshots, which
+ * call Dotypos only when they miss, so they leave the account read budget to
+ * the account and its reservations.
+ */
+const catalogReadBudget = { limit: 120, window: Duration.minutes(10) };
+
+/**
+ * Dotypos-backed requests one account may make, in three budgets so that
+ * neither the app's repeated reads nor its other sections can spend the
+ * allowance its edits, its bookings and its deletion need.
+ *
+ * Account reads: the account, the reservation history, an order's status and
+ * its door code. Opening the app costs two (the account and the history). A
+ * booking costs up to thirteen: the account at the booking screen, the
+ * order's status once and up to nine times more while the payment return
+ * settles, then the history and the door code. Two bookings and a session's
+ * navigation (about ten more account and history loads) come to about 38,
+ * so 40 leaves no room for a third booking's polling; the app stops polling
+ * on its own while fewer than eight reads are left by its own count.
+ *
+ * Dotypos reads: consent, referrals and the invoice, which the app reads
+ * only when their screen or action opens.
+ *
+ * Mutations: editing the profile or the avatar, saving consent, deleting the
+ * account and each checkout step that calls Dotypos. A booking spends up to
+ * four (the hold, a rejected and an applied code, and the submission;
+ * accepting a changed price spends none), so two bookings fit beside the
+ * account's edits.
+ *
+ * The whole site shares 150 Dotypos requests per 30 minutes. A linked
+ * account's request usually costs one or two Dotypos requests: an order's
+ * status reads the reservation once, its door code reads the reservation and
+ * the customer. It costs more when a read pages, when the account's
+ * referral overview reads each invitee's reservations, when a call is
+ * retried (up to three times), and when resolving an unlinked account or
+ * retrying a version conflict. An account that spends all three budgets at
+ * two Dotypos requests each makes about 150 (40 account reads, 20 Dotypos
+ * reads and 15 mutations): with every budget spent, one account can take
+ * the whole allowance, and more on the costlier paths. Catalog reads call
+ * Dotypos only when a shared snapshot misses. These per-account budgets
+ * bound what one account, such as a looping client, can take; they can't
+ * keep the site within the shared allowance, since enough accounts each
+ * within their budgets still exceed it. The site, assistant tools
+ * (`agentTools.spendSignedInCallBudgets`) and other accounts share the
+ * rest.
+ */
+const accountReadBudget = { limit: 40, window: Duration.minutes(30) };
+const dotyposReadBudget = { limit: 20, window: Duration.minutes(30) };
+const dotyposMutationBudget = { limit: 15, window: Duration.minutes(30) };
+
+/**
+ * Spends the account's general budget, then the budget of the endpoint's
+ * class: its catalog, account read, Dotypos read or Dotypos mutation budget,
+ * or none for a workspace-only endpoint. An exhausted budget refuses
+ * the request as rate limited; a budget that can't be checked fails closed.
+ * An endpoint the classification doesn't know spends the mutation budget,
+ * though the type keeps that from happening.
+ */
+export const spendCustomerRequestBudgets = Effect.fn(
+  "customerApi.spendCustomerRequestBudgets"
+)(function* ({
+  session,
+  group,
+  endpoint,
+}: {
+  readonly session: CustomerSession;
+  readonly group: string;
+  readonly endpoint: string;
+}) {
+  const account = digest("account", session.accountId);
+  const policies: RequestBudgetPolicy[] = [
+    { key: `customer-api:account:${account}`, ...generalBudget },
+    ...Match.value(budgetClassOf(group, endpoint)).pipe(
+      Match.withReturnType<RequestBudgetPolicy[]>(),
+      Match.when("workspace-only", () => []),
+      Match.when("catalog-read", () => [
+        {
+          key: `customer-api:catalog-read:account:${account}`,
+          ...catalogReadBudget,
+        },
+      ]),
+      Match.when("account-read", () => [
+        {
+          key: `customer-api:account-read:account:${account}`,
+          ...accountReadBudget,
+        },
+      ]),
+      Match.when("dotypos-read", () => [
+        {
+          key: `customer-api:dotypos-read:account:${account}`,
+          ...dotyposReadBudget,
+        },
+      ]),
+      Match.when("dotypos-mutation", () => [
+        {
+          key: `customer-api:dotypos-mutation:account:${account}`,
+          ...dotyposMutationBudget,
+        },
+      ]),
+      Match.exhaustive
+    ),
+  ];
+  const budget = yield* RequestBudget;
+
+  yield* Effect.forEach(policies, (policy) =>
+    budget.spend(policy).pipe(
+      Effect.tapError(() =>
+        Effect.logWarning("Customer API request budget failed closed.")
+      ),
+      Effect.mapError(() => new CustomerServiceUnavailable()),
+      Effect.flatMap((spend) =>
+        Match.value(spend).pipe(
+          Match.tagsExhaustive({
+            Granted: () => Effect.void,
+            Exhausted: () => Effect.fail(new CustomerRateLimited()),
+          })
+        )
+      )
+    )
+  );
+});
+
+/** The classification by name, for an endpoint the request names at runtime. */
+const budgetClassesByName = new Map(
+  Object.entries(customerRequestBudgetClasses).map(([group, endpoints]) => [
+    group,
+    new Map(Object.entries(endpoints)),
+  ])
+);
+
+const budgetClassOf = (
+  group: string,
+  endpoint: string
+): CustomerRequestBudgetClass =>
+  budgetClassesByName.get(group)?.get(endpoint) ?? "dotypos-mutation";
+
+const digest = (...parts: ReadonlyArray<string>) =>
+  budgetKeyDigest("deskohub-workspace/customer-api-budget", ...parts);

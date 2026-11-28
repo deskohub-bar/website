@@ -1,0 +1,28 @@
+{
+  "name": "@deskohub/email",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "lint": "biome check .",
+    "test": "bun test"
+  },
+  "exports": {
+    ".": "./index.ts",
+    "./testing": "./backend/email-provider.test-utils.ts",
+    "./backend/email-config": "./backend/email-config.ts",
+    "./backend/email-delivery-observer": "./backend/email-delivery-observer.ts",
+    "./backend/email-providers": "./backend/email-providers.ts",
+    "./backend/email-routing": "./backend/email-routing.ts",
+    "./backend/escaping": "./backend/escaping.ts",
+    "./backend/network-error": "./backend/network-error.ts",
+    "./backend/recipient-domain.service": "./backend/recipient-domain.service.ts",
+    "./backend/recipient-domain.service.mock": "./backend/recipient-domain.service.mock.ts",
+    "./backend/service": "./backend/service.ts",
+    "./backend/test-recipients": "./backend/test-recipients.ts",
+    "./types/email.types": "./types/email.types.ts"
+  },
+  "dependencies": {
+    "@deskohub/test-email": "workspace:*",
+    "effect": "4.1.4"
+  }
+}

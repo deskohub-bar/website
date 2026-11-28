@@ -1,0 +1,146 @@
+import { workspaceSiteDomain } from "@deskohub/workspace-admin-api/cowork-booking-link";
+import { WORKSPACE_SITE_TIME_ZONE } from "@deskohub/workspace-admin-api/site-time-zone";
+import type { WorkspaceCurrencyCode } from "../money/currencies";
+
+export interface WorkspacePaymentAccount {
+  readonly accountNumber: string;
+  readonly iban: string;
+  readonly bic: string;
+  readonly bankName: string;
+}
+
+export interface WorkspaceOpeningHours {
+  /** The space is open around the clock, every day. */
+  readonly alwaysOpen: boolean;
+  /** The exclusive Prague-local end of the Open Space service day, if any. */
+  readonly openSpaceUsableUntil?: string | null;
+  /**
+   * An overnight Reserved Desk stay runs from this local time on the arrival
+   * date until the same local time on the next date.
+   */
+  readonly overnightStayChangeover: string;
+}
+
+/**
+ * Whether the company is registered for VAT. The website footer, invoices and
+ * the app's price totals state it from the one setting below.
+ */
+export const vatStatuses = ["not-vat-payer", "vat-payer"] as const;
+export type VatStatus = (typeof vatStatuses)[number];
+
+interface CompanyVatRegistration {
+  readonly vatStatus: VatStatus;
+}
+
+// Typed as the registration, so code reading the status handles both values.
+const companyVatRegistration: CompanyVatRegistration = {
+  /** The company's VAT status; `"vat-payer"` once it registers for VAT. */
+  vatStatus: "not-vat-payer",
+};
+
+export const workspaceSiteConstants = {
+  brand: {
+    name: "Deskohub Workspace",
+    legalName: "Desktechub s.r.o.",
+    domain: workspaceSiteDomain,
+  },
+  contact: {
+    infoEmail: "workspace@deskohub.cz",
+  },
+  location: {
+    address: {
+      street: "Turnovská 430/10",
+      cityDistrict: "Libeň",
+      city: "Praha 8",
+      postalCode: "180 00",
+      country: "CZ",
+    },
+    coordinates: {
+      lat: 50.103277,
+      lng: 14.479023,
+    },
+    timeZone: WORKSPACE_SITE_TIME_ZONE,
+  },
+  openingHours: {
+    alwaysOpen: true,
+    openSpaceUsableUntil: "17:00",
+    overnightStayChangeover: "12:00",
+  } satisfies WorkspaceOpeningHours,
+  reservation: {
+    defaultStartTime: "10:00",
+  },
+  company: {
+    identificationNumber: "24531596",
+    taxIdentificationNumber: "CZ24531596",
+    establishmentId: "1016069146",
+    vatStatus: companyVatRegistration.vatStatus,
+    commercialRegister: {
+      court: "Městský soud v Praze",
+      section: "C",
+      file: "442830",
+    },
+    paymentAccounts: {
+      CZK: {
+        accountNumber: "2303459272/2010",
+        iban: "CZ0620100000002303459272",
+        bic: "FIOBCZPPXXX",
+        bankName: "Fio banka, a.s.",
+      },
+    } satisfies Partial<
+      Readonly<Record<WorkspaceCurrencyCode, WorkspacePaymentAccount>>
+    >,
+  },
+  social: {
+    instagram: "https://www.instagram.com/deskohub/",
+    facebook: "https://www.facebook.com/deskohub",
+  },
+} as const;
+
+export const workspaceSiteOrigin = `https://${workspaceSiteConstants.brand.domain}`;
+
+/** The Deskohub board game bar next door runs its own site. */
+const deskohubBarOrigin = "https://bar.deskohub.cz";
+
+/**
+ * A Deskohub Bar page, such as `/contact`; the bar home by default. Without a
+ * locale, as agent-facing references need, the bar opens in the visitor's
+ * language.
+ */
+export const getDeskohubBarPageUrl = ({
+  locale,
+  pathname = "",
+}: {
+  readonly locale?: string;
+  readonly pathname?: string;
+} = {}) =>
+  locale
+    ? `${deskohubBarOrigin}/${locale}${pathname}`
+    : `${deskohubBarOrigin}${pathname || "/"}`;
+
+type WorkspaceCanonicalSearchParams = ConstructorParameters<
+  typeof URLSearchParams
+>[0];
+
+const normalizePathname = (pathname: string) => {
+  if (pathname === "" || pathname === "/") return "/";
+  return pathname.startsWith("/") ? pathname : `/${pathname}`;
+};
+
+export function getWorkspaceCanonicalUrl(
+  pathname: string | URL = "/",
+  searchParams?: WorkspaceCanonicalSearchParams
+): string {
+  const canonicalPathname =
+    pathname instanceof URL
+      ? `${pathname.pathname}${pathname.search}${pathname.hash}`
+      : normalizePathname(pathname);
+  const url = new URL(canonicalPathname, workspaceSiteOrigin);
+
+  if (searchParams) {
+    for (const [key, value] of new URLSearchParams(searchParams)) {
+      url.searchParams.append(key, value);
+    }
+  }
+
+  return url.toString();
+}

@@ -1,0 +1,39 @@
+{
+  "name": "@deskohub/workspace-telemetry",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./censorship": "./src/censorship.ts",
+    "./cloud-logging": "./src/cloud-logging.ts",
+    "./database-query-parameter-classifier": "./src/database-query-parameter-classifier.ts",
+    "./deployment-identity": "./src/deployment-identity.ts",
+    "./log-classification": "./src/log-classification.ts",
+    "./span-allowlist": "./src/span-allowlist.ts",
+    "./telemetry-policy": "./src/telemetry-policy.ts",
+    "./telemetry-sinks": "./src/telemetry-sinks.ts"
+  },
+  "scripts": {
+    "lint": "cd ../.. && biome check packages/workspace-telemetry",
+    "test": "bun test",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "dependencies": {
+    "@deskohub/cloudinary": "workspace:*",
+    "@effect/opentelemetry": "4.1.4",
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/api-logs": "0.223.0",
+    "@opentelemetry/core": "2.8.0",
+    "@opentelemetry/exporter-logs-otlp-http": "0.223.0",
+    "@opentelemetry/exporter-trace-otlp-http": "0.223.0",
+    "@opentelemetry/resources": "2.12.0",
+    "@opentelemetry/sdk-logs": "0.223.0",
+    "@opentelemetry/sdk-trace-base": "2.12.0",
+    "drizzle-orm": "1.0.0-rc.5",
+    "effect": "4.1.4"
+  },
+  "devDependencies": {
+    "typescript": "npm:@typescript/typescript6@6.0.2"
+  }
+}

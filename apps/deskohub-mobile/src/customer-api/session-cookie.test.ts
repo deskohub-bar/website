@@ -1,0 +1,55 @@
+import { describe, expect, test } from "bun:test";
+import { HttpClientRequest } from "effect/http";
+import { withNativeAuthOrigin, withSessionCookie } from "./session-cookie";
+
+const apiOrigin = "https://workspace.deskohub.test";
+const cookie = "deskohub.session_token=abc";
+
+describe("withSessionCookie", () => {
+  test("keeps the cookie off a request for another origin", () => {
+    const request = withSessionCookie(
+      apiOrigin,
+      cookie
+    )(HttpClientRequest.get("https://elsewhere.test/api/customer/account"));
+
+    expect(request.headers.cookie).toBeUndefined();
+  });
+
+  test("keeps the cookie off a look-alike or protocol-relative host", () => {
+    const attach = withSessionCookie(apiOrigin, cookie);
+
+    expect(
+      attach(
+        HttpClientRequest.get("https://workspace.deskohub.test.evil.test/x")
+      ).headers.cookie
+    ).toBeUndefined();
+    expect(
+      attach(HttpClientRequest.get("//elsewhere.test/x")).headers.cookie
+    ).toBeUndefined();
+  });
+
+  test("attaches the cookie to a path the client will send to the API origin", () => {
+    const request = withSessionCookie(
+      apiOrigin,
+      cookie
+    )(HttpClientRequest.get("/api/customer/account"));
+
+    expect(request.headers.cookie).toBe(cookie);
+  });
+});
+
+describe("withNativeAuthOrigin", () => {
+  const mark = withNativeAuthOrigin(apiOrigin);
+
+  test("leaves reads and other origins unmarked", () => {
+    expect(
+      mark(HttpClientRequest.get(`${apiOrigin}/api/auth/get-session`)).headers[
+        "expo-origin"
+      ]
+    ).toBeUndefined();
+    expect(
+      mark(HttpClientRequest.post("https://elsewhere.test/api/auth/sign-out"))
+        .headers["expo-origin"]
+    ).toBeUndefined();
+  });
+});

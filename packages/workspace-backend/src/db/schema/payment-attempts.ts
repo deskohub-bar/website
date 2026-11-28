@@ -1,0 +1,176 @@
+import type { PaymentAttemptId } from "@deskohub/workspace-domain/features/checkout/checkout-identifiers";
+import type { OrderId } from "@deskohub/workspace-domain/features/order/order";
+import type { WorkspaceReservationId } from "@deskohub/workspace-domain/features/reservation/persistence-contracts";
+import { sql } from "drizzle-orm";
+import {
+  check,
+  index,
+  integer,
+  pgTable,
+  text,
+  uniqueIndex,
+} from "drizzle-orm/pg-core";
+import { instant } from "../instant";
+import { sensitiveText } from "../sensitive-text";
+import { postgresUuidV7 } from "../uuid-v7";
+import { orders } from "./orders";
+import { quotedSqlList } from "./sql-list";
+import { workspaceReservations } from "./workspace-reservations";
+
+export const paymentAttemptStates = [
+  "created",
+  "pending",
+  "paid",
+  "failed",
+  "cancelled",
+  "expired",
+] as const;
+
+export type PaymentAttemptState = (typeof paymentAttemptStates)[number];
+
+/**
+ * `required` marks a paid provider attempt whose money must go back to the
+ * customer. `refunded` records that the provider reported a successful refund of the
+ * attempt's order, whether full or partial.
+ */
+export const paymentRefundStates = [
+  "not_required",
+  "required",
+  "refunded",
+] as const;
+
+export type PaymentRefundState = (typeof paymentRefundStates)[number];
+
+const externalPaymentProviders = ["nexi", "mock", "fio"] as const;
+
+export const paymentProviders = [
+  ...externalPaymentProviders,
+  "internal",
+] as const;
+
+export type PaymentProvider = (typeof paymentProviders)[number];
+
+const paymentAttemptStatesRequiringFailureCode = [
+  "failed",
+  "cancelled",
+  "expired",
+] as const satisfies readonly PaymentAttemptState[];
+
+export const paymentAttempts = pgTable(
+  "payment_attempts",
+  {
+    id: text("id")
+      .primaryKey()
+      .default(postgresUuidV7)
+      .$type<PaymentAttemptId>(),
+    workspaceReservationId: text("workspace_reservation_id")
+      .$type<WorkspaceReservationId>()
+      .references(() => workspaceReservations.id, { onDelete: "cascade" }),
+    /**
+     * The order the attempt pays. For a reservation order it equals
+     * `workspace_reservation_id`. A trigger fills it from the reservation on
+     * insert when the writer leaves it out, which repairs attempts that
+     * writers from before the order key insert during a rolling deployment.
+     */
+    orderId: text("order_id")
+      .notNull()
+      .$type<OrderId>()
+      .references(() => orders.id, { onDelete: "cascade" }),
+    provider: text("provider").notNull().$type<PaymentProvider>(),
+    providerOrderId: text("provider_order_id"),
+    securityToken: sensitiveText("security_token"),
+    state: text("state").notNull().$type<PaymentAttemptState>(),
+    refundState: text("refund_state")
+      .notNull()
+      .default("not_required")
+      .$type<PaymentRefundState>(),
+    /**
+     * The refund owed while `refund_state` is `required`, in the attempt's
+     * minor units, when it is less than everything paid, such as a consumer
+     * withdrawal after part of the service ran. Absent, the whole payment is
+     * owed back and any successful refund settles it.
+     */
+    refundTargetValue: integer("refund_target_value"),
+    /**
+     * Sum of successful provider refunds, in the attempt's minor units: set once
+     * refunded, or while a partial refund owed is still short of its target.
+     */
+    refundedAmountValue: integer("refunded_amount_value"),
+    /** Time of the latest successful Nexi refund. */
+    refundedAt: instant("refunded_at"),
+    /**
+     * When scheduled refund reconciliation last claimed this attempt to check
+     * Nexi, whatever the outcome. Batches take least recently checked attempts
+     * first, so no paid attempt starves the others.
+     */
+    refundCheckedAt: instant("refund_checked_at"),
+    amountValue: integer("amount_value").notNull(),
+    amountExponent: integer("amount_exponent").notNull(),
+    currency: text("currency").notNull(),
+    providerRedirectUrl: sensitiveText("provider_redirect_url"),
+    lastWebhookEventId: text("last_webhook_event_id"),
+    lastProviderOperationId: text("last_provider_operation_id"),
+    lastProviderStatus: text("last_provider_status"),
+    failureCode: text("failure_code"),
+    providerOrderCreatedAt: instant("provider_order_created_at"),
+    createdAt: instant("created_at").notNull().default(sql`now()`),
+    updatedAt: instant("updated_at").notNull().default(sql`now()`),
+  },
+  (t) => [
+    check(
+      "payment_attempts_provider_check",
+      sql`${t.provider} in (${quotedSqlList(paymentProviders)})`
+    ),
+    check(
+      "payment_attempts_state_check",
+      sql`${t.state} in (${quotedSqlList(paymentAttemptStates)})`
+    ),
+    check(
+      "payment_attempts_refund_state_check",
+      sql`${t.refundState} in (${quotedSqlList(paymentRefundStates)}) and (${t.refundState} = 'not_required' or (${t.provider} in (${quotedSqlList(externalPaymentProviders)}) and ${t.state} = 'paid'))`
+    ),
+    check(
+      "payment_attempts_refund_record_check",
+      sql`(${t.refundState} = 'refunded' and ${t.refundedAmountValue} > 0 and ${t.refundedAt} is not null) or (${t.refundState} = 'required' and ${t.refundTargetValue} is not null and ${t.refundedAmountValue} > 0 and ${t.refundedAmountValue} < ${t.refundTargetValue} and ${t.refundedAt} is not null) or (${t.refundState} <> 'refunded' and ${t.refundedAmountValue} is null and ${t.refundedAt} is null)`
+    ),
+    check(
+      "payment_attempts_refund_target_check",
+      sql`${t.refundTargetValue} is null or (${t.refundState} <> 'not_required' and ${t.refundTargetValue} > 0 and ${t.refundTargetValue} <= ${t.amountValue})`
+    ),
+    check("payment_attempts_currency_check", sql`${t.currency} ~ '^[A-Z]{3}$'`),
+    check(
+      "payment_attempts_amount_check",
+      sql`(${t.provider} in (${quotedSqlList(externalPaymentProviders)}) and ${t.amountValue} > 0) or (${t.provider} = 'internal' and ${t.amountValue} = 0)`
+    ),
+    check(
+      "payment_attempts_provider_fields_check",
+      sql`(${t.provider} in (${quotedSqlList(externalPaymentProviders)}) and ${t.providerOrderId} is not null) or (${t.provider} = 'internal' and ${t.providerOrderId} is null and ${t.securityToken} is null and ${t.providerRedirectUrl} is null and ${t.lastWebhookEventId} is null and ${t.lastProviderOperationId} is null and ${t.lastProviderStatus} is null and ${t.providerOrderCreatedAt} is null)`
+    ),
+    check(
+      "payment_attempts_internal_state_check",
+      sql`${t.provider} <> 'internal' or (${t.state} = 'paid' and ${t.failureCode} is null)`
+    ),
+    check(
+      "payment_attempts_failure_code_check",
+      sql`${t.state} not in (${quotedSqlList(paymentAttemptStatesRequiringFailureCode)}) or ${t.failureCode} is not null`
+    ),
+    uniqueIndex("payment_attempts_provider_order_unique_idx").on(
+      t.provider,
+      t.providerOrderId
+    ),
+    index("payment_attempts_workspace_reservation_idx").on(
+      t.workspaceReservationId
+    ),
+    check(
+      "payment_attempts_reservation_order_match_check",
+      sql`${t.workspaceReservationId} is null or ${t.orderId} = ${t.workspaceReservationId}`
+    ),
+    index("payment_attempts_order_idx").on(t.orderId),
+    index("payment_attempts_state_created_idx").on(t.state, t.createdAt),
+    index("payment_attempts_refund_required_idx")
+      .on(t.workspaceReservationId)
+      .where(sql`${t.refundState} = 'required'`),
+  ]
+);
+
+export type PaymentAttemptRow = typeof paymentAttempts.$inferSelect;

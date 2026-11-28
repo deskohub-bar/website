@@ -1,0 +1,21 @@
+{
+  "name": "@deskohub/google-oidc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "lint": "biome check .",
+    "test": "bun test",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "dependencies": {
+    "effect": "4.1.4",
+    "jose": "6.2.12"
+  },
+  "devDependencies": {
+    "@deskohub/test-email": "workspace:*"
+  }
+}

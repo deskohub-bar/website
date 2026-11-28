@@ -1,0 +1,23 @@
+{
+  "name": "@deskohub/workspace-rpc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./testing": "./src/testing.ts"
+  },
+  "scripts": {
+    "lint": "biome check .",
+    "test": "bun test",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "dependencies": {
+    "@deskohub/i18n": "workspace:*",
+    "effect": "4.1.4"
+  },
+  "devDependencies": {
+    "effect-rpc-baseline": "npm:effect@4.1.4",
+    "typescript": "npm:@typescript/typescript6@6.0.2"
+  }
+}

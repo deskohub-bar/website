@@ -1,0 +1,496 @@
+import { describe, expect, mock, spyOn, test } from "bun:test";
+import {
+  act,
+  Children,
+  type ComponentProps,
+  type ReactElement,
+  type ReactNode,
+} from "react";
+import * as Native from "react-native";
+import { expoRouterStandIn } from "../../testing/expo-router-stand-in";
+
+// The bar registers its height with the toasts while its screen has focus;
+// outside a navigator the focus effect does nothing.
+mock.module("expo-router", () =>
+  expoRouterStandIn({ useFocusEffect: () => undefined })
+);
+
+const { clientRoot } = await import("../../testing/client-root");
+const { m } = await import("../../i18n/messages");
+const { formatMoney, formatMoneyReduction } = await import(
+  "../../i18n/money-format"
+);
+const { idleLiveRegionLayout } = await import("../../ui/notice-presentation");
+const { elementTree, find, findAll, flatStyle, hostTree, textOf } =
+  await import("../../ui/testing/element-tree");
+const { ToastProvider } = await import("../../ui/toast");
+const { AvailableWidthContext } = await import("../../ui/viewport");
+const { color, touchTarget } = await import("../../ui/tokens");
+const { Icon } = await import("../../ui/icon");
+const { default: Info } = await import("lucide-react-native/icons/info");
+const { default: CircleAlert } = await import(
+  "lucide-react-native/icons/circle-alert"
+);
+const { czk } = await import("../testing/sample-booking-catalog");
+const { BookingBar } = await import("./booking-bar");
+const { priceBreakdown } = await import("./price-breakdown");
+const { describeOfficePriceLine, describePriceLine } = await import(
+  "./price-line-description"
+);
+const { officeFromPrice } = await import("../family/office-booking-model");
+const { officeOnSale, openSpaceWithCoffee } = await import(
+  "./testing/price-fixtures"
+);
+
+type BarProps = ComponentProps<typeof BookingBar>;
+type Price = NonNullable<BarProps["summary"]>["price"];
+
+const locale = "en-US" as const;
+
+// The unit a screen passes for its from-price; the bar shows it as given.
+const unit = "unit";
+
+const quoted: Price = {
+  kind: "quoted",
+  breakdown: priceBreakdown(openSpaceWithCoffee.summary),
+  describeLine: describePriceLine(openSpaceWithCoffee.selection, locale),
+  was: czk(340),
+};
+
+const props = (overrides: Partial<BarProps> = {}): BarProps => ({
+  summary: { title: "Thu 26 Nov", detail: "Open Space desk", price: quoted },
+  action: { label: "Continue", onPress: () => undefined },
+  locale,
+  ...overrides,
+});
+
+const withToasts = (node: ReactNode) => <ToastProvider>{node}</ToastProvider>;
+
+const bar = (overrides: Partial<BarProps> = {}) =>
+  hostTree(elementTree(BookingBar, props(overrides), withToasts));
+
+const wideBar = (overrides: Partial<BarProps>, fontScale = 1) => {
+  const dimensions = spyOn(Native, "useWindowDimensions").mockReturnValue({
+    width: 840,
+    height: 900,
+    scale: 2,
+    fontScale,
+  });
+  try {
+    return hostTree(
+      elementTree(BookingBar, props(overrides), (node) => (
+        <AvailableWidthContext value={728}>
+          {withToasts(node)}
+        </AvailableWidthContext>
+      ))
+    );
+  } finally {
+    dimensions.mockRestore();
+  }
+};
+
+const chevronOf = (tree: ReactNode) =>
+  findAll(tree, "Pressable").find(
+    (press) => press.props["aria-expanded"] !== undefined
+  );
+
+const priceRowsOf = (tree: ReactNode) =>
+  findAll(find(tree, "ScrollView"), "View").filter(
+    (view) => view.props.accessible === true
+  );
+
+/** The live region under the action. */
+const reasonOf = (tree: ReactNode) =>
+  findAll(tree, "View")
+    .filter((view) => view.props.role === "status")
+    .at(-1);
+
+describe("BookingBar", () => {
+  test("discloses the price beside the action when the available width fits", () => {
+    const collapsed = wideBar({});
+    expect(flatStyle(find(collapsed, "View")?.props.style).width).toBe(680);
+    expect(
+      flatStyle(find(wideBar({ contentWidth: "form" }), "View")?.props.style)
+        .width
+    ).toBe(640);
+    const toggle = chevronOf(collapsed);
+    expect(toggle?.props["aria-expanded"]).toBe(false);
+    expect(flatStyle(toggle?.props.style).minHeight).toBe(touchTarget);
+    expect(findAll(toggle, "Text").map(textOf)).toContain(
+      m.booking_review_total({}, { locale })
+    );
+    expect(
+      chevronOf(wideBar({ initiallyOpen: true }))?.props["aria-expanded"]
+    ).toBe(true);
+    expect(flatStyle(chevronOf(wideBar({}, 2))?.props.style).height).toBe(
+      touchTarget
+    );
+  });
+
+  test("keeps the checkout reason at the start when the review has no summary", () => {
+    const reason = reasonOf(
+      wideBar({ summary: undefined, reason: "Agreement required" })
+    );
+    expect(flatStyle(reason?.props.style).justifyContent).toBe("flex-start");
+    expect(findAll(reason, "Text").map(textOf)).toContain("Agreement required");
+  });
+
+  test("shows the quoted total with the earlier price struck above it", () => {
+    const texts = findAll(bar(), "Text").map(textOf);
+    const total = formatMoney(czk(282), locale);
+    const was = formatMoney(czk(340), locale);
+    expect(texts).toContain(total);
+    expect(texts.indexOf(was)).toBe(texts.indexOf(total) - 1);
+    const struck = findAll(bar(), "Text").find((text) => textOf(text) === was);
+    expect(flatStyle(struck?.props.style).textDecorationLine).toBe(
+      "line-through"
+    );
+  });
+
+  test("the summary's lines wrap at large text sizes; none is cut", () => {
+    const texts = findAll(bar(), "Text").filter(
+      (text) => text.props.numberOfLines !== undefined
+    );
+    expect(texts).toEqual([]);
+  });
+
+  test("a quoted price has a collapsed toggle named for showing the details", () => {
+    const tree = bar();
+    const chevron = chevronOf(tree);
+    expect(chevron?.props["aria-expanded"]).toBe(false);
+    expect(chevron?.props["aria-label"]).toBe(
+      m.booking_price_show_details({}, { locale })
+    );
+    // No line rows: each reads as one accessible item.
+    expect(findAll(tree, "View").some((v) => v.props.accessible)).toBe(false);
+  });
+
+  test("opened, it lists the lines above the summary and offers to hide them", () => {
+    const host = bar({ initiallyOpen: true });
+    const amount = formatMoney(czk(290), locale);
+    const texts = findAll(host, "Text").map(textOf);
+    expect(texts).toContain(amount);
+    expect(texts).toContain("Thu 26 Nov");
+    expect(texts.indexOf(amount)).toBeLessThan(texts.indexOf("Thu 26 Nov"));
+    expect(findAll(find(host, "ScrollView"), "Text").map(textOf)).not.toContain(
+      formatMoney(czk(282), locale)
+    );
+    const chevron = chevronOf(host);
+    expect(chevron?.props["aria-expanded"]).toBe(true);
+    expect(chevron?.props["aria-label"]).toBe(
+      m.booking_price_hide_details({}, { locale })
+    );
+    expect(flatStyle(find(host, "View")?.props.style).borderTopLeftRadius).toBe(
+      20
+    );
+  });
+
+  test("the opened list scrolls within a share of the window", () => {
+    const host = bar({ initiallyOpen: true });
+    const list = find(host, "ScrollView");
+    expect(findAll(list, "View").some((v) => v.props.accessible)).toBe(true);
+    const { maxHeight } = flatStyle(list?.props.style);
+    expect(maxHeight).toBeGreaterThan(0);
+    expect(maxHeight).toBeLessThan(780);
+  });
+
+  test("the price's status region stays mounted, idle until the price updates", () => {
+    const statuses = findAll(bar(), "View").filter(
+      (view) => view.props.role === "status"
+    );
+    // The price's region, then the reason's.
+    expect(statuses).toHaveLength(2);
+    expect(flatStyle(statuses[0]?.props.style)).toMatchObject(
+      idleLiveRegionLayout
+    );
+    expect(findAll(statuses[0], "Text").map(textOf)).toEqual([""]);
+  });
+
+  test("the arrow's own target is a full touch target, above what it overlaps", () => {
+    const tree = bar();
+    const chevron = chevronOf(tree);
+    expect(flatStyle(chevron?.props.style).height).toBe(touchTarget);
+    expect(chevron?.props.hitSlop).toBeUndefined();
+    // The strip is the View right around the arrow.
+    const strip = findAll(tree, "View").find((view) =>
+      Children.toArray(view.props.children).some(
+        (child) =>
+          (child as ReactElement<{ "aria-expanded"?: boolean }>).props?.[
+            "aria-expanded"
+          ] !== undefined
+      )
+    );
+    const own = flatStyle(strip?.props.style);
+    expect(own.zIndex).toBeGreaterThan(0);
+    // Whatever follows starts where the board's strip ends.
+    expect(touchTarget + Number(own.marginBottom)).toBe(20 - 6);
+  });
+
+  test("a from-price shows its unit and does not open", () => {
+    const tree = bar({
+      summary: {
+        title: "Open Space desk",
+        price: {
+          kind: "from",
+          amount: czk(232),
+          was: czk(290),
+          unit,
+        },
+      },
+      initiallyOpen: true,
+    });
+    expect(chevronOf(tree)).toBeUndefined();
+    expect(findAll(tree, "Text").map(textOf)).toContain(unit);
+    expect(
+      findAll(tree, "Pressable").find((press) => press.props.disabled === true)
+    ).toBeDefined();
+  });
+
+  test("an itemized from-price keeps its total and unit when expanded", () => {
+    const fromPrice: Price = {
+      kind: "from",
+      amount: czk(282),
+      unit,
+      itemized: {
+        breakdown: priceBreakdown(openSpaceWithCoffee.summary),
+        describeLine: describePriceLine(openSpaceWithCoffee.selection, locale),
+      },
+    };
+    const host = bar({
+      summary: { title: "Open Space desk", price: fromPrice },
+      initiallyOpen: true,
+    });
+    expect(chevronOf(host)?.props["aria-expanded"]).toBe(true);
+    const shown = findAll(host, "Text").map(textOf);
+    expect(shown).toContain(formatMoney(czk(282), locale));
+    expect(shown).toContain(unit);
+    const rows = priceRowsOf(host);
+    expect(rows.map((row) => findAll(row, "Text").map(textOf).at(-1))).toEqual([
+      formatMoney(czk(290), locale),
+      formatMoneyReduction(czk(58), locale),
+      formatMoney(czk(50), locale),
+    ]);
+    expect(rows.map((row) => flatStyle(row.props.style).alignItems)).toEqual([
+      "flex-start",
+      "flex-start",
+      "flex-start",
+    ]);
+  });
+
+  test("an office from-price during a sale opens to its base lines, then the sale's discount line", () => {
+    const breakdown = officeFromPrice(officeOnSale);
+    if (breakdown._tag === "None") throw new Error("Expected sale lines");
+    const fromPrice: Price = {
+      kind: "from",
+      amount: officeOnSale.advertisedPrice.price,
+      unit,
+      itemized: {
+        breakdown: breakdown.value,
+        describeLine: describeOfficePriceLine(locale, officeOnSale.name),
+      },
+    };
+    const host = bar({
+      summary: { title: "Private office", price: fromPrice },
+      initiallyOpen: true,
+    });
+    const lines = priceRowsOf(host).map((row) =>
+      findAll(row, "Text").map(textOf)
+    );
+    expect(lines.map((line) => line.at(-1))).toEqual([
+      formatMoney(czk(530), locale),
+      formatMoney(czk(315), locale),
+      formatMoneyReduction(czk(84.5), locale),
+    ]);
+    expect(lines.at(-1)).toContain("Calendar discount");
+    expect(findAll(host, "Text").map(textOf)).toContain(
+      formatMoney(officeOnSale.advertisedPrice.price, locale)
+    );
+  });
+
+  test("updating shows the indicator in an announced status, and no total", () => {
+    const tree = elementTree(
+      BookingBar,
+      props({
+        summary: { title: "Thu 26 Nov", price: { kind: "updating" } },
+      }),
+      withToasts
+    );
+    const host = hostTree(tree);
+    const status = findAll(host, "View").find(
+      (view) =>
+        view.props.role === "status" && view.props["aria-live"] === "polite"
+    );
+    expect(status).toBeDefined();
+    expect(findAll(status, "Text").map(textOf)).toContain(
+      m.booking_price_updating({}, { locale })
+    );
+    expect(chevronOf(host)).toBeUndefined();
+    expect(findAll(host, "Text").map(textOf)).not.toContain(
+      formatMoney(czk(282), locale)
+    );
+  });
+
+  test("the reason sits under the action in a polite live region", () => {
+    const tree = bar({
+      action: { label: "Continue", onPress: () => undefined, disabled: true },
+      reason: "why",
+    });
+    const reason = reasonOf(tree);
+    expect(reason?.props["aria-live"]).toBe("polite");
+    expect(reason?.props.accessibilityLiveRegion).toBe("polite");
+    expect(findAll(reason, "Text").map(textOf)).toEqual(["why"]);
+    const texts = findAll(tree, "Text").map(textOf);
+    expect(texts).toContain("Continue");
+    expect(texts.indexOf("Continue")).toBeLessThan(texts.indexOf("why"));
+  });
+
+  test("the reason's tone picks its icon and ink", () => {
+    // The bar's last part is the reason; render it one level deep, so its
+    // icon is still the Icon element.
+    const iconsOf = (tone: "info" | "plain" | "error") => {
+      const parts = Children.toArray(
+        (
+          elementTree(
+            BookingBar,
+            props({ reason: "why", reasonTone: tone }),
+            withToasts
+          ) as ReactElement<{ children: ReactNode }>
+        ).props.children
+      ) as ReadonlyArray<ReactElement<Record<string, unknown>>>;
+      const reason = parts.at(-1);
+      if (reason === undefined || typeof reason.type !== "function") return [];
+      const shallow = elementTree(
+        reason.type as (props: Record<string, unknown>) => ReactNode,
+        reason.props
+      );
+      return findAll(shallow, Icon).map(
+        (icon) => (icon.props as { icon: unknown }).icon
+      );
+    };
+    expect(iconsOf("info")).toEqual([Info]);
+    expect(iconsOf("plain")).toEqual([]);
+    expect(iconsOf("error")).toEqual([CircleAlert]);
+    const errorText = findAll(
+      reasonOf(bar({ reason: "why", reasonTone: "error" })),
+      "Text"
+    )[0];
+    expect(flatStyle(errorText?.props.style)).toMatchObject({
+      color: color.dangerInk,
+    });
+  });
+
+  test("without a reason the region stays mounted, out of the layout", () => {
+    const reason = reasonOf(bar());
+    expect(flatStyle(reason?.props.style)).toMatchObject(idleLiveRegionLayout);
+  });
+
+  test("without a summary the bar is the action and its reason alone", () => {
+    const host = bar({ summary: undefined, reason: "why" });
+    expect(findAll(host, "Text").map(textOf).filter(Boolean)).toEqual([
+      "Continue",
+      "why",
+    ]);
+    expect(chevronOf(host)).toBeUndefined();
+    expect(findAll(host, "Pressable").map((press) => press.props.role)).toEqual(
+      ["button"]
+    );
+    expect(flatStyle(find(host, "View")?.props.style).paddingTop).toBe(12);
+  });
+});
+
+describe("BookingBar opening and closing", () => {
+  const { render } = clientRoot();
+
+  /** Renders the bar as a live component and hands back its latest tree. */
+  const live = async (initial: BarProps) => {
+    let tree: ReactNode = null;
+    const Probe = (barProps: BarProps) => {
+      tree = BookingBar(barProps);
+      return null;
+    };
+    const show = (barProps: BarProps) =>
+      render(withToasts(<Probe {...barProps} />));
+    await show(initial);
+    return { tree: () => hostTree(tree), show };
+  };
+
+  const isOpen = (tree: ReactNode) =>
+    chevronOf(tree)?.props["aria-expanded"] === true;
+
+  const press = (handler: unknown) =>
+    act(async () => (handler as () => void)());
+
+  test("the toggle and the summary both open and close it", async () => {
+    const bar = await live(props());
+    await press(chevronOf(bar.tree())?.props.onPress);
+    expect(isOpen(bar.tree())).toBe(true);
+    const summary = findAll(bar.tree(), "Pressable").find(
+      (pressable) => pressable.props.accessible === false
+    );
+    await press(summary?.props.onPress);
+    expect(isOpen(bar.tree())).toBe(false);
+  });
+
+  const startSwipe = (tree: ReactNode) => {
+    const handlers = findAll(tree, "View").find(
+      (view) => view.props.onResponderRelease !== undefined
+    )?.props as Record<string, (event: unknown) => unknown>;
+    const at = (pageY: number, pageX: number) => ({
+      nativeEvent: { pageX, pageY },
+    });
+    expect(handlers.onStartShouldSetResponderCapture?.(at(300, 0))).toBe(false);
+    return {
+      move: (dy: number, dx = 0) =>
+        handlers.onMoveShouldSetResponderCapture?.(at(300 + dy, dx)),
+      release: (dy: number, dx = 0) =>
+        act(async () => {
+          handlers.onResponderRelease?.(at(300 + dy, dx));
+        }),
+    };
+  };
+
+  test("a swipe up opens it and a swipe down closes it", async () => {
+    const bar = await live(props());
+    const swipe = async (dy: number) => {
+      const gesture = startSwipe(bar.tree());
+      expect(gesture.move(dy / 2)).toBe(true);
+      await gesture.release(dy);
+    };
+    await swipe(-40);
+    expect(isOpen(bar.tree())).toBe(true);
+    await swipe(40);
+    expect(isOpen(bar.tree())).toBe(false);
+  });
+
+  test.each([false, true])(
+    "rejected gestures preserve expansion when initially open is %s",
+    async (initiallyOpen) => {
+      const bar = await live(props({ initiallyOpen }));
+      expect(isOpen(bar.tree())).toBe(initiallyOpen);
+      const short = startSwipe(bar.tree());
+      expect(short.move(-4)).toBe(false);
+      expect(short.move(16, 30)).toBe(false);
+      expect(short.move(-12)).toBe(true);
+      await short.release(-12);
+      expect(isOpen(bar.tree())).toBe(initiallyOpen);
+
+      const sideways = startSwipe(bar.tree());
+      expect(sideways.move(-16, 2)).toBe(true);
+      await sideways.release(-40, -60);
+      expect(isOpen(bar.tree())).toBe(initiallyOpen);
+    }
+  );
+
+  test("it closes when the price stops being quoted", async () => {
+    const bar = await live(props({ initiallyOpen: true }));
+    expect(isOpen(bar.tree())).toBe(true);
+    await bar.show(
+      props({ summary: { title: "Thu 26 Nov", price: { kind: "updating" } } })
+    );
+    expect(findAll(bar.tree(), "View").some((v) => v.props.accessible)).toBe(
+      false
+    );
+    await bar.show(props());
+    expect(isOpen(bar.tree())).toBe(false);
+  });
+});

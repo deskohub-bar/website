@@ -1,0 +1,159 @@
+name: Workspace E2E PR flows
+
+# Validates the required `## E2E flows` section whenever an open PR is opened,
+# edited, reopened, marked ready for review, or pushed (`synchronize`), and
+# immediately fails `Workspace E2E` and dispatches missing flows when an
+# internal PR edit adds flows that have not passed on the current head SHA.
+#
+# Runs on pull_request_target without ever checking out or executing PR code.
+# Validation runs for every open PR (including drafts, forks, Dependabot, and
+# new head pushes) with minimal permissions and never posts success for
+# ineligible PRs. Dispatching runs and resolving previews are restricted to
+# internal, non-draft, non-Dependabot PRs in the source repository.
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, ready_for_review, synchronize]
+
+permissions: {}
+
+concurrency:
+  group: workspace-e2e-pr-sync-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  validate-pr-e2e-flows:
+    if: >-
+      github.repository_id == '1015951989' &&
+      github.event.pull_request.state == 'open'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    outputs:
+      eligible_internal: ${{ steps.validate.outputs.eligible_internal }}
+      head_ref: ${{ steps.validate.outputs.head_ref }}
+      head_sha: ${{ steps.validate.outputs.head_sha }}
+      requested_flows: ${{ steps.validate.outputs.requested_flows }}
+    steps:
+      # Only the workflow commit's flow parser is checked out, never PR code.
+      - name: Checkout E2E flow parser for validation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .workspace-e2e-flows
+          persist-credentials: false
+          sparse-checkout: .github/actions/workspace-e2e-flows
+
+      - name: Validate PR description E2E flows
+        id: validate
+        env:
+          FLOWS_CLI: .workspace-e2e-flows/.github/actions/workspace-e2e-flows/cli.mjs
+          GH_TOKEN: ${{ github.token }}
+          INVALID_FLOWS_DESCRIPTION: 'Invalid or missing ## E2E flows in PR description; list valid flows, all, or none'
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          repo="repos/$GITHUB_REPOSITORY"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+          pr="$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "$repo/pulls/$PR_NUMBER")"
+          if ! jq -e '.state == "open"' <<<"$pr" >/dev/null; then
+            echo "PR #$PR_NUMBER is no longer open"
+            echo "eligible_internal=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          head_sha="$(jq -r '.head.sha' <<<"$pr")"
+          head_ref="$(jq -r '.head.ref' <<<"$pr")"
+          pr_body="$(jq -r '.body // ""' <<<"$pr")"
+
+          if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "PR #$PR_NUMBER head SHA is invalid" >&2
+            exit 1
+          fi
+          if ! git check-ref-format --branch "$head_ref" >/dev/null; then
+            echo "PR #$PR_NUMBER head ref is invalid" >&2
+            exit 1
+          fi
+
+          if ! parsed="$(PR_BODY="$pr_body" node "$FLOWS_CLI" parse-pr-body)"; then
+            error_message="$(jq -r '.error // "Invalid ## E2E flows section"' <<<"$parsed" 2>/dev/null || echo "Invalid ## E2E flows section")"
+            echo "$error_message" >&2
+            echo "Workspace E2E flow check failed for PR #$PR_NUMBER: $error_message" >> "$GITHUB_STEP_SUMMARY"
+            gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "$repo/statuses/$head_sha" \
+              -f state=failure \
+              -f context='Workspace E2E' \
+              -f description="$INVALID_FLOWS_DESCRIPTION" \
+              -f target_url="$run_url" \
+              >/dev/null
+            exit 1
+          fi
+
+          requested_flows="$(jq -r '.flows' <<<"$parsed")"
+          eligible_internal="false"
+          if jq -e \
+            --arg repo "$GITHUB_REPOSITORY" \
+            '.draft == false and
+             .head.repo.full_name == $repo and
+             .user.login != "dependabot[bot]" and
+             (.head.ref | startswith("dependabot/") | not)' \
+            <<<"$pr" >/dev/null; then
+            eligible_internal="true"
+          fi
+
+          {
+            echo "eligible_internal=$eligible_internal"
+            echo "head_ref=$head_ref"
+            echo "head_sha=$head_sha"
+            echo "requested_flows=$requested_flows"
+          } >> "$GITHUB_OUTPUT"
+          echo "PR #$PR_NUMBER requests Workspace E2E flows: \`$requested_flows\`" >> "$GITHUB_STEP_SUMMARY"
+
+  sync-pr-e2e-flows:
+    needs: validate-pr-e2e-flows
+    if: >-
+      github.repository_id == '1015951989' &&
+      github.event.action != 'synchronize' &&
+      github.event.pull_request.state == 'open' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      !startsWith(github.event.pull_request.head.ref, 'dependabot/') &&
+      needs.validate-pr-e2e-flows.outputs.eligible_internal == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+      deployments: read
+      pull-requests: read
+      statuses: write
+    steps:
+      # Only the workflow commit's flow parser is checked out, never PR code.
+      - name: Checkout E2E flow parser
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .workspace-e2e-flows
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/workspace-e2e-flows
+            .github/actions/workspace-backend-preview
+
+      - name: Sync Workspace E2E flows with PR description
+        env:
+          FLOWS_PUBLISH: .workspace-e2e-flows/.github/actions/workspace-e2e-flows/publish-status.mjs
+          GH_TOKEN: ${{ github.token }}
+          PILOT_PR_NUMBER: ${{ vars.WORKSPACE_BACKEND_PREVIEW_PR }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PREVIEW_ENVIRONMENT: 'Preview – deskohub-workspace-site'
+        run: |
+          set -euo pipefail
+          node "$FLOWS_PUBLISH" sync-pr-flows

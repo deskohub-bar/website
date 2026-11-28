@@ -1,0 +1,3141 @@
+import {
+  type AdministrationBookingQueryType,
+  AdministrationCanonicalPromotionCode,
+  type AdministrationCustomerQueryType,
+  AdministrationDiscountCodeId,
+  type AdministrationDiscountDefinitionInputType,
+  AdministrationDiscountMutation,
+  type AdministrationDiscountMutationType,
+  AdministrationDotyposCustomerId,
+  AdministrationDotyposDiscountGroupId,
+  AdministrationDotyposReservationId,
+  AdministrationInstant,
+  AdministrationInvoiceCreateFileInput,
+  AdministrationInvoiceId,
+  AdministrationInvoiceQuery,
+  AdministrationNexiOperationId,
+  AdministrationNexiOrderId,
+  type AdministrationOperationQueryType,
+  type AdministrationOrderQueryType,
+  type AdministrationOverviewCountType,
+  type AdministrationOverviewMetricType,
+  type AdministrationReservationAccessGrantType,
+  type AdministrationReservationAccessMutationType,
+  AdministrationReservationAuditQuery,
+  type AdministrationReservationAuthorType,
+  AdministrationReservationFamily,
+  AdministrationReservationListStatusFilter,
+  type AdministrationReservationProductDetailsBackfillBatchType,
+  AdministrationReservationQuery,
+  type AdministrationReservationRestorationResultType,
+  type AdministrationReservationSummaryType,
+  AdministrationServiceDate,
+  type AdministrationServiceDateType,
+  AdministrationStandaloneAccessCodeAttemptId,
+  type AdministrationStandaloneAccessCodeAttemptIdType,
+  AdministrationStandaloneAccessCodeCreateInput,
+  type AdministrationStandaloneAccessCodeCreateInputType,
+  type AdministrationStandaloneAccessCodeCreationOutcomeType,
+  AdministrationStandaloneAccessCodeName,
+  AdministrationStoredDiscountId,
+  AdministrationVoucherId,
+  type AdministrationWorkspaceProductTargetType,
+  AdministrationWorkspaceReservationId,
+  type AdministrationWorkspaceReservationIdType,
+  AdministrationWorkspaceSiteLocalWholeHourDateTime,
+  administrationInputParseOptions,
+  type CliAccessTokenType,
+  CliClientName,
+  CliMutationRejected,
+  CliMutationUncertain,
+  type CliSessionAdministrationType,
+  CliSessionId,
+  CliStandaloneAccessCodeCleanupRequired,
+  CliStandaloneAccessCodeReconciled,
+  makeCliAuthenticationChallenge,
+  makeCliAuthenticationVerifier,
+  WORKSPACE_SITE_TIME_ZONE,
+} from "@deskohub/workspace-admin-api";
+import {
+  BigDecimal,
+  Clock,
+  Console,
+  Data,
+  Effect,
+  FileSystem,
+  Option,
+  type Redacted,
+  Schema,
+  SchemaGetter,
+} from "effect";
+import { Argument, Command, Flag } from "effect/cli";
+import { AccessCodeAttemptStore } from "./access-codes/access-code-attempt-store.service";
+import { administratorsCommand } from "./administrators/administrators.command";
+import { WorkspaceAdminApiClient } from "./api/workspace-admin-api-client.service";
+import { AuthenticationService } from "./authentication/authentication.service";
+import {
+  describeSessionExpiry,
+  reportAuthenticationGranted,
+  reportAuthenticationStarted,
+} from "./authentication/authentication-output";
+import { ClientIdentity } from "./authentication/client-identity.service";
+import { automationsCommand } from "./automations/automations.command";
+import { calendarCommand } from "./automations/calendar.command";
+import { DHW_BUILD_TARGET, DHW_VERSION } from "./build-info";
+import { campaignsCommand } from "./campaigns/campaigns.command";
+import { presentFlagValues } from "./command-flags";
+import {
+  AuthenticationRequiredError,
+  confirmationFlag,
+  confirmChange,
+  confirmChangeShowingConsequences,
+  InvalidMutationInputError,
+  makeMutationRequestId,
+  reportCancellation,
+  rootCommand,
+  runAuthenticatedCommand,
+  runCommand,
+} from "./command-runtime";
+import { DhwConfig } from "./config/dhw-config.service";
+import {
+  formatCustomerContact,
+  formatCustomerSummaryRow,
+} from "./customer-output";
+import {
+  formatCodeBenefit,
+  formatCodeRow,
+  formatDiscountAdjustment,
+  formatMoney,
+  formatMutationResult,
+  formatProductTarget,
+  formatPromotionDetailLines,
+  formatServiceDatesLine,
+} from "./discount-output";
+import {
+  formatInvoiceArchiveOutput,
+  formatInvoiceCancellation,
+  formatInvoiceCancellationOutput,
+  formatInvoiceResendOutput,
+  formatReservationInvoiceOutput,
+  formatRestorationInvoiceOutput,
+  getInvoiceStateLabel,
+  planInvoiceCancellation,
+  planReservationInvoiceConsequences,
+  planRestorationInvoiceConsequence,
+} from "./invoice-output";
+import {
+  formatProviderListSummary,
+  formatProviderOperationRow,
+  formatProviderOrderRow,
+} from "./payment-provider-output";
+import { pollUntil } from "./polling";
+import { updateCommand } from "./update.command";
+
+const versionCommand = Command.make("version", {}, () =>
+  runCommand((json) =>
+    Console.log(
+      json
+        ? JSON.stringify({ version: DHW_VERSION, target: DHW_BUILD_TARGET })
+        : `dhw ${DHW_VERSION} (${DHW_BUILD_TARGET})`
+    )
+  )
+).pipe(
+  Command.withDescription(
+    "Show CLI version and build target; bundled administration contracts match this version"
+  )
+);
+
+const apiInfoCommand = Command.make("info", {}, () =>
+  runCommand((json) =>
+    Effect.gen(function* () {
+      const client = yield* WorkspaceAdminApiClient;
+      const info = yield* client.getInfo;
+
+      yield* Console.log(
+        json
+          ? JSON.stringify(info)
+          : `${info.service} administration API ${info.apiVersion}`
+      );
+    })
+  )
+).pipe(Command.withDescription("Check the administration API contract"));
+
+const apiCommand = Command.make("api").pipe(
+  Command.withDescription("Inspect the administration API"),
+  Command.withSubcommands([apiInfoCommand])
+);
+
+const overviewCommand = Command.make("overview", {}, () =>
+  runAuthenticatedCommand((api, accessToken, json) =>
+    Effect.gen(function* () {
+      const overview = yield* api.getOverview(accessToken);
+      if (json) {
+        yield* Console.log(JSON.stringify(overview));
+        return;
+      }
+      yield* Console.log(
+        [
+          formatOverviewMetric("Today", overview.today),
+          formatOverviewMetric("Upcoming", overview.upcoming),
+          formatOverviewMetric("Last 7 days", overview.lastSevenDays),
+          formatOverviewCount(
+            "Customers in the last 7 days",
+            overview.uniqueCustomers
+          ),
+          formatOverviewCount(
+            "New customers in the last 7 days",
+            overview.newCustomers
+          ),
+          formatOverviewCount(
+            "Reservations needing a refund",
+            overview.refundAttention
+          ),
+        ].join("\n")
+      );
+    })
+  )
+).pipe(Command.withDescription("Show the administration overview"));
+
+const reservationsListCommand = Command.make(
+  "list",
+  {
+    customer: Flag.String("customer").pipe(
+      Flag.optional,
+      Flag.withDescription("Filter by customer ID")
+    ),
+    date: Flag.String("date").pipe(
+      Flag.optional,
+      Flag.withDescription("Filter by reservation date (YYYY-MM-DD)")
+    ),
+    direction: Flag.Literals("direction", ["asc", "desc"]).pipe(
+      Flag.optional,
+      Flag.withDescription("Sort direction")
+    ),
+    page: Flag.Int("page").pipe(
+      Flag.optional,
+      Flag.withDescription("Results page")
+    ),
+    sort: Flag.Literals("sort", [
+      "created",
+      "date",
+      "reservation",
+      "status",
+    ]).pipe(Flag.optional, Flag.withDescription("Sort field")),
+    status: Flag.Literals(
+      "status",
+      AdministrationReservationListStatusFilter.literals
+    ).pipe(
+      Flag.optional,
+      Flag.withDescription(
+        "Reservation status. Use needs_attention for refunds owed or failing withdrawal settlements."
+      )
+    ),
+    type: Flag.Literals("type", AdministrationReservationFamily.literals).pipe(
+      Flag.optional,
+      Flag.withDescription("Reservation type")
+    ),
+  },
+  ({ customer, date, direction, page, sort, status, type }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const query = yield* Schema.decodeUnknownEffect(
+          AdministrationReservationQuery,
+          { reportInput: true }
+        )(
+          presentFlagValues({
+            customerId: customer,
+            date,
+            direction,
+            page,
+            sort,
+            status,
+            type,
+          })
+        );
+        const result = yield* api.listReservations(accessToken, query);
+        if (json) {
+          yield* Console.log(JSON.stringify(result));
+          return;
+        }
+        yield* Console.log(
+          `Reservations: ${result.total} total · page ${result.page}/${result.pageCount}`
+        );
+        for (const reservation of result.items) {
+          yield* Console.log(formatReservationRow(reservation));
+        }
+      })
+    )
+).pipe(Command.withDescription("List and filter reservations"));
+
+const reservationsGetCommand = Command.make(
+  "get",
+  {
+    reservationId: Argument.String("reservation-id").pipe(
+      Argument.withSchema(AdministrationWorkspaceReservationId)
+    ),
+  },
+  ({ reservationId }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const detail = yield* api.getReservation(accessToken, reservationId);
+        if (json) {
+          yield* Console.log(JSON.stringify(detail));
+          return;
+        }
+        const reservation = detail.reservation;
+        yield* Console.log(
+          [
+            reservation.id,
+            reservation.date ?? reservation.startsAt ?? "Unknown date",
+            reservation.typeLabel,
+            reservation.customer?.displayName ?? reservation.customerId,
+            reservation.status.label,
+          ].join("\t")
+        );
+        if (reservation.setupStartsAt) {
+          yield* Console.log(formatReservationEarlySetup(reservation));
+        }
+        if (detail.withdrawal) {
+          yield* Console.log(
+            `Customer withdrawal: ${detail.withdrawal.settlement}`
+          );
+          for (const step of detail.withdrawal.steps) {
+            yield* Console.log(
+              [step.step, step.status, step.failureCode, step.retryAt]
+                .filter((value) => value !== null)
+                .join("\t")
+            );
+          }
+        }
+        if (detail.author) {
+          yield* Console.log(formatReservationAuthor(detail.author));
+        }
+        yield* Console.log(
+          `${detail.paymentAttempts.length} payment attempts · ${detail.orders.length} provider orders · ${detail.discounts.length} discounts`
+        );
+        yield* Console.log(
+          detail.accessGrant
+            ? formatReservationAccessGrant(detail.accessGrant)
+            : "Access: not provisioned"
+        );
+      })
+    )
+).pipe(Command.withDescription("Show a reservation and its history"));
+
+const reservationsFindCommand = Command.make(
+  "find",
+  { identifier: Argument.String("identifier") },
+  ({ identifier }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const result = yield* api.findReservation(accessToken, identifier);
+        if (json) {
+          yield* Console.log(JSON.stringify(result));
+          return;
+        }
+        yield* Console.log(result.reservationId ?? "No reservation matched.");
+      })
+    )
+).pipe(
+  Command.withDescription("Find a reservation by reservation or payment ID")
+);
+
+const reservationsCancelCommand = Command.make(
+  "cancel",
+  {
+    reservationId: Argument.String("reservation-id"),
+    force: Flag.Boolean("force").pipe(
+      Flag.withDefault(false),
+      Flag.withDescription(
+        "Cancel a pending payment locally before cancelling the reservation"
+      )
+    ),
+    sendCancellationEmail: Flag.Boolean("send-cancellation-email").pipe(
+      Flag.withDefault(false),
+      Flag.withDescription("Email the customer after cancellation")
+    ),
+    yes: confirmationFlag,
+  },
+  ({ force, reservationId, sendCancellationEmail, yes }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const decodedReservationId = yield* Schema.decodeUnknownEffect(
+          AdministrationWorkspaceReservationId,
+          { reportInput: true }
+        )(reservationId);
+        // The invoice consequence is read before asking, and the request
+        // confirms what was shown; the server refuses it if that changed.
+        const detail = yield* api.getReservation(
+          accessToken,
+          decodedReservationId
+        );
+        const invoiceConsequences = planReservationInvoiceConsequences(
+          detail.invoice
+        );
+        const confirmed = yield* confirmChangeShowingConsequences(
+          "administration.cancelReservation",
+          yes,
+          json,
+          [
+            force
+              ? "Force-cancel this reservation? A pending payment will be cancelled locally; a later provider settlement will require recovery or a refund."
+              : "Cancel this reservation? Paid online payments will be marked as needing a refund; no refund is issued automatically.",
+            ...invoiceConsequences.lines,
+          ].join("\n")
+        );
+        if (!confirmed) {
+          yield* reportCancellation(json);
+          return;
+        }
+        const result = yield* api.cancelReservation(
+          accessToken,
+          decodedReservationId,
+          {
+            confirmedConsequences: invoiceConsequences.confirmedConsequences,
+            force,
+            sendCancellationEmail,
+          }
+        );
+        yield* Console.log(
+          json
+            ? JSON.stringify(result)
+            : [
+                {
+                  failed:
+                    "Reservation cancelled, but the cancellation email could not be sent.",
+                  not_requested:
+                    "Reservation cancelled without emailing the customer.",
+                  sent: "Reservation cancelled and the customer was emailed.",
+                }[result.email],
+                ...formatReservationInvoiceOutput(result.invoice),
+              ].join("\n")
+        );
+      })
+    )
+).pipe(Command.withDescription("Cancel a reservation in Dotypos"));
+
+const restorationOutcomeMessages = {
+  restored: "Reservation restored.",
+  already_confirmed: "Reservation was already restored.",
+} satisfies Record<
+  AdministrationReservationRestorationResultType["outcome"],
+  string
+>;
+
+const restorationEmailMessages = {
+  not_requested: null,
+  sent: "The customer was emailed.",
+  failed: "The restoration email could not be sent.",
+  not_available:
+    "No restoration email was sent because no cancellation email was recorded.",
+} satisfies Record<
+  AdministrationReservationRestorationResultType["email"],
+  string | null
+>;
+
+const restorationAccessMessages = (reservationId: string) =>
+  ({
+    issued: "A new door PIN was issued.",
+    failed: `Access could not be issued; the restore stands. Run dhw reservations retry-access ${reservationId}.`,
+    not_needed: null,
+  }) satisfies Record<
+    AdministrationReservationRestorationResultType["access"],
+    string | null
+  >;
+
+const reservationsRestoreCommand = Command.make(
+  "restore",
+  {
+    reservationId: Argument.String("reservation-id").pipe(
+      Argument.withSchema(AdministrationWorkspaceReservationId)
+    ),
+    acknowledgeRefundedPayment: Flag.Boolean(
+      "acknowledge-refunded-payment"
+    ).pipe(
+      Flag.withDefault(false),
+      Flag.withDescription(
+        "Restore although Nexi already refunded some or all of the payment"
+      )
+    ),
+    sendRestorationEmail: Flag.Boolean("send-restoration-email").pipe(
+      Flag.withDefault(false),
+      Flag.withDescription(
+        "Email the customer that the reservation is valid again, when a cancellation email was sent"
+      )
+    ),
+    yes: confirmationFlag,
+  },
+  ({ acknowledgeRefundedPayment, reservationId, sendRestorationEmail, yes }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const decodedReservationId = yield* Schema.decodeUnknownEffect(
+          AdministrationWorkspaceReservationId
+        )(reservationId);
+        const detail = yield* api.getReservation(
+          accessToken,
+          decodedReservationId
+        );
+        const confirmed = yield* confirmChangeShowingConsequences(
+          "administration.restoreReservation",
+          yes,
+          json,
+          [
+            "Restore this cancelled reservation? It is confirmed again in Dotypos and a payment marked as needing a refund no longer is; a refunded payment stays refunded. A reservation that has not ended gets a new door PIN.",
+            ...planRestorationInvoiceConsequence(detail.restoration),
+          ].join("\n")
+        );
+        if (!confirmed) {
+          yield* reportCancellation(json);
+          return;
+        }
+        const result = yield* api.restoreReservation(
+          accessToken,
+          reservationId,
+          { acknowledgeRefundedPayment, sendRestorationEmail }
+        );
+        if (json) {
+          yield* Console.log(JSON.stringify(result));
+          return;
+        }
+        yield* Console.log(
+          [
+            restorationOutcomeMessages[result.outcome],
+            restorationEmailMessages[result.email],
+            restorationAccessMessages(reservationId)[result.access],
+            ...formatRestorationInvoiceOutput(result.invoice),
+          ]
+            .filter((line) => line !== null)
+            .join(" ")
+        );
+      })
+    )
+).pipe(Command.withDescription("Restore a cancelled reservation"));
+
+const reservationsRetryWithdrawalCommand = Command.make(
+  "retry-withdrawal",
+  {
+    reservationId: Argument.String("reservation-id"),
+    yes: confirmationFlag,
+  },
+  ({ reservationId, yes }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const id = yield* Schema.decodeUnknownEffect(
+          AdministrationWorkspaceReservationId
+        )(reservationId);
+        const confirmed = yield* confirmChange(
+          "administration.retryReservationWithdrawal",
+          yes,
+          json,
+          `Retry the customer withdrawal for ${id}? This can send withdrawal emails and cancel the reservation.`
+        );
+        if (!confirmed) {
+          yield* reportCancellation(json);
+          return;
+        }
+        const result = yield* api.retryReservationWithdrawal(accessToken, id);
+        yield* Console.log(
+          json
+            ? JSON.stringify(result)
+            : {
+                settled: "Withdrawal settled.",
+                failed:
+                  "Withdrawal could not be settled. Automatic retries continue.",
+                already_settled: "Withdrawal was already settled.",
+                in_progress:
+                  "Another attempt took over settlement. Check the reservation again in a few minutes.",
+              }[result.outcome]
+        );
+      })
+    )
+).pipe(Command.withDescription("Retry a customer withdrawal now"));
+
+const reservationsBackfillProductDetailsCommand = Command.make(
+  "backfill-product-details",
+  {
+    dryRun: Flag.Boolean("dry-run").pipe(
+      Flag.withDefault(false),
+      Flag.withDescription("Report what would be filled without writing")
+    ),
+    yes: confirmationFlag,
+  },
+  ({ dryRun, yes }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        if (!dryRun) {
+          const confirmed = yield* confirmChange(
+            "administration.backfillReservationProductDetails",
+            yes,
+            json,
+            "Fill missing meeting-room and office product details from Dotypos?"
+          );
+          if (!confirmed) {
+            yield* reportCancellation(json);
+            return;
+          }
+        }
+        let updated = 0;
+        let alreadyComplete = 0;
+        const unresolved: AdministrationReservationProductDetailsBackfillBatchType["unresolved"][number][] =
+          [];
+        let after: AdministrationWorkspaceReservationIdType | null = null;
+        do {
+          const batch: AdministrationReservationProductDetailsBackfillBatchType =
+            yield* api.backfillReservationProductDetails(accessToken, {
+              dryRun,
+              after,
+            });
+          updated += batch.updated;
+          alreadyComplete += batch.alreadyComplete;
+          unresolved.push(...batch.unresolved);
+          after = batch.nextCursor;
+        } while (after !== null);
+
+        if (json) {
+          yield* Console.log(
+            JSON.stringify({ dryRun, updated, alreadyComplete, unresolved })
+          );
+          return;
+        }
+        yield* Console.log(
+          `${dryRun ? "Would fill" : "Filled"} ${updated}, already complete ${alreadyComplete}, unresolved ${unresolved.length}.`
+        );
+        for (const { family, reason, reservationId } of unresolved) {
+          yield* Console.log(`${reservationId}\t${family}\t${reason}`);
+        }
+      })
+    )
+).pipe(
+  Command.withDescription(
+    "Fill meeting-room and office product details of older reservations from Dotypos"
+  )
+);
+
+const reservationsRetryAccessCommand = Command.make(
+  "retry-access",
+  {
+    reservationId: Argument.String("reservation-id").pipe(
+      Argument.withSchema(AdministrationWorkspaceReservationId)
+    ),
+    yes: confirmationFlag,
+  },
+  ({ reservationId, yes }) =>
+    runConfirmedReservationAccessMutation({
+      confirmation: `Retry failed access issuance for ${reservationId}?`,
+      mutation: { kind: "retry-failed" },
+      reservationId,
+      yes,
+    })
+).pipe(Command.withDescription("Retry definitively failed access issuance"));
+
+const reservationsReconcileAccessCommand = Command.make(
+  "reconcile-access",
+  {
+    reservationId: Argument.String("reservation-id").pipe(
+      Argument.withSchema(AdministrationWorkspaceReservationId)
+    ),
+    providerCredentialRemoved: Flag.Boolean("provider-credential-removed").pipe(
+      Flag.withDefault(false),
+      Flag.withDescription(
+        "Confirm the possible AlgoPIN was removed or verified absent in Igloohome"
+      )
+    ),
+    yes: confirmationFlag,
+  },
+  ({ providerCredentialRemoved, reservationId, yes }) =>
+    runConfirmedReservationAccessMutation({
+      confirmation: `Confirm the possible Igloohome credential for ${reservationId} was removed, then retry access issuance?`,
+      mutation: {
+        kind: "confirm-provider-credential-removed",
+        providerCredentialRemoved: true,
+      },
+      providerCredentialRemoved,
+      reservationId,
+      yes,
+    })
+).pipe(
+  Command.withDescription(
+    "Reconcile uncertain access after manual provider removal"
+  )
+);
+
+const reservationsActivityCommand = Command.make("activity", {}, () =>
+  runAuthenticatedCommand((api, accessToken, json) =>
+    Effect.gen(function* () {
+      const activity = yield* api.getReservationActivity(accessToken);
+      if (json) {
+        yield* Console.log(JSON.stringify(activity));
+        return;
+      }
+      if (activity.dates === null) {
+        yield* Console.log(
+          `Reservation activity ${activity.from} to ${activity.to}: unavailable`
+        );
+        return;
+      }
+      yield* Console.log(
+        `Reservation activity ${activity.from} to ${activity.to}: ${activity.dates.length} days`
+      );
+      for (const day of activity.dates) {
+        yield* Console.log([day.date, day.count].join("\t"));
+      }
+    })
+  )
+).pipe(
+  Command.withDescription("Show linked reservations per day over the last year")
+);
+
+const reservationsAuditCommand = Command.make(
+  "audit",
+  {
+    reservationId: Argument.String("reservation-id").pipe(
+      Argument.withSchema(AdministrationWorkspaceReservationId)
+    ),
+    before: Flag.String("before").pipe(
+      Flag.withSchema(AdministrationReservationAuditQuery.fields.before.schema),
+      Flag.optional,
+      Flag.withDescription("Continue from the previous page's cursor")
+    ),
+  },
+  ({ reservationId, before }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const page = yield* api.getReservationAudit(
+          accessToken,
+          reservationId,
+          presentFlagValues({ before })
+        );
+        if (json) {
+          yield* Console.log(JSON.stringify(page));
+          return;
+        }
+        if (page.events.length === 0) {
+          yield* Console.log("No recorded audit events for this reservation.");
+        }
+        for (const event of page.events) {
+          yield* Console.log(
+            [
+              event.occurredAt,
+              `${event.beforeState} → ${event.afterState}`,
+              event.reason,
+              `${event.source} ${event.actorAccountId}`,
+              event.id,
+            ].join("\t")
+          );
+        }
+        if (page.nextBefore) {
+          yield* Console.log(`Next page: --before ${page.nextBefore}`);
+        }
+      })
+    )
+).pipe(
+  Command.withDescription("Read the reservation's administration audit trail")
+);
+
+const reservationsCommand = Command.make("reservations").pipe(
+  Command.withDescription("Inspect, cancel and restore Workspace reservations"),
+  Command.withSubcommands([
+    reservationsListCommand,
+    reservationsActivityCommand,
+    reservationsGetCommand,
+    reservationsAuditCommand,
+    reservationsFindCommand,
+    reservationsCancelCommand,
+    reservationsRestoreCommand,
+    reservationsRetryWithdrawalCommand,
+    reservationsBackfillProductDetailsCommand,
+    reservationsRetryAccessCommand,
+    reservationsReconcileAccessCommand,
+  ])
+);
+
+const bookingsListCommand = Command.make(
+  "list",
+  {
+    date: Flag.String("date").pipe(
+      Flag.optional,
+      Flag.withDescription("Filter by booking date (YYYY-MM-DD)")
+    ),
+    page: Flag.Int("page").pipe(
+      Flag.optional,
+      Flag.withDescription("Results page")
+    ),
+  },
+  ({ date, page }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const query: AdministrationBookingQueryType = presentFlagValues({
+          date,
+          page,
+        });
+        const result = yield* api.listBookings(accessToken, query);
+        if (json) {
+          yield* Console.log(JSON.stringify(result));
+          return;
+        }
+        yield* Console.log(
+          `Bookings: ${result.total} total · page ${result.page}/${result.pageCount}`
+        );
+        for (const booking of result.items) {
+          yield* Console.log(
+            [
+              booking.id,
+              booking.startsAt,
+              booking.tableName ?? "Unassigned",
+              booking.customer?.displayName ??
+                booking.customerId ??
+                "Unknown customer",
+              booking.statusLabel,
+            ].join("\t")
+          );
+        }
+      })
+    )
+).pipe(Command.withDescription("List and filter Dotypos bookings"));
+
+const bookingsGetCommand = Command.make(
+  "get",
+  { bookingId: Argument.String("booking-id") },
+  ({ bookingId }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const decodedBookingId = yield* Schema.decodeUnknownEffect(
+          AdministrationDotyposReservationId,
+          { reportInput: true }
+        )(bookingId);
+        const detail = yield* api.getBooking(accessToken, decodedBookingId);
+        if (json) {
+          yield* Console.log(JSON.stringify(detail));
+          return;
+        }
+        const booking = detail.booking;
+        yield* Console.log(
+          [
+            booking.id,
+            booking.startsAt,
+            booking.endsAt,
+            booking.tableName ?? "Unassigned",
+            booking.customer?.displayName ??
+              booking.customerId ??
+              "Unknown customer",
+            booking.statusLabel,
+          ].join("\t")
+        );
+        if (detail.references.workspaceReservationId) {
+          yield* Console.log(
+            `Workspace reservation: ${detail.references.workspaceReservationId}`
+          );
+        }
+      })
+    )
+).pipe(Command.withDescription("Show a Dotypos booking"));
+
+const bookingsCommand = Command.make("bookings").pipe(
+  Command.withDescription("Inspect Dotypos bookings"),
+  Command.withSubcommands([bookingsListCommand, bookingsGetCommand])
+);
+
+const administrationDateRangeFlags = {
+  from: Flag.String("from").pipe(
+    Flag.optional,
+    Flag.withDescription("Start date (YYYY-MM-DD)")
+  ),
+  to: Flag.String("to").pipe(
+    Flag.optional,
+    Flag.withDescription("End date (YYYY-MM-DD)")
+  ),
+};
+
+const ordersListCommand = Command.make(
+  "list",
+  administrationDateRangeFlags,
+  ({ from, to }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const query: AdministrationOrderQueryType = presentFlagValues({
+          from,
+          to,
+        });
+        const result = yield* api.listOrders(accessToken, query);
+        if (json) {
+          yield* Console.log(JSON.stringify(result));
+          return;
+        }
+        yield* Console.log(formatProviderListSummary("Orders", result));
+        for (const order of result.items) {
+          yield* Console.log(formatProviderOrderRow(order));
+        }
+      })
+    )
+).pipe(Command.withDescription("List payment provider orders"));
+
+const ordersGetCommand = Command.make(
+  "get",
+  { orderId: Argument.String("order-id") },
+  ({ orderId }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const decodedOrderId = yield* Schema.decodeUnknownEffect(
+          AdministrationNexiOrderId,
+          { reportInput: true }
+        )(orderId);
+        const order = yield* api.getOrder(accessToken, decodedOrderId);
+        if (json) {
+          yield* Console.log(JSON.stringify(order));
+          return;
+        }
+        yield* Console.log(formatProviderOrderRow(order));
+        if (order.provider) {
+          yield* Console.log(
+            `${order.provider.operations.length} provider operations`
+          );
+        }
+      })
+    )
+).pipe(Command.withDescription("Show a payment provider order"));
+
+const ordersCommand = Command.make("orders").pipe(
+  Command.withDescription("Inspect payment provider orders"),
+  Command.withSubcommands([ordersListCommand, ordersGetCommand])
+);
+
+const invoicesListCommand = Command.make(
+  "list",
+  {
+    sort: Flag.Literals("sort", [
+      "invoiceNumber",
+      "issuedAt",
+      "customer",
+      "total",
+      "paymentStatus",
+      "source",
+      "delivery",
+    ]).pipe(Flag.optional, Flag.withDescription("Sort field")),
+    direction: Flag.Literals("direction", ["asc", "desc"]).pipe(
+      Flag.optional,
+      Flag.withDescription("Sort direction")
+    ),
+    page: Flag.Int("page").pipe(
+      Flag.optional,
+      Flag.withDescription("Results page")
+    ),
+    includeArchived: Flag.Boolean("include-archived").pipe(
+      Flag.withDefault(false),
+      Flag.withDescription(
+        "Also list archived invoices, which the Admin UI hides"
+      )
+    ),
+  },
+  ({ direction, includeArchived, page, sort }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const query = yield* Schema.decodeUnknownEffect(
+          AdministrationInvoiceQuery,
+          { reportInput: true }
+        )({
+          ...presentFlagValues({ sort, direction, page }),
+          ...(includeArchived && { includeArchived }),
+        });
+        const result = yield* api.listInvoices(accessToken, query);
+        if (json) {
+          yield* Console.log(JSON.stringify(result));
+          return;
+        }
+        yield* Console.log(
+          `Invoices: ${result.total} total · page ${result.page}/${result.pageCount}`
+        );
+        for (const invoice of result.items) {
+          yield* Console.log(
+            [
+              invoice.id,
+              invoice.invoiceNumber,
+              invoice.issuedAt,
+              invoice.customerName,
+              `${invoice.total} ${invoice.currency}`,
+              invoice.paymentStatus,
+              getInvoiceDeliveryLabel(invoice),
+              getInvoiceStateLabel(invoice),
+            ].join("\t")
+          );
+        }
+      })
+    )
+).pipe(Command.withDescription("List issued invoices"));
+
+const invoicesGetCommand = Command.make(
+  "get",
+  {
+    invoiceId: Argument.String("invoice-id").pipe(
+      Argument.withSchema(AdministrationInvoiceId)
+    ),
+  },
+  ({ invoiceId }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const invoice = yield* api.getInvoice(accessToken, invoiceId);
+        if (json) {
+          yield* Console.log(JSON.stringify(invoice));
+          return;
+        }
+        yield* Console.log(
+          [
+            invoice.invoiceNumber,
+            invoice.issuedAt,
+            invoice.customerName,
+            `${invoice.total} ${invoice.currency}`,
+            invoice.paymentStatus,
+            invoice.source,
+            getInvoiceDeliveryLabel(invoice),
+            getInvoiceStateLabel(invoice),
+          ].join("\t")
+        );
+        for (const line of invoice.lines) {
+          yield* Console.log(`${line.description}\t${line.price}`);
+        }
+        if (invoice.cancellation !== null) {
+          yield* Console.log(formatInvoiceCancellation(invoice.cancellation));
+        }
+        if (invoice.archivedAt !== null) {
+          yield* Console.log(`Archived ${invoice.archivedAt}`);
+        }
+        if (invoice.replacesInvoiceId !== null) {
+          yield* Console.log(`Replaces invoice ${invoice.replacesInvoiceId}`);
+        }
+        if (invoice.replacedByInvoiceId !== null) {
+          yield* Console.log(
+            `Replaced by invoice ${invoice.replacedByInvoiceId}`
+          );
+        }
+      })
+    )
+).pipe(Command.withDescription("Show an issued invoice"));
+
+const invoicesDefaultsCommand = Command.make("defaults", {}, () =>
+  runAuthenticatedCommand((api, accessToken, json) =>
+    Effect.gen(function* () {
+      const defaults = yield* api.getInvoiceCreationDefaults(accessToken);
+      if (json) {
+        yield* Console.log(JSON.stringify(defaults));
+        return;
+      }
+      yield* Console.log(
+        [
+          `Currencies: ${defaults.currencies.map(({ code }) => code).join(", ")}`,
+          `Default currency: ${defaults.defaultCurrency}`,
+          `Service date: ${defaults.defaultServiceDate}`,
+          `Due date: ${defaults.defaultDueDate}`,
+          `Suggested variable symbol: ${defaults.suggestedVariableSymbol}`,
+        ].join("\n")
+      );
+    })
+  )
+).pipe(Command.withDescription("Show what a new invoice starts from"));
+
+const invoicesPreviewCommand = Command.make(
+  "preview",
+  {
+    input: Flag.String("input").pipe(
+      Flag.withDescription("Strict JSON invoice input file")
+    ),
+    output: Flag.String("output").pipe(
+      Flag.optional,
+      Flag.withDescription("PDF output path")
+    ),
+  },
+  ({ input, output }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const invoiceInput = yield* readInvoiceCreateInput(input);
+        const pdf = yield* api.previewInvoice(accessToken, invoiceInput);
+        const path = Option.getOrElse(
+          output,
+          () => `${invoiceInput.invoiceId}-preview.pdf`
+        );
+        const fileSystem = yield* FileSystem.FileSystem;
+        yield* fileSystem.writeFile(path, pdf);
+        yield* Console.log(
+          json
+            ? JSON.stringify({ invoiceId: invoiceInput.invoiceId, path })
+            : `Wrote the preview of invoice ${invoiceInput.invoiceId} to ${path}.`
+        );
+      })
+    )
+).pipe(
+  Command.withDescription(
+    "Render an invoice input file as a PDF without creating the invoice"
+  )
+);
+
+const invoicesCreateCommand = Command.make(
+  "create",
+  {
+    input: Flag.String("input").pipe(
+      Flag.withDescription("Strict JSON invoice input file")
+    ),
+    yes: confirmationFlag,
+  },
+  ({ input, yes }) =>
+    runAuthenticatedCommand((api, accessToken, json, session) =>
+      Effect.gen(function* () {
+        if (session.approvedBy === null) {
+          return yield* new AuthenticationRequiredError({
+            message:
+              "This legacy CLI session cannot issue invoices. Run dhw auth again.",
+          });
+        }
+        const invoiceInput = yield* readInvoiceCreateInput(input);
+        const confirmed = yield* confirmChange(
+          "administration.createInvoice",
+          yes,
+          json,
+          "Create this immutable invoice and immediately email it to both the customer and Deskohub?"
+        );
+        if (!confirmed) {
+          yield* reportCancellation(json);
+          return;
+        }
+        const result = yield* api.createInvoice(accessToken, invoiceInput);
+        yield* Console.log(
+          json ? JSON.stringify(result) : formatInvoiceCreationOutput(result)
+        );
+      })
+    )
+).pipe(Command.withDescription("Create and immediately email an invoice"));
+
+export const formatInvoiceCreationOutput = (result: {
+  readonly invoiceId: string;
+  readonly invoiceNumber: string;
+  readonly needsAttention: boolean;
+}) =>
+  result.needsAttention
+    ? `Created ${result.invoiceNumber} (${result.invoiceId}); delivery needs attention.`
+    : `Created and sent ${result.invoiceNumber} (${result.invoiceId}).`;
+
+const getInvoiceDeliveryLabel = (invoice: {
+  readonly delivery: Readonly<
+    Record<
+      "customer" | "internal",
+      "missing" | "processing" | "accepted" | "failed"
+    >
+  >;
+  readonly needsAttention: boolean;
+}) => {
+  if (invoice.needsAttention) return "Needs resend";
+  return invoice.delivery.customer === "accepted" &&
+    invoice.delivery.internal === "accepted"
+    ? "Sent"
+    : "Sending";
+};
+
+const invoicesDownloadCommand = Command.make(
+  "download",
+  {
+    invoiceId: Argument.String("invoice-id").pipe(
+      Argument.withSchema(AdministrationInvoiceId)
+    ),
+    output: Flag.String("output").pipe(
+      Flag.optional,
+      Flag.withDescription("PDF output path")
+    ),
+    corrective: Flag.Boolean("corrective").pipe(
+      Flag.withDefault(false),
+      Flag.withDescription(
+        "Download the credit note of a cancelled invoice instead"
+      )
+    ),
+  },
+  ({ corrective, invoiceId, output }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const pdf = corrective
+          ? yield* api.getInvoiceCorrectiveDocumentPdf(accessToken, invoiceId)
+          : yield* api.getInvoicePdf(accessToken, invoiceId);
+        const path = Option.getOrElse(output, () =>
+          corrective ? `${invoiceId}-credit-note.pdf` : `${invoiceId}.pdf`
+        );
+        const fileSystem = yield* FileSystem.FileSystem;
+        yield* fileSystem.writeFile(path, pdf);
+        const downloaded = corrective
+          ? `Downloaded the credit note of invoice ${invoiceId} to ${path}.`
+          : `Downloaded invoice ${invoiceId} to ${path}.`;
+        yield* Console.log(
+          json ? JSON.stringify({ invoiceId, path }) : downloaded
+        );
+      })
+    )
+).pipe(
+  Command.withDescription(
+    "Download an invoice PDF, or a cancelled invoice's credit note"
+  )
+);
+
+const invoicesResendCommand = Command.make(
+  "resend",
+  {
+    invoiceId: Argument.String("invoice-id").pipe(
+      Argument.withSchema(AdministrationInvoiceId)
+    ),
+    yes: confirmationFlag,
+  },
+  ({ invoiceId, yes }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const confirmed = yield* confirmChange(
+          "administration.resendInvoice",
+          yes,
+          json,
+          `Retry missing or failed email delivery for invoice ${invoiceId}? For a cancelled invoice this retries its cancellation notices; the invoice email isn't sent again.`
+        );
+        if (!confirmed) {
+          yield* reportCancellation(json);
+          return;
+        }
+        const result = yield* api.resendInvoice(accessToken, invoiceId);
+        yield* Console.log(
+          json ? JSON.stringify(result) : formatInvoiceResendOutput(result)
+        );
+      })
+    )
+).pipe(
+  Command.withDescription(
+    "Retry missing or failed invoice email, or a cancelled invoice's notices"
+  )
+);
+
+const invoicesCancelCommand = Command.make(
+  "cancel",
+  {
+    invoiceId: Argument.String("invoice-id").pipe(
+      Argument.withSchema(AdministrationInvoiceId)
+    ),
+    sendCancellationEmail: Flag.Boolean("send-cancellation-email").pipe(
+      Flag.withDefault(false),
+      Flag.withDescription(
+        "Email the customer that the invoice's reservation was cancelled"
+      )
+    ),
+    yes: confirmationFlag,
+  },
+  ({ invoiceId, sendCancellationEmail, yes }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const invoice = yield* api.getInvoice(accessToken, invoiceId);
+        if (invoice.cancellation !== null) {
+          const replay = {
+            invoiceId,
+            outcome: "already_cancelled",
+            cancellation: invoice.cancellation,
+            reservation: null,
+          } as const;
+          yield* Console.log(
+            json
+              ? JSON.stringify(replay)
+              : formatInvoiceCancellationOutput(invoice.invoiceNumber, replay)
+          );
+          return;
+        }
+        const plan = invoice.cancellationPlan;
+        if (plan === null) {
+          return yield* new InvalidMutationInputError({
+            message:
+              "This Workspace can't cancel invoices yet. Update the server or use the Admin UI.",
+          });
+        }
+        if (plan.reservation === "cancellation_in_progress") {
+          return yield* new InvalidMutationInputError({
+            message: `The reservation of invoice ${invoice.invoiceNumber} is being cancelled. Try again once that finishes.`,
+          });
+        }
+        if (
+          plan.reservation === "cancels_reservation" &&
+          invoice.reservationId === null
+        ) {
+          return yield* new InvalidMutationInputError({
+            message: `Invoice ${invoice.invoiceNumber} reports a reservation to cancel but names none. Try again, or cancel it in the Admin UI.`,
+          });
+        }
+        const reservation =
+          plan.reservation === "cancels_reservation" &&
+          invoice.reservationId !== null
+            ? yield* api.getReservation(accessToken, invoice.reservationId)
+            : null;
+        const cancellation = planInvoiceCancellation({
+          invoiceNumber: invoice.invoiceNumber,
+          plan,
+          reservation,
+          flags: { sendCancellationEmail },
+        });
+        const confirmed = yield* confirmChangeShowingConsequences(
+          "administration.cancelInvoice",
+          yes,
+          json,
+          cancellation.prompt
+        );
+        if (!confirmed) {
+          yield* reportCancellation(json);
+          return;
+        }
+        const result = yield* api.cancelInvoice(
+          accessToken,
+          invoiceId,
+          cancellation.input
+        );
+        yield* Console.log(
+          json
+            ? JSON.stringify(result)
+            : formatInvoiceCancellationOutput(invoice.invoiceNumber, result)
+        );
+      })
+    )
+).pipe(
+  Command.withDescription(
+    "Cancel an invoice with a credit note, and its reservation with it"
+  )
+);
+
+const invoicesArchiveCommand = Command.make(
+  "archive",
+  {
+    invoiceId: Argument.String("invoice-id").pipe(
+      Argument.withSchema(AdministrationInvoiceId)
+    ),
+    yes: confirmationFlag,
+  },
+  ({ invoiceId, yes }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const invoice = yield* api.getInvoice(accessToken, invoiceId);
+        const confirmed = yield* confirmChange(
+          "administration.archiveInvoice",
+          yes,
+          json,
+          `Hide cancelled invoice ${invoice.invoiceNumber} from the Admin UI? It stays readable through dhw, the API and the customer's account, and can't be unhidden.`
+        );
+        if (!confirmed) {
+          yield* reportCancellation(json);
+          return;
+        }
+        const result = yield* api.archiveInvoice(accessToken, invoiceId);
+        yield* Console.log(
+          json
+            ? JSON.stringify(result)
+            : formatInvoiceArchiveOutput(invoice.invoiceNumber, result)
+        );
+      })
+    )
+).pipe(
+  Command.withDescription(
+    "Hide a cancelled invoice from the Admin UI; dhw still reads it"
+  )
+);
+
+const invoicesCommand = Command.make("invoices").pipe(
+  Command.withDescription("Create and manage invoices"),
+  Command.withSubcommands([
+    invoicesListCommand,
+    invoicesGetCommand,
+    invoicesDefaultsCommand,
+    invoicesPreviewCommand,
+    invoicesCreateCommand,
+    invoicesDownloadCommand,
+    invoicesResendCommand,
+    invoicesCancelCommand,
+    invoicesArchiveCommand,
+  ])
+);
+
+const operationsListCommand = Command.make(
+  "list",
+  {
+    ...administrationDateRangeFlags,
+    channel: Flag.String("channel").pipe(
+      Flag.optional,
+      Flag.withDescription("Filter by provider channel")
+    ),
+    operationType: Flag.String("operation-type").pipe(
+      Flag.optional,
+      Flag.withDescription("Filter by provider operation type")
+    ),
+  },
+  ({ channel, from, operationType, to }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const query: AdministrationOperationQueryType = presentFlagValues({
+          from,
+          to,
+          channel,
+          operationType,
+        });
+        const result = yield* api.listOperations(accessToken, query);
+        if (json) {
+          yield* Console.log(JSON.stringify(result));
+          return;
+        }
+        yield* Console.log(formatProviderListSummary("Operations", result));
+        for (const operation of result.items) {
+          yield* Console.log(formatProviderOperationRow(operation));
+        }
+      })
+    )
+).pipe(Command.withDescription("List payment provider operations"));
+
+const operationsGetCommand = Command.make(
+  "get",
+  { operationId: Argument.String("operation-id") },
+  ({ operationId }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const decodedOperationId = yield* Schema.decodeUnknownEffect(
+          AdministrationNexiOperationId,
+          { reportInput: true }
+        )(operationId);
+        const detail = yield* api.getOperation(accessToken, decodedOperationId);
+        if (json) {
+          yield* Console.log(JSON.stringify(detail));
+          return;
+        }
+        yield* Console.log(
+          [
+            detail.operationId,
+            detail.providerStatus,
+            detail.operation?.operationType ?? "Unknown type",
+            detail.operation?.operationResult ?? "Unknown result",
+            detail.operation?.orderId ?? "No order",
+            detail.linkedReservationId ?? "No reservation",
+          ].join("\t")
+        );
+      })
+    )
+).pipe(Command.withDescription("Show a payment provider operation"));
+
+const operationsCommand = Command.make("operations").pipe(
+  Command.withDescription("Inspect payment provider operations"),
+  Command.withSubcommands([operationsListCommand, operationsGetCommand])
+);
+
+const customersListCommand = Command.make(
+  "list",
+  {
+    page: Flag.Int("page").pipe(
+      Flag.optional,
+      Flag.withDescription("Results page")
+    ),
+  },
+  ({ page }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const query: AdministrationCustomerQueryType = presentFlagValues({
+          page,
+        });
+        const result = yield* api.listCustomers(accessToken, query);
+        if (json) {
+          yield* Console.log(JSON.stringify(result));
+          return;
+        }
+        yield* Console.log(
+          `Customers: ${result.total} total · page ${result.page}/${result.pageCount}`
+        );
+        for (const summary of result.items) {
+          yield* Console.log(formatCustomerSummaryRow(summary));
+        }
+      })
+    )
+).pipe(Command.withDescription("List customers with reservations"));
+
+const customersSearchCommand = Command.make(
+  "search",
+  { query: Argument.String("query") },
+  ({ query }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const result = yield* api.searchCustomers(accessToken, { query });
+        if (json) {
+          yield* Console.log(JSON.stringify(result));
+          return;
+        }
+        if (result.customers.length === 0) {
+          yield* Console.log("No customer matched.");
+          return;
+        }
+        if (result.kind === "ambiguous") {
+          yield* Console.log("Multiple customers matched:");
+        }
+        for (const customer of result.customers) {
+          yield* Console.log(
+            [
+              customer.id,
+              customer.displayName,
+              formatCustomerContact(customer),
+            ].join("\t")
+          );
+        }
+      })
+    )
+).pipe(Command.withDescription("Search customers by name or email"));
+
+const customersGetCommand = Command.make(
+  "get",
+  { customerId: Argument.String("customer-id") },
+  ({ customerId }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const decodedCustomerId = yield* Schema.decodeUnknownEffect(
+          AdministrationDotyposCustomerId,
+          { reportInput: true }
+        )(customerId);
+        const detail = yield* api.getCustomer(accessToken, decodedCustomerId);
+        if (json) {
+          yield* Console.log(JSON.stringify(detail));
+          return;
+        }
+        const profile = detail.profile;
+        yield* Console.log(
+          profile
+            ? [
+                profile.customer.id,
+                profile.customer.displayName,
+                formatCustomerContact(profile.customer),
+              ].join("\t")
+            : `${customerId}\tLive customer details unavailable`
+        );
+        yield* Console.log(
+          `${detail.activity.stats.reservationCount} reservations · ${profile?.codes.length ?? 0} discount codes · ${profile?.claims.length ?? 0} code claims`
+        );
+        if (detail.activity.stats.favoriteProduct) {
+          yield* Console.log(
+            `Favorite product: ${detail.activity.stats.favoriteProduct}`
+          );
+        }
+      })
+    )
+).pipe(Command.withDescription("Show customer activity and discount details"));
+
+const customersActivityCommand = Command.make(
+  "activity",
+  { customerId: Argument.String("customer-id") },
+  ({ customerId }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const decodedCustomerId = yield* Schema.decodeUnknownEffect(
+          AdministrationDotyposCustomerId,
+          { reportInput: true }
+        )(customerId);
+        const activity = yield* api.getCustomerReservationActivity(
+          accessToken,
+          decodedCustomerId
+        );
+        if (json) {
+          yield* Console.log(JSON.stringify(activity));
+          return;
+        }
+        if (activity.dates === null) {
+          yield* Console.log(
+            `Reservation activity ${activity.from} to ${activity.to}: unavailable`
+          );
+          return;
+        }
+        yield* Console.log(
+          `Reservation activity ${activity.from} to ${activity.to}: ${activity.dates.length} days`
+        );
+        for (const day of activity.dates) {
+          yield* Console.log([day.date, day.count, day.category].join("\t"));
+        }
+      })
+    )
+).pipe(
+  Command.withDescription(
+    "Show a customer's completed reservations per day over the last year"
+  )
+);
+
+const customersReservationsCommand = Command.make(
+  "reservations",
+  {
+    customerId: Argument.String("customer-id"),
+    page: Flag.Int("page").pipe(
+      Flag.optional,
+      Flag.withDescription("Results page")
+    ),
+  },
+  ({ customerId, page }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const decodedCustomerId = yield* Schema.decodeUnknownEffect(
+          AdministrationDotyposCustomerId,
+          { reportInput: true }
+        )(customerId);
+        const result = yield* api.listCustomerReservations(
+          accessToken,
+          decodedCustomerId,
+          presentFlagValues({ page })
+        );
+        if (json) {
+          yield* Console.log(JSON.stringify(result));
+          return;
+        }
+        yield* Console.log(
+          `Reservations: ${result.total} total · page ${result.page}/${result.pageCount}`
+        );
+        for (const reservation of result.items) {
+          yield* Console.log(formatReservationRow(reservation));
+        }
+      })
+    )
+).pipe(Command.withDescription("List a customer's reservations"));
+
+const customersSetDiscountGroupCommand = Command.make(
+  "set-discount-group",
+  {
+    customerId: Argument.String("customer-id").pipe(
+      Argument.withSchema(AdministrationDotyposCustomerId)
+    ),
+    discountGroupId: Argument.String("discount-group-id").pipe(
+      Argument.withSchema(AdministrationDotyposDiscountGroupId)
+    ),
+    yes: confirmationFlag,
+  },
+  ({ customerId, discountGroupId, yes }) =>
+    runConfirmedDiscountMutation({
+      confirmation: `Set Dotypos discount group ${discountGroupId} for ${customerId}?`,
+      mutation: {
+        kind: "set-customer-discount-group",
+        customerId,
+        discountGroupId,
+      },
+      yes,
+    })
+).pipe(Command.withDescription("Set a customer's Dotypos discount group"));
+
+const customersClearDiscountGroupCommand = Command.make(
+  "clear-discount-group",
+  {
+    customerId: Argument.String("customer-id").pipe(
+      Argument.withSchema(AdministrationDotyposCustomerId)
+    ),
+    yes: confirmationFlag,
+  },
+  ({ customerId, yes }) =>
+    runConfirmedDiscountMutation({
+      confirmation: `Clear the Dotypos discount group for ${customerId}?`,
+      mutation: {
+        kind: "set-customer-discount-group",
+        customerId,
+        discountGroupId: null,
+      },
+      yes,
+    })
+).pipe(Command.withDescription("Clear a customer's Dotypos discount group"));
+
+const customersCommand = Command.make("customers").pipe(
+  Command.withDescription("Inspect Workspace customers"),
+  Command.withSubcommands([
+    customersListCommand,
+    customersSearchCommand,
+    customersGetCommand,
+    customersActivityCommand,
+    customersReservationsCommand,
+    customersSetDiscountGroupCommand,
+    customersClearDiscountGroupCommand,
+  ])
+);
+
+const discountDefinitionFlags = {
+  labelCs: Flag.String("label-cs").pipe(
+    Flag.withSchema(Schema.Trim.check(Schema.isNonEmpty())),
+    Flag.withDescription("Czech customer-facing label")
+  ),
+  labelEn: Flag.String("label-en").pipe(
+    Flag.withSchema(Schema.Trim.check(Schema.isNonEmpty())),
+    Flag.withDescription("English customer-facing label")
+  ),
+  products: Flag.ChoiceWithValue("product", [
+    ["cowork", { kind: "cowork" }],
+    ["cowork:open-space", { kind: "cowork", tier: "open-space" }],
+    ["cowork:reserved-desk", { kind: "cowork", tier: "reserved-desk" }],
+    ["meeting-room", { kind: "meeting-room" }],
+    ["office", { kind: "office" }],
+    ["table", { kind: "table" }],
+  ] as const).pipe(
+    Flag.atLeast(1),
+    Flag.withDescription(
+      "Eligible product: a reservation family, where cowork covers every cowork tier, or a single cowork tier such as cowork:reserved-desk; repeat for multiple products"
+    )
+  ),
+};
+
+const percentageBasisPointsFromString = Schema.String.check(
+  Schema.isPattern(/^\d+(?:\.\d+)?$/)
+).pipe(
+  Schema.decodeTo(
+    Schema.BigDecimalFromString.check(
+      Schema.isBetweenBigDecimal({
+        minimum: BigDecimal.fromBigInt(BigInt(0)),
+        maximum: BigDecimal.fromBigInt(BigInt(100)),
+        exclusiveMinimum: true,
+      }),
+      Schema.makeFilter(
+        (percentage) =>
+          BigDecimal.isInteger(
+            BigDecimal.multiply(percentage, BigDecimal.fromBigInt(BigInt(100)))
+          ),
+        { message: "must convert exactly to whole basis points" }
+      )
+    )
+  ),
+  Schema.decodeTo(
+    Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 10_000 })),
+    {
+      decode: SchemaGetter.transform((percentage) =>
+        Number(
+          BigDecimal.scale(
+            BigDecimal.multiply(percentage, BigDecimal.fromBigInt(BigInt(100))),
+            0
+          ).value
+        )
+      ),
+      encode: SchemaGetter.transform((basisPoints) =>
+        BigDecimal.make(BigInt(basisPoints), 2)
+      ),
+    }
+  )
+);
+
+const percentageFlag = Flag.String("percentage").pipe(
+  Flag.withSchema(percentageBasisPointsFromString),
+  Flag.withDescription("Percentage from 0.01 through 100")
+);
+
+const fixedValueFlag = Flag.Int("fixed-value").pipe(
+  Flag.withSchema(Schema.Int.check(Schema.isGreaterThan(0))),
+  Flag.withDescription("Money value in minor currency units")
+);
+
+const fixedCurrencyFlag = Flag.Literals("currency", ["CZK", "EUR"]).pipe(
+  Flag.withDescription("Currency for the money value")
+);
+
+const discountIdArgument = Argument.String("discount-id").pipe(
+  Argument.withSchema(AdministrationStoredDiscountId)
+);
+
+const discountsCreatePercentageCommand = Command.make(
+  "percentage",
+  { ...discountDefinitionFlags, percentage: percentageFlag },
+  ({ labelCs, labelEn, percentage, products }) =>
+    runDiscountMutation({
+      kind: "create-discount",
+      discount: makeDiscountDefinition({
+        adjustment: { kind: "percentage", basisPoints: percentage },
+        labelCs,
+        labelEn,
+        products,
+      }),
+    })
+).pipe(Command.withDescription("Create a percentage discount definition"));
+
+const discountsCreateFixedCommand = Command.make(
+  "fixed",
+  {
+    ...discountDefinitionFlags,
+    currency: fixedCurrencyFlag,
+    fixedValue: fixedValueFlag,
+  },
+  ({ currency, fixedValue, labelCs, labelEn, products }) =>
+    runDiscountMutation({
+      kind: "create-discount",
+      discount: makeDiscountDefinition({
+        adjustment: {
+          kind: "fixed",
+          amount: { value: fixedValue, exponent: 2, currency },
+        },
+        labelCs,
+        labelEn,
+        products,
+      }),
+    })
+).pipe(Command.withDescription("Create a fixed-amount discount definition"));
+
+const discountsCreateCommand = Command.make("create").pipe(
+  Command.withDescription("Create a managed discount definition"),
+  Command.withSubcommands([
+    discountsCreatePercentageCommand,
+    discountsCreateFixedCommand,
+  ])
+);
+
+const discountsUpdatePercentageCommand = Command.make(
+  "percentage",
+  {
+    discountId: discountIdArgument,
+    ...discountDefinitionFlags,
+    percentage: percentageFlag,
+  },
+  ({ discountId, labelCs, labelEn, percentage, products }) =>
+    runDiscountMutation({
+      kind: "update-discount",
+      discount: {
+        id: discountId,
+        ...makeDiscountDefinition({
+          adjustment: { kind: "percentage", basisPoints: percentage },
+          labelCs,
+          labelEn,
+          products,
+        }),
+      },
+    })
+).pipe(Command.withDescription("Replace a discount with percentage values"));
+
+const discountsUpdateFixedCommand = Command.make(
+  "fixed",
+  {
+    discountId: discountIdArgument,
+    ...discountDefinitionFlags,
+    currency: fixedCurrencyFlag,
+    fixedValue: fixedValueFlag,
+  },
+  ({ currency, discountId, fixedValue, labelCs, labelEn, products }) =>
+    runDiscountMutation({
+      kind: "update-discount",
+      discount: {
+        id: discountId,
+        ...makeDiscountDefinition({
+          adjustment: {
+            kind: "fixed",
+            amount: { value: fixedValue, exponent: 2, currency },
+          },
+          labelCs,
+          labelEn,
+          products,
+        }),
+      },
+    })
+).pipe(Command.withDescription("Replace a discount with fixed-amount values"));
+
+const discountsUpdateCommand = Command.make("update").pipe(
+  Command.withDescription("Replace a managed discount definition"),
+  Command.withSubcommands([
+    discountsUpdatePercentageCommand,
+    discountsUpdateFixedCommand,
+  ])
+);
+
+const discountsDeleteCommand = Command.make(
+  "delete",
+  { discountId: discountIdArgument, yes: confirmationFlag },
+  ({ discountId, yes }) =>
+    runConfirmedDiscountMutation({
+      confirmation: `Delete discount ${discountId}? Referenced discounts cannot be deleted. This cannot be undone.`,
+      mutation: { kind: "delete-discount", id: discountId },
+      yes,
+    })
+).pipe(Command.withDescription("Delete an unreferenced discount definition"));
+
+const discountsListCommand = Command.make("list", {}, () =>
+  runAuthenticatedCommand((api, accessToken, json) =>
+    Effect.gen(function* () {
+      const dashboard = yield* api.getDiscountDashboard(accessToken);
+      if (json) {
+        yield* Console.log(JSON.stringify(dashboard.discounts));
+        return;
+      }
+      yield* Console.log(`Discounts: ${dashboard.discounts.length}`);
+      for (const discount of dashboard.discounts) {
+        yield* Console.log(
+          [
+            discount.id,
+            discount.labels["en-US"],
+            formatDiscountAdjustment(discount.adjustment),
+            discount.products.map(formatProductTarget).join(","),
+            `${discount.codeCount} codes`,
+          ].join("\t")
+        );
+      }
+    })
+  )
+).pipe(Command.withDescription("List managed discounts"));
+
+const discountsGroupsCommand = Command.make("groups", {}, () =>
+  runAuthenticatedCommand((api, accessToken, json) =>
+    Effect.gen(function* () {
+      const { discountGroups } = yield* api.listDiscountGroups(accessToken);
+      if (json) {
+        yield* Console.log(JSON.stringify(discountGroups));
+        return;
+      }
+      yield* Console.log(`Discount groups: ${discountGroups.length}`);
+      for (const group of discountGroups) {
+        yield* Console.log(`${group.id}\t${group.name ?? "Unnamed"}`);
+      }
+    })
+  )
+).pipe(Command.withDescription("List the Dotypos discount groups"));
+
+const discountsCommand = Command.make("discounts").pipe(
+  Command.withDescription("Inspect and manage discounts"),
+  Command.withSubcommands([
+    discountsListCommand,
+    discountsGroupsCommand,
+    discountsCreateCommand,
+    discountsUpdateCommand,
+    discountsDeleteCommand,
+  ])
+);
+
+const discountCodeArgument = Argument.String("code").pipe(
+  Argument.map((code) => code.trim().toUpperCase()),
+  Argument.withSchema(AdministrationCanonicalPromotionCode)
+);
+
+const discountCodeIdArgument = Argument.String("code-id").pipe(
+  Argument.withSchema(AdministrationDiscountCodeId)
+);
+
+const customerIdFlag = Flag.String("customer").pipe(
+  Flag.withSchema(AdministrationDotyposCustomerId),
+  Flag.optional,
+  Flag.withDescription("Restrict the new code to this Dotypos customer")
+);
+
+const serviceDateFlags = {
+  serviceDateFrom: Flag.String("service-date-from").pipe(
+    Flag.withSchema(AdministrationServiceDate),
+    Flag.optional,
+    Flag.withDescription(
+      "First reservation start date (YYYY-MM-DD, Prague) the code applies to; pass with --service-date-until"
+    )
+  ),
+  serviceDateUntil: Flag.String("service-date-until").pipe(
+    Flag.withSchema(AdministrationServiceDate),
+    Flag.optional,
+    Flag.withDescription(
+      "Last reservation start date (YYYY-MM-DD, Prague) the code applies to; pass with --service-date-from"
+    )
+  ),
+};
+
+const discountCodeCreateFlags = {
+  ...serviceDateFlags,
+  customer: customerIdFlag,
+  disabled: Flag.Boolean("disabled").pipe(
+    Flag.withDefault(false),
+    Flag.withDescription("Create the code disabled")
+  ),
+  maxUses: Flag.Int("max-uses").pipe(
+    Flag.withSchema(Schema.Int.check(Schema.isGreaterThan(0))),
+    Flag.optional,
+    Flag.withDescription("Maximum successful redemptions")
+  ),
+  maxUsesPerCustomer: Flag.Int("max-uses-per-customer").pipe(
+    Flag.withSchema(Schema.Int.check(Schema.isGreaterThan(0))),
+    Flag.optional,
+    Flag.withDescription("Maximum successful redemptions per customer")
+  ),
+  validFrom: Flag.String("valid-from").pipe(
+    Flag.withSchema(AdministrationInstant),
+    Flag.optional,
+    Flag.withDescription("Inclusive ISO instant")
+  ),
+  validUntil: Flag.String("valid-until").pipe(
+    Flag.withSchema(AdministrationInstant),
+    Flag.optional,
+    Flag.withDescription("Exclusive ISO instant")
+  ),
+};
+
+const codesCreateExistingCommand = Command.make(
+  "existing",
+  {
+    code: discountCodeArgument,
+    discountId: discountIdArgument,
+    ...discountCodeCreateFlags,
+  },
+  (input) =>
+    makeCreateCodeMutation(input, {
+      kind: "existing",
+      discountId: input.discountId,
+    }).pipe(Effect.flatMap(runDiscountMutation))
+).pipe(Command.withDescription("Create a code for an existing discount"));
+
+const codesCreatePercentageCommand = Command.make(
+  "percentage",
+  {
+    code: discountCodeArgument,
+    ...discountCodeCreateFlags,
+    ...discountDefinitionFlags,
+    percentage: percentageFlag,
+  },
+  (input) =>
+    makeCreateCodeMutation(input, {
+      kind: "new",
+      discount: makeDiscountDefinition({
+        adjustment: {
+          kind: "percentage",
+          basisPoints: input.percentage,
+        },
+        labelCs: input.labelCs,
+        labelEn: input.labelEn,
+        products: input.products,
+      }),
+    }).pipe(Effect.flatMap(runDiscountMutation))
+).pipe(
+  Command.withDescription("Create a code and percentage discount atomically")
+);
+
+const codesCreateFixedCommand = Command.make(
+  "fixed",
+  {
+    code: discountCodeArgument,
+    ...discountCodeCreateFlags,
+    ...discountDefinitionFlags,
+    currency: fixedCurrencyFlag,
+    fixedValue: fixedValueFlag,
+  },
+  (input) =>
+    makeCreateCodeMutation(input, {
+      kind: "new",
+      discount: makeDiscountDefinition({
+        adjustment: {
+          kind: "fixed",
+          amount: {
+            value: input.fixedValue,
+            exponent: 2,
+            currency: input.currency,
+          },
+        },
+        labelCs: input.labelCs,
+        labelEn: input.labelEn,
+        products: input.products,
+      }),
+    }).pipe(Effect.flatMap(runDiscountMutation))
+).pipe(Command.withDescription("Create a code and fixed discount atomically"));
+
+const creditValueFlag = Flag.Int("credit-value").pipe(
+  Flag.withSchema(Schema.Int.check(Schema.isGreaterThan(0))),
+  Flag.withDescription("Issued credit in minor currency units")
+);
+
+const vouchersCreateCommand = Command.make(
+  "create",
+  {
+    code: discountCodeArgument,
+    customer: discountCodeCreateFlags.customer,
+    disabled: discountCodeCreateFlags.disabled,
+    validFrom: discountCodeCreateFlags.validFrom,
+    validUntil: discountCodeCreateFlags.validUntil,
+    currency: fixedCurrencyFlag,
+    creditValue: creditValueFlag,
+  },
+  (input) =>
+    Option.match(input.customer, {
+      onNone: () =>
+        runDiscountMutation({
+          kind: "create-voucher",
+          voucher: {
+            code: input.code,
+            enabled: !input.disabled,
+            validFrom: Option.getOrNull(input.validFrom),
+            validUntil: Option.getOrNull(input.validUntil),
+            credit: {
+              value: input.creditValue,
+              exponent: 2,
+              currency: input.currency,
+            },
+          },
+        }),
+      onSome: (customerId) =>
+        runDiscountMutation({
+          kind: "create-customer-voucher",
+          voucher: {
+            customerId,
+            code: input.code,
+            enabled: !input.disabled,
+            validFrom: Option.getOrNull(input.validFrom),
+            validUntil: Option.getOrNull(input.validUntil),
+            credit: {
+              value: input.creditValue,
+              exponent: 2,
+              currency: input.currency,
+            },
+          },
+        }),
+    })
+).pipe(Command.withDescription("Create a promotional credit voucher"));
+
+const codesCreateCommand = Command.make("create").pipe(
+  Command.withDescription("Create a managed discount code"),
+  Command.withSubcommands([
+    codesCreateExistingCommand,
+    codesCreatePercentageCommand,
+    codesCreateFixedCommand,
+  ])
+);
+
+const codesUpdateCommand = Command.make(
+  "update",
+  {
+    codeId: discountCodeIdArgument,
+    code: discountCodeArgument,
+    discountId: discountIdArgument,
+    enabled: Flag.ChoiceWithValue("enabled", [
+      ["true", true],
+      ["false", false],
+    ] as const),
+    maxUses: discountCodeCreateFlags.maxUses,
+    maxUsesPerCustomer: discountCodeCreateFlags.maxUsesPerCustomer,
+    ...serviceDateFlags,
+    clearServiceDates: Flag.Boolean("clear-service-dates").pipe(
+      Flag.withDefault(false),
+      Flag.withDescription(
+        "Remove the code's reservation dates; without date flags the update keeps them"
+      )
+    ),
+    validFrom: discountCodeCreateFlags.validFrom,
+    validUntil: discountCodeCreateFlags.validUntil,
+  },
+  ({
+    clearServiceDates,
+    code,
+    codeId,
+    discountId,
+    enabled,
+    maxUses,
+    maxUsesPerCustomer,
+    serviceDateFrom,
+    serviceDateUntil,
+    validFrom,
+    validUntil,
+  }) =>
+    toServiceDateInput({
+      clearServiceDates,
+      serviceDateFrom,
+      serviceDateUntil,
+    }).pipe(
+      Effect.flatMap((serviceDates) =>
+        runDiscountMutation({
+          kind: "update-code",
+          code: {
+            id: codeId,
+            discountId,
+            code,
+            enabled,
+            maxUses: Option.getOrNull(maxUses),
+            maxUsesPerCustomer: Option.getOrNull(maxUsesPerCustomer),
+            ...serviceDates,
+            validFrom: Option.getOrNull(validFrom),
+            validUntil: Option.getOrNull(validUntil),
+          },
+        })
+      )
+    )
+).pipe(Command.withDescription("Replace a managed discount code"));
+
+const voucherIdArgument = Argument.String("voucher-id").pipe(
+  Argument.withSchema(AdministrationVoucherId)
+);
+
+const vouchersUpdateCommand = Command.make(
+  "update",
+  {
+    voucherId: voucherIdArgument,
+    code: discountCodeArgument,
+    enabled: Flag.ChoiceWithValue("enabled", [
+      ["true", true],
+      ["false", false],
+    ] as const),
+    validFrom: discountCodeCreateFlags.validFrom,
+    validUntil: discountCodeCreateFlags.validUntil,
+    currency: fixedCurrencyFlag,
+    creditValue: creditValueFlag,
+  },
+  ({
+    code,
+    voucherId,
+    currency,
+    enabled,
+    creditValue,
+    validFrom,
+    validUntil,
+  }) =>
+    runDiscountMutation({
+      kind: "update-voucher",
+      voucher: {
+        id: voucherId,
+        code,
+        credit: { value: creditValue, exponent: 2, currency },
+        enabled,
+        validFrom: Option.getOrNull(validFrom),
+        validUntil: Option.getOrNull(validUntil),
+      },
+    })
+).pipe(Command.withDescription("Replace a managed voucher"));
+
+const codesDeleteCommand = Command.make(
+  "delete",
+  { codeId: discountCodeIdArgument, yes: confirmationFlag },
+  ({ codeId, yes }) =>
+    runConfirmedDiscountMutation({
+      confirmation: `Delete discount code ${codeId}? Codes with claim history cannot be deleted. This cannot be undone.`,
+      mutation: { kind: "delete-code", id: codeId },
+      yes,
+    })
+).pipe(Command.withDescription("Delete an unused discount code"));
+
+const codesAddCustomerCommand = Command.make(
+  "add-customer",
+  {
+    codeId: discountCodeIdArgument,
+    customerId: Argument.String("customer-id").pipe(
+      Argument.withSchema(AdministrationDotyposCustomerId)
+    ),
+    yes: confirmationFlag,
+  },
+  ({ codeId, customerId, yes }) =>
+    runConfirmedDiscountMutation({
+      confirmation: `Add customer ${customerId} to the audience for code ${codeId}?`,
+      mutation: { kind: "add-code-customer", codeId, customerId },
+      yes,
+    })
+).pipe(Command.withDescription("Add a customer to a code audience"));
+
+const codesRemoveCustomerCommand = Command.make(
+  "remove-customer",
+  {
+    codeId: discountCodeIdArgument,
+    customerId: Argument.String("customer-id").pipe(
+      Argument.withSchema(AdministrationDotyposCustomerId)
+    ),
+    yes: confirmationFlag,
+  },
+  ({ codeId, customerId, yes }) =>
+    runConfirmedDiscountMutation({
+      confirmation: `Remove customer ${customerId} from code ${codeId}?`,
+      mutation: { kind: "remove-code-customer", codeId, customerId },
+      yes,
+    })
+).pipe(Command.withDescription("Remove a customer from a code audience"));
+
+const codesMakeUnrestrictedCommand = Command.make(
+  "make-unrestricted",
+  { codeId: discountCodeIdArgument, yes: confirmationFlag },
+  ({ codeId, yes }) =>
+    runConfirmedDiscountMutation({
+      confirmation: `Make code ${codeId} available to every customer?`,
+      mutation: { kind: "make-code-unrestricted", codeId },
+      yes,
+    })
+).pipe(Command.withDescription("Remove all customer restrictions from a code"));
+
+const codesListCommand = Command.make("list", {}, () =>
+  runAuthenticatedCommand((api, accessToken, json) =>
+    Effect.gen(function* () {
+      const dashboard = yield* api.getDiscountDashboard(accessToken);
+      if (json) {
+        yield* Console.log(JSON.stringify(dashboard.codes));
+        return;
+      }
+      yield* Console.log(`Discount codes: ${dashboard.codes.length}`);
+      const discountLabels = new Map(
+        dashboard.discounts.map((discount) => [
+          discount.id,
+          discount.labels["en-US"],
+        ])
+      );
+      for (const code of dashboard.codes) {
+        yield* Console.log(
+          formatCodeRow(code, formatCodeBenefit(code, discountLabels))
+        );
+      }
+    })
+  )
+).pipe(Command.withDescription("List managed discount codes"));
+
+const codesGetCommand = Command.make(
+  "get",
+  { codeId: discountCodeIdArgument },
+  ({ codeId }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const detail = yield* api.getDiscountCode(accessToken, codeId);
+        if (json) {
+          yield* Console.log(JSON.stringify(detail));
+          return;
+        }
+        yield* Console.log(formatCodeRow(detail.code, detail.discountLabel));
+        yield* Console.log(formatServiceDatesLine(detail.code));
+        for (const line of formatPromotionDetailLines(detail.code, detail)) {
+          yield* Console.log(line);
+        }
+      })
+    )
+).pipe(Command.withDescription("Show a discount code and its claims"));
+
+const codesCommand = Command.make("codes").pipe(
+  Command.withDescription("Inspect and manage discount codes"),
+  Command.withSubcommands([
+    codesListCommand,
+    codesGetCommand,
+    codesCreateCommand,
+    codesUpdateCommand,
+    codesDeleteCommand,
+    codesAddCustomerCommand,
+    codesRemoveCustomerCommand,
+    codesMakeUnrestrictedCommand,
+  ])
+);
+
+const vouchersDeleteCommand = Command.make(
+  "delete",
+  { voucherId: voucherIdArgument, yes: confirmationFlag },
+  ({ voucherId, yes }) =>
+    runConfirmedDiscountMutation({
+      confirmation: `Delete voucher ${voucherId}? Vouchers with claim history cannot be deleted. This cannot be undone.`,
+      mutation: { kind: "delete-voucher", id: voucherId },
+      yes,
+    })
+).pipe(Command.withDescription("Delete an unused voucher"));
+
+const voucherCustomerArguments = {
+  voucherId: voucherIdArgument,
+  customerId: Argument.String("customer-id").pipe(
+    Argument.withSchema(AdministrationDotyposCustomerId)
+  ),
+  yes: confirmationFlag,
+};
+
+const vouchersAddCustomerCommand = Command.make(
+  "add-customer",
+  voucherCustomerArguments,
+  ({ customerId, voucherId, yes }) =>
+    runConfirmedDiscountMutation({
+      confirmation: `Add customer ${customerId} to voucher ${voucherId}?`,
+      mutation: { kind: "add-voucher-customer", voucherId, customerId },
+      yes,
+    })
+).pipe(Command.withDescription("Add a customer to a voucher audience"));
+
+const vouchersRemoveCustomerCommand = Command.make(
+  "remove-customer",
+  voucherCustomerArguments,
+  ({ customerId, voucherId, yes }) =>
+    runConfirmedDiscountMutation({
+      confirmation: `Remove customer ${customerId} from voucher ${voucherId}?`,
+      mutation: { kind: "remove-voucher-customer", voucherId, customerId },
+      yes,
+    })
+).pipe(Command.withDescription("Remove a customer from a voucher audience"));
+
+const vouchersMakeUnrestrictedCommand = Command.make(
+  "make-unrestricted",
+  { voucherId: voucherIdArgument, yes: confirmationFlag },
+  ({ voucherId, yes }) =>
+    runConfirmedDiscountMutation({
+      confirmation: `Make voucher ${voucherId} available to every customer?`,
+      mutation: { kind: "make-voucher-unrestricted", voucherId },
+      yes,
+    })
+).pipe(Command.withDescription("Remove all voucher customer restrictions"));
+
+const vouchersListCommand = Command.make("list", {}, () =>
+  runAuthenticatedCommand((api, accessToken, json) =>
+    Effect.gen(function* () {
+      const { vouchers } = yield* api.getDiscountDashboard(accessToken);
+      if (json) {
+        yield* Console.log(JSON.stringify(vouchers));
+        return;
+      }
+      yield* Console.log(`Vouchers: ${vouchers.length}`);
+      for (const voucher of vouchers) {
+        yield* Console.log(
+          [
+            voucher.id,
+            voucher.code,
+            formatMoney(voucher.issuedCredit),
+            formatMoney(voucher.remainingCredit),
+            voucher.enabled ? "Enabled" : "Disabled",
+          ].join("\t")
+        );
+      }
+    })
+  )
+).pipe(Command.withDescription("List managed vouchers"));
+
+const vouchersGetCommand = Command.make(
+  "get",
+  { voucherId: voucherIdArgument },
+  ({ voucherId }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const detail = yield* api.getVoucher(accessToken, voucherId);
+        if (json) {
+          yield* Console.log(JSON.stringify(detail));
+          return;
+        }
+        const voucher = detail.voucher;
+        yield* Console.log(
+          [
+            voucher.id,
+            voucher.code,
+            `${formatMoney(voucher.issuedCredit)} issued`,
+            `${formatMoney(voucher.remainingCredit)} remaining`,
+            voucher.enabled ? "Enabled" : "Disabled",
+          ].join("\t")
+        );
+        for (const line of formatPromotionDetailLines(voucher, detail)) {
+          yield* Console.log(line);
+        }
+      })
+    )
+).pipe(Command.withDescription("Show a voucher and its claims"));
+
+const vouchersCommand = Command.make("vouchers").pipe(
+  Command.withDescription("Inspect and manage promotional vouchers"),
+  Command.withSubcommands([
+    vouchersListCommand,
+    vouchersGetCommand,
+    vouchersCreateCommand,
+    vouchersUpdateCommand,
+    vouchersDeleteCommand,
+    vouchersAddCustomerCommand,
+    vouchersRemoveCustomerCommand,
+    vouchersMakeUnrestrictedCommand,
+  ])
+);
+
+const accessCodesCreateCommand = Command.make(
+  "create",
+  {
+    name: Argument.String("name").pipe(
+      Argument.withSchema(AdministrationStandaloneAccessCodeName)
+    ),
+    startsAt: Flag.String("starts-at").pipe(
+      Flag.withSchema(AdministrationWorkspaceSiteLocalWholeHourDateTime),
+      Flag.withDescription("Inclusive site-local start (YYYY-MM-DDTHH:mm)")
+    ),
+    endsAt: Flag.String("ends-at").pipe(
+      Flag.withSchema(AdministrationWorkspaceSiteLocalWholeHourDateTime),
+      Flag.withDescription("Exclusive site-local end (YYYY-MM-DDTHH:mm)")
+    ),
+    providerCredentialRemoved: Flag.String("provider-credential-removed").pipe(
+      Flag.withSchema(AdministrationStandaloneAccessCodeAttemptId),
+      Flag.optional,
+      Flag.withDescription(
+        "Confirm the possible AlgoPIN of this exact attempt was removed or verified absent in Igloohome"
+      )
+    ),
+    yes: confirmationFlag,
+  },
+  ({ endsAt, name, providerCredentialRemoved, startsAt, yes }) =>
+    runAuthenticatedCommand((api, accessToken, json, session) =>
+      Effect.gen(function* () {
+        if (session.approvedBy === null) {
+          return yield* new AuthenticationRequiredError({
+            message:
+              "This legacy CLI session cannot create access codes. Run dhw auth again.",
+          });
+        }
+        const request = yield* Schema.decodeUnknownEffect(
+          AdministrationStandaloneAccessCodeCreateInput,
+          administrationInputParseOptions
+        )({ name, startsAt, endsAt }).pipe(
+          Effect.mapError(
+            () =>
+              new InvalidMutationInputError({
+                message:
+                  "The access window must span 1 to 672 whole hours between site-local whole-hour times.",
+              })
+          )
+        );
+        const confirmed = yield* confirmChange(
+          "administration.createStandaloneAccessCode",
+          yes,
+          json,
+          formatStandaloneAccessCodeConfirmation(request)
+        );
+        if (!confirmed) {
+          yield* reportCancellation(json);
+          return;
+        }
+        const attemptStore = yield* AccessCodeAttemptStore;
+        const identity = { sessionId: session.id, request };
+        const cleanupTargetAttemptId = Option.isSome(providerCredentialRemoved)
+          ? providerCredentialRemoved.value
+          : undefined;
+        const issueCreation = (
+          currentAttemptId: AdministrationStandaloneAccessCodeAttemptIdType,
+          providerCredentialRemovedAttemptId?: AdministrationStandaloneAccessCodeAttemptIdType
+        ) =>
+          api
+            .createStandaloneAccessCode(
+              accessToken,
+              currentAttemptId,
+              request,
+              providerCredentialRemovedAttemptId
+            )
+            .pipe(
+              Effect.catchIf(isConclusiveAccessCodeCreationError, (error) =>
+                attemptStore
+                  .forget(identity, currentAttemptId)
+                  .pipe(Effect.andThen(Effect.fail(error)))
+              )
+            );
+        const attemptId = yield* attemptStore.reserve(identity).pipe(
+          Effect.mapError(
+            () =>
+              new AccessCodeAttemptReservationError({
+                message:
+                  "The access-code attempt could not be reserved in the local state directory. No access code was created.",
+              })
+          )
+        );
+        let issuedAttemptId = attemptId;
+        const outcome = yield* issueCreation(
+          issuedAttemptId,
+          cleanupTargetAttemptId
+        ).pipe(
+          Effect.catchIf(isReconciledAccessCodeCreationError, () =>
+            attemptStore.reserve(identity).pipe(
+              Effect.flatMap((freshAttemptId) => {
+                issuedAttemptId = freshAttemptId;
+                return issueCreation(freshAttemptId);
+              })
+            )
+          )
+        );
+        yield* Console.log(
+          json
+            ? JSON.stringify(outcome)
+            : formatStandaloneAccessCodeOutcome(outcome)
+        );
+        yield* attemptStore.forget(identity, issuedAttemptId);
+      })
+    )
+).pipe(
+  Command.withDescription(
+    "Create a standalone door access code and show its one-time PIN"
+  )
+);
+
+type AccessCodeCreationError = Effect.Error<
+  ReturnType<WorkspaceAdminApiClient["Service"]["createStandaloneAccessCode"]>
+>;
+
+const isConclusiveAccessCodeCreationError = (
+  error: AccessCodeCreationError
+): error is
+  | CliMutationRejected
+  | CliMutationUncertain
+  | CliStandaloneAccessCodeCleanupRequired
+  | CliStandaloneAccessCodeReconciled =>
+  error instanceof CliMutationRejected ||
+  error instanceof CliMutationUncertain ||
+  error instanceof CliStandaloneAccessCodeCleanupRequired ||
+  error instanceof CliStandaloneAccessCodeReconciled;
+
+const isReconciledAccessCodeCreationError = (
+  error: AccessCodeCreationError
+): error is CliStandaloneAccessCodeReconciled =>
+  error instanceof CliStandaloneAccessCodeReconciled;
+
+export const formatStandaloneAccessCodeOutcome = (
+  outcome: AdministrationStandaloneAccessCodeCreationOutcomeType
+) => {
+  const window = `${outcome.startsAt} to ${outcome.endsAt} (${WORKSPACE_SITE_TIME_ZONE})`;
+  if (outcome.outcome === "created") {
+    return [
+      `Created access code ${outcome.name} (${window}).`,
+      `PIN: ${outcome.pin}`,
+      "This PIN is shown only once and the code cannot be removed remotely. Record it now.",
+    ].join("\n");
+  }
+  return `Access code ${outcome.name} (${window}) was already created for this attempt. The PIN cannot be shown again.`;
+};
+
+const formatStandaloneAccessCodeConfirmation = (
+  request: AdministrationStandaloneAccessCodeCreateInputType
+) =>
+  `Create access code ${request.name} from ${request.startsAt} to ${request.endsAt} (${WORKSPACE_SITE_TIME_ZONE})? Creation is irreversible remotely and the PIN is shown only once.`;
+
+const accessCodesCommand = Command.make("access-codes").pipe(
+  Command.withDescription("Create standalone door access codes"),
+  Command.withSubcommands([accessCodesCreateCommand])
+);
+
+const salesListCommand = Command.make("list", {}, () =>
+  runAuthenticatedCommand((api, accessToken, json) =>
+    Effect.gen(function* () {
+      const dashboard = yield* api.getDiscountDashboard(accessToken);
+      if (json) {
+        yield* Console.log(JSON.stringify(dashboard.calendar));
+        return;
+      }
+      const calendar = dashboard.calendar;
+      yield* Console.log(
+        `Calendar sales: ${calendar.events.length} · ${calendar.from} to ${calendar.to}${calendar.unavailable ? " · unavailable" : ""}`
+      );
+      for (const sale of calendar.events) {
+        yield* Console.log(
+          [
+            sale.eventReference,
+            sale.start,
+            sale.end,
+            sale.title,
+            sale.association.kind,
+          ].join("\t")
+        );
+      }
+    })
+  )
+).pipe(Command.withDescription("List calendar-managed sales"));
+
+const salesCommand = Command.make("sales").pipe(
+  Command.withDescription("Inspect calendar-managed sales"),
+  Command.withSubcommands([salesListCommand])
+);
+
+const sessionsListCommand = Command.make("list", {}, () =>
+  runAuthenticatedCommand((api, accessToken, json) =>
+    Effect.gen(function* () {
+      const sessions = yield* api.listSessions(accessToken);
+      if (json) {
+        yield* Console.log(JSON.stringify(sessions));
+        return;
+      }
+      const now = yield* Clock.currentTimeMillis;
+      yield* Console.log(`CLI sessions: ${sessions.length}`);
+      for (const session of sessions) {
+        yield* Console.log(
+          [
+            session.id,
+            session.clientName,
+            session.cliVersion,
+            session.buildTarget,
+            session.lastUsedAt,
+            session.expiresAt ?? "Never expires",
+            describeCliSessionStatus(session, now),
+          ].join("\t")
+        );
+      }
+    })
+  )
+).pipe(Command.withDescription("List issued CLI sessions"));
+
+const describeCliSessionStatus = (
+  session: CliSessionAdministrationType,
+  now: number
+) => {
+  if (session.revokedAt) return "Revoked";
+  if (session.expiresAt && Date.parse(session.expiresAt) <= now) {
+    return "Expired";
+  }
+  return "Active";
+};
+
+const sessionsRenameCommand = Command.make(
+  "rename",
+  {
+    sessionId: Argument.String("session-id").pipe(
+      Argument.withSchema(CliSessionId)
+    ),
+    clientName: Argument.String("label").pipe(
+      Argument.withSchema(CliClientName)
+    ),
+  },
+  ({ clientName, sessionId }) =>
+    runAuthenticatedCommand((api, accessToken, json) =>
+      Effect.gen(function* () {
+        const result = yield* api.renameSession(accessToken, sessionId, {
+          clientName,
+        });
+        yield* Console.log(
+          json
+            ? JSON.stringify(result)
+            : `Renamed CLI session ${sessionId} to “${clientName}”.`
+        );
+      })
+    )
+).pipe(Command.withDescription("Rename an issued CLI session"));
+
+const sessionsRevokeCommand = Command.make(
+  "revoke",
+  {
+    sessionId: Argument.String("session-id").pipe(
+      Argument.withSchema(CliSessionId)
+    ),
+    yes: confirmationFlag,
+  },
+  ({ sessionId, yes }) =>
+    runAuthenticatedCommand((api, accessToken, json, currentSession) =>
+      Effect.gen(function* () {
+        const confirmed = yield* confirmChange(
+          "administration.revokeSession",
+          yes,
+          json,
+          `Revoke CLI session ${sessionId}? Its access will stop immediately. This cannot be undone.`
+        );
+        if (!confirmed) {
+          yield* reportCancellation(json);
+          return;
+        }
+
+        const result = yield* api.revokeSession(accessToken, sessionId);
+        if (result.changed && sessionId === currentSession.id) {
+          const authentication = yield* AuthenticationService;
+          yield* authentication.clear;
+        }
+        const message = result.changed
+          ? `Revoked CLI session ${sessionId}.`
+          : `CLI session ${sessionId} was already revoked or no longer exists.`;
+        yield* Console.log(json ? JSON.stringify(result) : message);
+      })
+    )
+).pipe(Command.withDescription("Revoke an issued CLI session"));
+
+const sessionsCommand = Command.make("sessions").pipe(
+  Command.withDescription("Inspect and manage CLI sessions"),
+  Command.withSubcommands([
+    sessionsListCommand,
+    sessionsRenameCommand,
+    sessionsRevokeCommand,
+  ])
+);
+
+const authCommand = Command.make(
+  "auth",
+  {
+    name: Flag.String("name").pipe(
+      Flag.optional,
+      Flag.withDescription("Name shown for this client in the admin interface")
+    ),
+  },
+  ({ name }) =>
+    runCommand((json) =>
+      Effect.gen(function* () {
+        const authentication = yield* AuthenticationService;
+        const existing = yield* authentication.current;
+
+        if (Option.isSome(existing)) {
+          yield* Console.log(
+            json
+              ? JSON.stringify({
+                  authStatus: "granted",
+                  session: existing.value.session,
+                })
+              : `Already authenticated as ${existing.value.session.clientName}. ${describeSessionExpiry(existing.value.session)}`
+          );
+          return;
+        }
+
+        const api = yield* WorkspaceAdminApiClient;
+        const identity = yield* ClientIdentity;
+        const config = yield* DhwConfig;
+        const clientName = Option.isSome(name)
+          ? name.value
+          : yield* identity.defaultName;
+        const verifier = yield* makeCliAuthenticationVerifier;
+        const challenge = yield* makeCliAuthenticationChallenge(verifier);
+        const started = yield* api.startAuthentication({
+          challenge,
+          clientName,
+          cliVersion: DHW_VERSION,
+          buildTarget: DHW_BUILD_TARGET,
+        });
+        const approvalUrl = new URL(started.approvalPath, config.baseUrl).href;
+
+        yield* reportAuthenticationStarted({
+          approvalUrl,
+          expiresAt: started.expiresAt,
+          json,
+        });
+
+        const session = yield* waitForCliAuthentication({
+          api,
+          authentication,
+          code: started.code,
+          verifier,
+        });
+
+        yield* reportAuthenticationGranted({ json, session });
+      })
+    )
+).pipe(Command.withDescription("Authenticate this CLI through the admin UI"));
+
+export const dhwCommand = rootCommand.pipe(
+  Command.withSubcommands([
+    versionCommand,
+    accessCodesCommand,
+    administratorsCommand,
+    apiCommand,
+    authCommand,
+    automationsCommand,
+    bookingsCommand,
+    calendarCommand,
+    campaignsCommand,
+    codesCommand,
+    customersCommand,
+    discountsCommand,
+    invoicesCommand,
+    operationsCommand,
+    ordersCommand,
+    overviewCommand,
+    reservationsCommand,
+    salesCommand,
+    sessionsCommand,
+    updateCommand,
+    vouchersCommand,
+  ])
+);
+
+const waitForCliAuthentication = Effect.fn(
+  "AuthenticationService.waitForApproval"
+)(function* ({
+  api,
+  authentication,
+  code,
+  verifier,
+}: {
+  readonly api: WorkspaceAdminApiClient["Service"];
+  readonly authentication: AuthenticationService["Service"];
+  readonly code: Parameters<
+    WorkspaceAdminApiClient["Service"]["getAuthenticationStatus"]
+  >[0];
+  readonly verifier: Parameters<typeof makeCliAuthenticationChallenge>[0];
+}) {
+  const status = yield* pollUntil(api.getAuthenticationStatus(code), {
+    settled: (
+      status
+    ): status is Exclude<typeof status, { readonly authStatus: "pending" }> =>
+      status.authStatus !== "pending",
+    // The request itself expires after five minutes.
+    timeout: "10 minutes",
+    onTimeout: () =>
+      new AuthenticationFlowError({
+        message: "The authentication request expired. Run dhw auth again.",
+      }),
+  });
+  switch (status.authStatus) {
+    case "approved": {
+      const granted = yield* api.exchangeGrant({
+        code,
+        grantToken: status.grantToken,
+        verifier,
+      });
+      yield* authentication.save(granted.accessToken);
+      return granted.session;
+    }
+    case "expired":
+      return yield* new AuthenticationFlowError({
+        message: "The authentication request expired. Run dhw auth again.",
+      });
+    case "granted":
+      return yield* new AuthenticationFlowError({
+        message:
+          "The authentication grant was already exchanged. Run dhw auth again on this machine.",
+      });
+    case "revoked":
+      return yield* new AuthenticationFlowError({
+        message: "The CLI session was revoked. Run dhw auth again.",
+      });
+  }
+});
+
+class AuthenticationFlowError extends Data.TaggedError(
+  "AuthenticationFlowError"
+)<{ readonly message: string }> {}
+
+class AccessCodeAttemptReservationError extends Data.TaggedError(
+  "AccessCodeAttemptReservationError"
+)<{ readonly message: string }> {}
+
+const readInvoiceCreateInput = Effect.fn("dhw.invoices.readCreateInput")(
+  function* (path: string) {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const contents = yield* fileSystem.readFileString(path).pipe(
+      Effect.mapError(
+        () =>
+          new InvalidMutationInputError({
+            message: "The invoice input file could not be read.",
+          })
+      )
+    );
+    const json = yield* Effect.try({
+      try: () => JSON.parse(contents) as unknown,
+      catch: () =>
+        new InvalidMutationInputError({
+          message: "The invoice input file is not valid JSON.",
+        }),
+    });
+    return yield* Schema.decodeUnknownEffect(
+      AdministrationInvoiceCreateFileInput,
+      { errors: "all", onExcessProperty: "error" }
+    )(json).pipe(
+      Effect.mapError(
+        () =>
+          new InvalidMutationInputError({
+            message:
+              "The invoice input is invalid or contains an unknown property.",
+          })
+      )
+    );
+  }
+);
+
+const makeDiscountDefinition = ({
+  adjustment,
+  labelCs,
+  labelEn,
+  products,
+}: {
+  readonly adjustment: AdministrationDiscountDefinitionInputType["adjustment"];
+  readonly labelCs: string;
+  readonly labelEn: string;
+  readonly products: ReadonlyArray<AdministrationWorkspaceProductTargetType>;
+}): AdministrationDiscountDefinitionInputType => ({
+  adjustment,
+  labels: { "cs-CZ": labelCs, "en-US": labelEn },
+  products: [products[0]!, ...products.slice(1)],
+});
+
+type CreateCodeMutation = Extract<
+  AdministrationDiscountMutationType,
+  { readonly kind: "create-code" }
+>;
+type CreateCustomerCodeMutation = Extract<
+  AdministrationDiscountMutationType,
+  { readonly kind: "create-customer-code" }
+>;
+
+type ServiceDateInput = Pick<
+  CreateCodeMutation["code"],
+  "serviceDateFrom" | "serviceDateUntil"
+>;
+
+/**
+ * The service dates a code command sends: none without date flags (a new code
+ * then has none and an update keeps the stored ones), both dates, or both null
+ * to remove them.
+ */
+const toServiceDateInput = ({
+  clearServiceDates = false,
+  serviceDateFrom,
+  serviceDateUntil,
+}: {
+  readonly clearServiceDates?: boolean;
+  readonly serviceDateFrom: Option.Option<AdministrationServiceDateType>;
+  readonly serviceDateUntil: Option.Option<AdministrationServiceDateType>;
+}): Effect.Effect<ServiceDateInput, InvalidMutationInputError> => {
+  const dates = Option.all({ serviceDateFrom, serviceDateUntil });
+  if (clearServiceDates) {
+    return Option.isNone(serviceDateFrom) && Option.isNone(serviceDateUntil)
+      ? Effect.succeed({ serviceDateFrom: null, serviceDateUntil: null })
+      : Effect.fail(
+          new InvalidMutationInputError({
+            message:
+              "Use either --clear-service-dates or the service-date flags, not both.",
+          })
+        );
+  }
+  if (Option.isSome(dates)) return Effect.succeed(dates.value);
+  return Option.isNone(serviceDateFrom) && Option.isNone(serviceDateUntil)
+    ? Effect.succeed({})
+    : Effect.fail(
+        new InvalidMutationInputError({
+          message:
+            "Pass --service-date-from and --service-date-until together.",
+        })
+      );
+};
+
+const makeCreateCodeMutation = (
+  input: {
+    readonly code: CreateCodeMutation["code"]["code"];
+    readonly customer: Option.Option<CreateCustomerCodeMutation["customerId"]>;
+    readonly disabled: boolean;
+    readonly maxUses: Option.Option<number>;
+    readonly maxUsesPerCustomer: Option.Option<number>;
+    readonly serviceDateFrom: Option.Option<AdministrationServiceDateType>;
+    readonly serviceDateUntil: Option.Option<AdministrationServiceDateType>;
+    readonly validFrom: Option.Option<
+      NonNullable<CreateCodeMutation["code"]["validFrom"]>
+    >;
+    readonly validUntil: Option.Option<
+      NonNullable<CreateCodeMutation["code"]["validUntil"]>
+    >;
+  },
+  discount: CreateCodeMutation["discount"]
+): Effect.Effect<
+  AdministrationDiscountMutationType,
+  InvalidMutationInputError
+> =>
+  toServiceDateInput(input).pipe(
+    Effect.map((serviceDates) => {
+      const code: CreateCodeMutation["code"] = {
+        code: input.code,
+        enabled: !input.disabled,
+        maxUses: Option.getOrNull(input.maxUses),
+        maxUsesPerCustomer: Option.getOrNull(input.maxUsesPerCustomer),
+        ...serviceDates,
+        validFrom: Option.getOrNull(input.validFrom),
+        validUntil: Option.getOrNull(input.validUntil),
+      };
+      return Option.match(input.customer, {
+        onNone: (): CreateCodeMutation => ({
+          kind: "create-code",
+          code,
+          discount,
+        }),
+        onSome: (customerId): CreateCustomerCodeMutation => ({
+          kind: "create-customer-code",
+          customerId,
+          code,
+          discount,
+        }),
+      });
+    })
+  );
+
+const runDiscountMutation = (mutation: AdministrationDiscountMutationType) =>
+  runAuthenticatedCommand((api, accessToken, json) =>
+    executeAndReportDiscountMutation(api, accessToken, json, mutation)
+  );
+
+const runConfirmedDiscountMutation = ({
+  confirmation,
+  mutation,
+  yes,
+}: {
+  readonly confirmation: string;
+  readonly mutation: AdministrationDiscountMutationType;
+  readonly yes: boolean;
+}) =>
+  runAuthenticatedCommand((api, accessToken, json) =>
+    Effect.gen(function* () {
+      const confirmed = yield* confirmChange(
+        `administration.mutateDiscounts.${mutation.kind}`,
+        yes,
+        json,
+        confirmation
+      );
+      if (!confirmed) {
+        yield* reportCancellation(json);
+        return;
+      }
+      yield* executeAndReportDiscountMutation(api, accessToken, json, mutation);
+    })
+  );
+
+const runConfirmedReservationAccessMutation = ({
+  confirmation,
+  mutation,
+  providerCredentialRemoved,
+  reservationId,
+  yes,
+}: {
+  readonly confirmation: string;
+  readonly mutation: AdministrationReservationAccessMutationType;
+  readonly providerCredentialRemoved?: boolean;
+  readonly reservationId: AdministrationWorkspaceReservationIdType;
+  readonly yes: boolean;
+}) =>
+  runAuthenticatedCommand((api, accessToken, json) =>
+    Effect.gen(function* () {
+      if (providerCredentialRemoved === false) {
+        return yield* new InvalidMutationInputError({
+          message:
+            "Verify the credential in Igloohome, then pass --provider-credential-removed.",
+        });
+      }
+      const confirmed = yield* confirmChange(
+        `administration.mutateReservationAccess.${mutation.kind}`,
+        yes,
+        json,
+        confirmation
+      );
+      if (!confirmed) {
+        yield* reportCancellation(json);
+        return;
+      }
+      const requestId = yield* makeMutationRequestId;
+      const grant = yield* api.mutateReservationAccess(
+        accessToken,
+        requestId,
+        reservationId,
+        mutation
+      );
+      yield* Console.log(
+        json ? JSON.stringify(grant) : formatReservationAccessGrant(grant)
+      );
+    })
+  );
+
+const executeAndReportDiscountMutation = (
+  api: WorkspaceAdminApiClient["Service"],
+  accessToken: Redacted.Redacted<CliAccessTokenType>,
+  json: boolean,
+  mutation: AdministrationDiscountMutationType
+) =>
+  Effect.gen(function* () {
+    const validatedMutation = yield* Schema.decodeUnknownEffect(
+      AdministrationDiscountMutation,
+      administrationInputParseOptions
+    )(mutation).pipe(
+      Effect.mapError(
+        () =>
+          new InvalidMutationInputError({
+            message:
+              "The mutation input is invalid. Check date ranges, repeated product options, and cowork combined with a cowork tier.",
+          })
+      )
+    );
+    const requestId = yield* makeMutationRequestId;
+    const result = yield* api.mutateDiscounts(
+      accessToken,
+      requestId,
+      validatedMutation
+    );
+    yield* Console.log(
+      json ? JSON.stringify(result) : formatMutationResult(result)
+    );
+  });
+
+const formatOverviewMetric = (
+  label: string,
+  metric: AdministrationOverviewMetricType
+) =>
+  `${label}: ${metric.unavailable ? "unavailable" : `${metric.completed} / ${metric.value}`}`;
+
+const formatOverviewCount = (
+  label: string,
+  count: AdministrationOverviewCountType
+) => `${label}: ${count.unavailable ? "unavailable" : count.value}`;
+
+const formatReservationRow = (
+  reservation: AdministrationReservationSummaryType
+) =>
+  [
+    reservation.id,
+    reservation.date ?? reservation.startsAt ?? "Unknown",
+    reservation.typeLabel,
+    reservation.customer?.displayName ?? reservation.customerId,
+    reservation.status.label,
+  ].join("\t");
+
+const formatReservationEarlySetup = (
+  reservation: AdministrationReservationSummaryType
+) =>
+  `Early setup: from ${reservation.setupStartsAt}, booked ${
+    reservation.startsAt ?? "unknown"
+  } to ${reservation.endsAt ?? "unknown"}`;
+
+const formatReservationAuthor = (author: AdministrationReservationAuthorType) =>
+  `Booked by: ${
+    author.kind === "account"
+      ? [author.displayName, author.email && `<${author.email}>`]
+          .filter(Boolean)
+          .join(" ")
+      : { deleted: "deleted account", unavailable: "unavailable" }[author.kind]
+  }`;
+
+const formatReservationAccessGrant = (
+  grant: AdministrationReservationAccessGrantType
+) =>
+  `Access: ${grant.state} · ${grant.startsAt}–${grant.endsAt} · ${grant.accessName}`;

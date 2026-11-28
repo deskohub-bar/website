@@ -1,0 +1,273 @@
+name: Workspace backend preview pilot
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Deploy an open pilot PR or clean up a closed pilot PR
+        type: choice
+        options: [deploy, cleanup]
+        default: deploy
+        required: true
+      pr_number:
+        description: Configured pilot PR number
+        type: string
+        required: true
+      head_sha:
+        description: Current full PR head SHA
+        type: string
+        required: true
+      vercel_deployment_id:
+        description: Exact READY Workspace deployment ID for deploy. Leave empty for cleanup.
+        type: string
+        required: false
+
+permissions: {}
+cache-mode: read
+
+concurrency:
+  group: workspace-backend-preview
+  cancel-in-progress: false
+  queue: max
+
+env:
+  PREVIEW_OPERATION: ${{ inputs.operation }}
+  PR_NUMBER: ${{ inputs.pr_number }}
+  GIT_SHA: ${{ inputs.head_sha }}
+  VERCEL_DEPLOYMENT_ID: ${{ inputs.vercel_deployment_id }}
+
+jobs:
+  resolve:
+    if: >-
+      github.ref == 'refs/heads/main' && github.ref_protected &&
+      github.repository_id == '1015951989' && github.repository_owner_id == '361691508'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      PILOT_PR_NUMBER: ${{ vars.WORKSPACE_BACKEND_PREVIEW_PR }}
+    outputs:
+      head_ref: ${{ steps.target.outputs.head_ref }}
+    steps:
+      - name: Check out the reviewed validation code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: .github/actions/workspace-backend-preview
+      - name: Resolve the exact current pilot PR
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node .github/actions/workspace-backend-preview/target.mjs resolve
+
+  build:
+    needs: resolve
+    if: inputs.operation == 'deploy'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      image_tar_digest: ${{ steps.image.outputs.digest }}
+    steps:
+      - name: Check out the exact candidate SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha }}
+          path: candidate
+          persist-credentials: false
+      - name: Build the production image archive
+        id: image
+        run: |
+          set -euo pipefail
+          [[ "$(git -C candidate rev-parse HEAD)" == "$GIT_SHA" ]]
+          archive="$RUNNER_TEMP/workspace-backend-preview/image.tar"
+          mkdir -p "$(dirname "$archive")"
+          docker buildx build --platform linux/amd64 --target production --load \
+            --provenance=false --sbom=false \
+            --file candidate/apps/deskohub-workspace-api/Dockerfile \
+            --tag workspace-backend-preview:artifact candidate
+          docker image save --output "$archive" workspace-backend-preview:artifact
+          [[ -f "$archive" && ! -L "$archive" && -s "$archive" ]]
+          [[ "$(stat -c %s "$archive")" -lt 536870912 ]]
+          digest="$(sha256sum "$archive" | cut -d ' ' -f 1)"
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+      - name: Upload the image archive for this attempt
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: workspace-backend-pr-${{ inputs.pr_number }}-${{ inputs.head_sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/workspace-backend-preview/image.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  apply:
+    name: >-
+      ${{ format('{0} PR #{1} {2} at {3}', inputs.operation, inputs.pr_number, needs.resolve.outputs.head_ref, inputs.head_sha) }}
+    needs: [resolve, build]
+    if: >-
+      !cancelled() && needs.resolve.result == 'success' &&
+      ((inputs.operation == 'deploy' && needs.build.result == 'success') ||
+      (inputs.operation == 'cleanup' && needs.build.result == 'skipped'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    environment: workspace-backend-preview
+    permissions:
+      actions: read
+      contents: read
+      deployments: read
+      pull-requests: read
+      id-token: write
+    env:
+      GIT_REF: ${{ needs.resolve.outputs.head_ref }}
+      PILOT_PR_NUMBER: ${{ vars.WORKSPACE_BACKEND_PREVIEW_APPROVED_PR }}
+      APPROVED_NEON_BRANCH_ID: ${{ vars.WORKSPACE_BACKEND_PREVIEW_NEON_BRANCH_ID }}
+      NEON_PROJECT_ID: ${{ vars.WORKSPACE_BACKEND_PREVIEW_NEON_PROJECT_ID }}
+      PREVIEW_SIGNING_SECRET_VERSION: ${{ vars.WORKSPACE_BACKEND_PREVIEW_SIGNING_SECRET_VERSION }}
+      GOOGLE_PROJECT_ID: deskohub-workspace-sandbox
+    steps:
+      - name: Check out only the reviewed deploy code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Check the trusted checkout and pilot configuration
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_WORKFLOW_SHA" ]]
+          node .github/actions/workspace-backend-preview/target.mjs config
+          node .github/actions/workspace-backend-preview/target.mjs approval
+          node .github/actions/workspace-backend-preview/target.mjs recheck
+      - name: Verify the exact protected Vercel preview
+        if: inputs.operation == 'deploy'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERCEL_TOKEN: ${{ secrets.WORKSPACE_BACKEND_PREVIEW_VERCEL_TOKEN }}
+        run: node .github/actions/workspace-backend-preview/target.mjs vercel
+      - name: Verify and stage the same-attempt artifact
+        if: inputs.operation == 'deploy'
+        id: artifact
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.build.outputs.artifact_id }}
+          ARTIFACT_DIGEST: ${{ needs.build.outputs.artifact_digest }}
+          IMAGE_TAR_DIGEST: ${{ needs.build.outputs.image_tar_digest }}
+        run: python3 .github/actions/workspace-backend-preview/artifact.py
+      - name: Set up the pinned image transfer tool
+        if: inputs.operation == 'deploy'
+        id: crane
+        run: |
+          set -euo pipefail
+          tool_dir="$(mktemp -d)"
+          url=https://github.com/google/go-containerregistry/releases/download/v0.22.1/go-containerregistry_Linux_x86_64.tar.gz
+          curl --fail --silent --show-error --location --proto '=https' --max-time 60 \
+            --output "$tool_dir/crane.tar.gz" "$url"
+          printf '0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0  %s\n' \
+            "$tool_dir/crane.tar.gz" | sha256sum --check --status
+          tar -xOzf "$tool_dir/crane.tar.gz" crane > "$tool_dir/crane"
+          chmod 700 "$tool_dir/crane"
+          printf 'path=%s/crane\n' "$tool_dir" >> "$GITHUB_OUTPUT"
+      - name: Set up the verified Bun release without a cache write
+        uses: ./.github/actions/setup-bun
+        with:
+          bun-version: 1.4.4
+          bun-sha256: bf8ccbfb2b0b80159e0f9a6d15c55317add8077534dbc6130a3edb52fccb395c
+      - name: Install dependencies from the reviewed lockfile
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Acquire the Workspace preview branch lease
+        id: lease
+        uses: ./.github/actions/workspace-e2e-allocation
+        with:
+          mode: acquire
+          preview-branch: ${{ needs.resolve.outputs.head_ref }}
+          token: ${{ github.token }}
+          database-url: ${{ secrets.WORKSPACE_E2E_COORDINATOR_DATABASE_URL }}
+      - name: Authenticate as the sandbox preview deployer
+        id: google-auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          project_id: deskohub-workspace-sandbox
+          workload_identity_provider: projects/759037106024/locations/global/workloadIdentityPools/workspace-preview-github/providers/deskohub-workspace
+          service_account: workspace-preview-deployer@deskohub-workspace-sandbox.iam.gserviceaccount.com
+          token_format: access_token
+          access_token_lifetime: 3600s
+      - name: Set up gcloud for the trusted deploy CLI
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+      - name: Recheck the approved Neon branch before publishing
+        if: inputs.operation == 'deploy'
+        env:
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+        run: node .github/actions/workspace-backend-preview/target.mjs neon-recheck
+      - name: Recheck the PR head before publishing
+        if: inputs.operation == 'deploy'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node .github/actions/workspace-backend-preview/target.mjs recheck
+      - name: Publish the verified archive by digest
+        if: inputs.operation == 'deploy'
+        id: publish
+        timeout-minutes: 5
+        env:
+          CRANE: ${{ steps.crane.outputs.path }}
+          IMAGE_ARCHIVE: ${{ steps.artifact.outputs.archive }}
+          GOOGLE_ACCESS_TOKEN: ${{ steps.google-auth.outputs.access_token }}
+        run: bash .github/actions/workspace-backend-preview/publish-image.sh
+      - name: Recheck the protected Vercel deployment
+        if: inputs.operation == 'deploy'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERCEL_TOKEN: ${{ secrets.WORKSPACE_BACKEND_PREVIEW_VERCEL_TOKEN }}
+        run: node .github/actions/workspace-backend-preview/target.mjs vercel
+      - name: Resolve the approved Neon branch and mask its pooled URI
+        if: inputs.operation == 'deploy'
+        id: neon
+        env:
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+        run: node .github/actions/workspace-backend-preview/target.mjs neon
+      - name: Recheck the PR head under its preview branch lease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node .github/actions/workspace-backend-preview/target.mjs recheck
+      - name: Deploy the exact preview generation
+        if: inputs.operation == 'deploy'
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GOOGLE_ACCESS_TOKEN: ${{ steps.google-auth.outputs.access_token }}
+          IMAGE_REF: ${{ steps.publish.outputs.image_ref }}
+          NEON_BRANCH_ID: ${{ vars.WORKSPACE_BACKEND_PREVIEW_NEON_BRANCH_ID }}
+          DATABASE_FILE: ${{ steps.neon.outputs.database_file }}
+        run: |
+          set -euo pipefail
+          PREVIEW_DATABASE_URL="$(< "$DATABASE_FILE")"
+          export PREVIEW_DATABASE_URL
+          bun packages/workspace-infrastructure/scripts/backend-preview.ts deploy
+      - name: Clean up the closed pilot PR generation
+        if: inputs.operation == 'cleanup'
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GOOGLE_ACCESS_TOKEN: ${{ steps.google-auth.outputs.access_token }}
+          NEON_BRANCH_ID: ${{ vars.WORKSPACE_BACKEND_PREVIEW_NEON_BRANCH_ID }}
+        run: bun packages/workspace-infrastructure/scripts/backend-preview.ts cleanup
+      - name: Remove the temporary Neon connection file
+        if: always() && steps.neon.outputs.database_file != ''
+        env:
+          DATABASE_FILE: ${{ steps.neon.outputs.database_file }}
+        run: rm -f -- "$DATABASE_FILE"
+      - name: Release the Workspace preview branch lease
+        if: always() && steps.lease.outcome != '' && steps.lease.outcome != 'skipped'
+        uses: ./.github/actions/workspace-e2e-allocation
+        with:
+          mode: release
+          token: ${{ github.token }}
+          database-url: ${{ secrets.WORKSPACE_E2E_COORDINATOR_DATABASE_URL }}

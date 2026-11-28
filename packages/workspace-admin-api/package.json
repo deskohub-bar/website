@@ -1,0 +1,25 @@
+{
+  "name": "@deskohub/workspace-admin-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./cowork-booking-link": "./src/cowork-booking-link.ts",
+    "./site-time-zone": "./src/site-time-zone.ts"
+  },
+  "scripts": {
+    "lint": "biome check .",
+    "test": "bun test",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "dependencies": {
+    "@deskohub/i18n": "workspace:*",
+    "@js-temporal/polyfill": "^0.5.1",
+    "effect": "4.1.4"
+  },
+  "devDependencies": {
+    "@deskohub/test-email": "workspace:*",
+    "typescript": "npm:@typescript/typescript6@6.0.2"
+  }
+}

@@ -1,0 +1,16 @@
+export {
+  type EmailDeliveryOutcome,
+  type EmailDiscountIssuanceRow,
+  type EmailPreparationFailureReason,
+  type EmailPreparationRow,
+  type EmailPreparationSkipReason,
+  type EmailPreparationUnavailableReason,
+  type EmailRow,
+  type EmailVersionRow,
+  emailDiscountIssuances,
+  emailPreparationOutcomeReasons,
+  emailPreparations,
+  emails,
+  emailValueSnapshots,
+  emailVersions,
+} from "@deskohub/workspace-backend/db/schema/emails";

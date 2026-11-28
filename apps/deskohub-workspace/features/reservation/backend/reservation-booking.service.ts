@@ -1,0 +1,1159 @@
+import { DotyposService } from "@deskohub/dotypos";
+import { EmailRecipientDomainService } from "@deskohub/email/backend/recipient-domain.service";
+import { parsePhoneNumber } from "@deskohub/phone-number";
+import {
+  Context,
+  Data,
+  Effect,
+  Layer,
+  Match,
+  Option,
+  Ref,
+  Schema,
+} from "effect";
+import {
+  WorkspaceDatabase,
+  type WorkspaceDatabaseClient,
+} from "@/db/database.service";
+import {
+  CustomerAccountAccessError,
+  CustomerAccountContactService,
+  CustomerAccountSections,
+} from "@/features/account";
+import { CurrentCustomerAccount } from "@/features/account/backend/current-customer-account";
+import type { CustomerAccountSession } from "@/features/account/backend/customer-authentication.service";
+import type { CustomerAccountId } from "@/features/account/customer-account";
+import { CheckoutAnalytics } from "@/features/checkout/backend/analytics";
+import {
+  type AdvertisementAffirmation,
+  CheckoutPricingService,
+  getPriceVerdictChangedKeys,
+  openSubmittedAdvertisedPriceState,
+  PayState,
+  type PreparedCustomerQuote,
+  type PriceVerdict,
+  toPayStateHoldExpiresAt,
+} from "@/features/checkout/backend/checkout";
+import { AdvertisedPriceMismatchError } from "@/features/checkout/backend/checkout/advertised-price-mismatch";
+import {
+  deriveCheckoutAttemptKeys,
+  deriveCheckoutSessionKeys,
+} from "@/features/checkout/backend/checkout/checkout-lookup-keys.server";
+import { quoteCoworkEntryPackForContinue } from "@/features/checkout/backend/checkout/cowork-checkout-pricing";
+import { splitCustomerName } from "@/features/checkout/backend/reservation";
+import type { CheckoutSessionId } from "@/features/checkout/checkout-identifiers";
+import {
+  addCheckoutReferralAppliedMarker,
+  hasCheckoutReferralBenefit,
+} from "@/features/checkout/checkout-referral-notice";
+import type {
+  CheckoutSummary,
+  CheckoutSummaryChangedKeys,
+} from "@/features/checkout/checkout-summary";
+import { legalEvidenceMapSchema } from "@/features/checkout/legal-evidence";
+import { getReservationQuoteDiscount } from "@/features/checkout/reservation-quote-schema";
+import { getCheckoutDetails } from "@/features/checkout/schemas/checkout-details";
+import type { CanonicalPromotionCode } from "@/features/discounts/contracts";
+import { defaultPhoneRegion, type Locale, m } from "@/features/i18n";
+import { AnalyticsConsentLedger } from "@/features/legal/backend/analytics-consent-ledger";
+import { mirrorDeviceAnalyticsConsent } from "@/features/legal/backend/analytics-consent-mirror";
+import { MarketingConsentLedger } from "@/features/legal/backend/marketing-consent-ledger";
+import type { MarketingConsentGrantSource } from "@/features/legal/marketing-consent-grant-source";
+import {
+  ensureOfficeReservationsEnabled,
+  OfficeReleaseGate,
+} from "@/features/office/backend/office-release-gate";
+import { EntryPackUnavailableError } from "@/features/passes/backend/entry-pack-redemption";
+import { ReferralService } from "@/features/referrals";
+import { ReferralReleaseGate } from "@/features/referrals/referral-release-gate";
+import {
+  RememberedReferral,
+  type RememberedReferralForBooking,
+} from "@/features/referrals/remembered-referral.service";
+import type { PreparePayStateInput } from "@/features/reservation/actions/prepare-pay-state.schema";
+import {
+  AgentBookingPaymentInProgressError,
+  AgentBookingProfileRequiredError,
+  BookingAgent,
+} from "@/features/reservation/backend/booking-agent";
+import {
+  ensureCoworkStayOffered,
+  OvernightStayReleaseGate,
+} from "@/features/reservation/backend/overnight-stay-release-gate";
+import {
+  getAgentHoldBookedAt,
+  getDotyposCustomerId,
+  type ReservationHold,
+  ReservationHolds,
+} from "@/features/reservation/backend/reservation-holds.service";
+import { WorkspaceTableUnavailableError } from "@/features/reservation/backend/workspace-availability.service";
+import type { WorkspaceReservation } from "@/features/reservation/backend/workspace-reservation.repository";
+import type { DotyposCustomerId } from "@/features/reservation/dotypos-customer";
+import type { WorkspaceReservationId } from "@/features/reservation/persistence-contracts";
+import type { ReservationPrePaymentOutcome } from "@/features/reservation/reservation-analytics";
+import { defaultReservationBillingSelection } from "@/features/reservation/reservation-billing";
+import { getReservationCustomerProfile } from "@/features/reservation/reservation-customer-profile";
+import { getWorkspaceDate } from "@/features/reservation/reservation-date";
+import type { TableReservationDetails } from "@/features/reservation/table-reservation";
+import { isTableReservationBookable } from "@/features/reservation/table-reservation-time";
+import { ReservationInviteeEmailKeys } from "@/features/reservation-invitees/backend/reservation-invitee-email-keys.service";
+import { sealOfficePeople } from "@/features/reservation-invitees/backend/reservation-invitees.service";
+import { ReviewAccounts, ReviewSandbox } from "@/features/review-accounts";
+import {
+  ensureTeamTableReservationsEnabled,
+  TeamTableReleaseGate,
+} from "@/features/team-table/backend/team-table-release-gate";
+import { WorkspaceDotyposLayer } from "@/shared/backend/config/dotypos.config";
+import { SealedStateKeys } from "@/shared/backend/sealed-state-keys.service";
+import { catchRecoverableCause } from "@/shared/backend/workspace-effect";
+import { currentRequestHeaders } from "@/shared/backend/workspace-request-context";
+import {
+  currentInstant,
+  instantStringSchema,
+  temporalInstantToIsoString,
+} from "@/shared/utils/temporal";
+import { resolveEntryPackBooking } from "./entry-pack-booking";
+import {
+  getOfficeAccessEndsAt,
+  validateSubmittedOfficePeople,
+} from "./office-people-submission";
+
+/**
+ * One submission a server caller prepares Pay for. Beside the site's tools,
+ * the customer HTTP API labels a grant from the customer's native app; the
+ * site's schema keeps accepting only the site's tools.
+ */
+export type PayStateSubmission = Omit<
+  PreparePayStateInput,
+  "marketingConsentSource"
+> & {
+  readonly marketingConsentSource?: Extract<
+    MarketingConsentGrantSource,
+    "site_tool" | "customer_app"
+  >;
+  /** API and agent submissions affirm the pack shown in their signed quote. */
+  readonly requireEntryPackQuote?: true;
+};
+
+/** The services each caller provides per request for its own channel. */
+type ChannelServices =
+  | CustomerAccountSections
+  | CurrentCustomerAccount
+  | CustomerAccountContactService
+  | RememberedReferral;
+
+interface IReservationBooking {
+  /**
+   * Prepares the Pay page for one submission: the shared booking operation
+   * of the reservation form's Server Action, the customer MCP server and the
+   * customer HTTP API. Each caller authenticates its own channel first, the
+   * form with BotID, the MCP server with the agent's OAuth token and the
+   * HTTP API with the app session, and provides the account services for
+   * that authentication. A booking the MCP server makes carries its
+   * {@link BookingAgent}.
+   */
+  readonly book: (
+    submission: PayStateSubmission
+  ) => Effect.Effect<
+    Effect.Success<ReturnType<typeof bookSubmission>>,
+    Effect.Error<ReturnType<typeof bookSubmission>>,
+    ChannelServices
+  >;
+}
+
+/**
+ * The capabilities booking uses beside the channel's, captured when the
+ * service is built. Only these are captured, so a call keeps its own log
+ * annotations, spans and request references.
+ */
+const bookingCapabilities = [
+  ReservationHolds,
+  CheckoutAnalytics,
+  CheckoutPricingService,
+  DotyposService,
+  EmailRecipientDomainService,
+  MarketingConsentLedger,
+  AnalyticsConsentLedger,
+  ReviewAccounts,
+  ReviewSandbox,
+  SealedStateKeys,
+  ReferralReleaseGate,
+  OfficeReleaseGate,
+  TeamTableReleaseGate,
+  OvernightStayReleaseGate,
+] as const;
+
+type BookingCapabilities =
+  | ReservationHolds
+  | CheckoutAnalytics
+  | CheckoutPricingService
+  | DotyposService
+  | EmailRecipientDomainService
+  | MarketingConsentLedger
+  | AnalyticsConsentLedger
+  | ReviewAccounts
+  | ReviewSandbox
+  | SealedStateKeys
+  | ReferralReleaseGate
+  | OfficeReleaseGate
+  | TeamTableReleaseGate
+  | OvernightStayReleaseGate;
+
+/** Reservation submissions, booked into a hold and a Pay page. */
+export class ReservationBooking extends Context.Service<
+  ReservationBooking,
+  IReservationBooking
+>()("ReservationBooking") {
+  static Default = Layer.effect(
+    this,
+    Effect.gen(function* () {
+      const context = Context.pick(...bookingCapabilities)(
+        yield* Effect.context<BookingCapabilities>()
+      );
+      const database = yield* Effect.serviceOption(WorkspaceDatabase);
+      return ReservationBooking.of({
+        book: (submission) =>
+          bookSubmission(submission, Option.getOrUndefined(database)?.db).pipe(
+            Effect.provideContext(context)
+          ),
+      });
+    })
+  );
+
+  /**
+   * The live booking, with reservation release gates left to the
+   * caller: a request that decides them once, such as the customer HTTP API,
+   * passes the gates it built, so booking shares that request's decisions.
+   */
+  static Live = this.Default.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        ReservationHolds.Live,
+        WorkspaceDatabase.Default,
+        Layer.mergeAll(
+          MarketingConsentLedger.Default,
+          AnalyticsConsentLedger.Default,
+          ReviewAccounts.Default,
+          ReviewSandbox.Default
+        ).pipe(Layer.provide(WorkspaceDatabase.Default)),
+        EmailRecipientDomainService.Live,
+        CheckoutAnalytics.Live,
+        WorkspaceDotyposLayer,
+        CheckoutPricingService.Live,
+        ReferralService.Live,
+        SealedStateKeys.Default
+      )
+    )
+  );
+}
+
+/** {@link ReservationBooking}'s `book`, for one submission. */
+export const prepareWorkspacePayState = (submission: PayStateSubmission) =>
+  ReservationBooking.pipe(
+    Effect.flatMap((booking) => booking.book(submission))
+  );
+
+const decodeLegalEvidenceMap = Schema.decodeUnknownSync(
+  legalEvidenceMapSchema,
+  {
+    onExcessProperty: "error",
+  }
+);
+const emptyLegalEvidence = decodeLegalEvidenceMap({});
+
+type PreparedAdvertisement = PriceVerdict<AdvertisementAffirmation>;
+
+const prepareAdvertisement = Effect.fn("preparePayState.prepareAdvertisement")(
+  function* (
+    // Advertising prices the selection; it never reads the consent label.
+    input: Omit<PayStateSubmission, "marketingConsentSource"> & {
+      readonly bookedAt: Temporal.Instant;
+    }
+  ) {
+    const advertisement = yield* openSubmittedAdvertisedPriceState(
+      input.advertisedPriceToken
+    );
+    if (advertisement.kind === "cowork" && advertisement.quote.entryPack) {
+      return yield* AdvertisedPriceMismatchError.inputMismatch();
+    }
+    const pricing = yield* CheckoutPricingService;
+    return yield* pricing.affirmAdvertisement({
+      advertisement,
+      reservation: input.reservation,
+      locale: input.locale,
+      bookedAt: input.bookedAt,
+    });
+  }
+);
+
+const quotePreparedReservation = Effect.fn(
+  "preparePayState.quotePreparedReservation"
+)(function* (input: {
+  readonly advertisement: PreparedAdvertisement;
+  readonly displayedOfficePrice?: CheckoutSummary;
+  readonly dotyposCustomerId: DotyposCustomerId;
+  readonly locale: Locale;
+  readonly referralCodePrefill: CanonicalPromotionCode | undefined;
+  readonly referralCode: CanonicalPromotionCode | undefined;
+}) {
+  const pricing = yield* CheckoutPricingService;
+  const referral =
+    input.referralCode === undefined
+      ? {}
+      : { referralCode: input.referralCode };
+
+  const verdict = yield* pricing.quoteForCustomer({
+    advertisement: input.advertisement,
+    displayedOfficePrice: input.displayedOfficePrice,
+    dotyposCustomerId: input.dotyposCustomerId,
+    locale: input.locale,
+    ...referral,
+  });
+
+  return {
+    ...verdict.priced,
+    ...referral,
+    requestedDiscountCode:
+      input.advertisement.priced.requestedDiscountCode ??
+      input.referralCodePrefill,
+    changedKeys: getPriceVerdictChangedKeys(verdict),
+  };
+});
+
+type PreparedPayState = PreparedCustomerQuote & {
+  readonly requestedDiscountCode?: CanonicalPromotionCode;
+  readonly referralCode?: CanonicalPromotionCode;
+};
+
+const toReadyResult = Effect.fn("preparePayState.toReadyResult")(
+  function* (input: {
+    readonly locale: Locale;
+    readonly prepared: PreparedPayState;
+    readonly reservationId: WorkspaceReservationId;
+    readonly checkoutSessionId: CheckoutSessionId;
+    readonly bookedAt: Temporal.Instant;
+    /** The hold deadline stored with the reservation; the Pay state signs it. */
+    readonly holdExpiresAt: Temporal.Instant;
+    readonly changedKeys?: CheckoutSummaryChangedKeys;
+    /**
+     * The customer the quote was priced for, when the booking carries the
+     * remembered referral: the result reports the referral applied only when
+     * the Pay state holds that customer's invitation benefit.
+     */
+    readonly referralCustomer?: DotyposCustomerId;
+    /**
+     * Issues the Pay state as of `bookedAt` and seals it deterministically,
+     * so rebuilding it for the same hold returns the same link.
+     */
+    readonly stableLink?: boolean;
+  }) {
+    const payState = yield* PayState.issue(
+      {
+        ...input.prepared,
+        locale: input.locale,
+        orderId: input.reservationId,
+        bookedAt: instantStringSchema.make(
+          temporalInstantToIsoString(input.bookedAt)
+        ),
+        holdExpiresAt: toPayStateHoldExpiresAt(input.holdExpiresAt),
+        checkoutSessionId: input.checkoutSessionId,
+        changedKeys: input.changedKeys,
+      },
+      input.stableLink ? { stableAt: input.bookedAt } : {}
+    );
+    const referralApplied =
+      input.referralCustomer !== undefined &&
+      hasCheckoutReferralBenefit({
+        discounts: input.prepared.quote.payment.discounts,
+        dotyposCustomerId: input.referralCustomer,
+      });
+    const issued = {
+      orderId: input.reservationId,
+      redirectUrl: payState.payUrl,
+      payStateToken: payState.payStateToken,
+      // The Pay page accepts its sealed state until this instant.
+      expiresAt: payState.expiresAt,
+      ...(input.prepared.reservation.kind === "office" && {
+        preparedOffice: {
+          startsOn: input.prepared.reservation.startsOn,
+          endsOn: input.prepared.reservation.endsOn,
+          seats: input.prepared.reservation.seats,
+          total: input.prepared.quote.payment.expectedPrice,
+          regularPrice: input.prepared.quote.payment.undiscountedPrice,
+          discount: getReservationQuoteDiscount(input.prepared.quote.payment),
+        },
+      }),
+      ...(referralApplied && { referralApplied: true as const }),
+    };
+
+    if (input.changedKeys) {
+      return {
+        status: "pricing_changed" as const,
+        ...issued,
+        affectedProductKeys: input.changedKeys.itemKeys.flatMap((key) =>
+          key.startsWith("product:") ? [key] : []
+        ),
+      };
+    }
+
+    return { status: "ready" as const, ...issued };
+  }
+);
+
+/**
+ * The account a reservation booked "as the account" belongs to: the linked
+ * Dotypos customer and the contact the reservation must carry. An account
+ * without a profile yet saves the submitted contact and billing as its
+ * profile first, except through a customer agent: the customer completes
+ * the profile on the site. It runs inside the account section, so
+ * completing the profile reuses that hold instead of taking the account lock
+ * again.
+ */
+const resolveAccountCustomer = Effect.fn(
+  "preparePayState.resolveAccountCustomer"
+)(function* ({
+  input,
+  bookingAgent,
+}: {
+  readonly input: PayStateSubmission;
+  readonly bookingAgent: Option.Option<BookingAgent["Service"]>;
+}) {
+  if (input.customer !== "account") return undefined;
+
+  const contacts = yield* CustomerAccountContactService;
+  // The stored link only: booking never claims, reactivates, or asks Dotypos
+  // through this read.
+  const standing = yield* CurrentCustomerAccount.pipe(
+    Effect.flatMap((current) => current.peek)
+  );
+  const completeProfile = ({ session }: { session: CustomerAccountSession }) =>
+    Option.isSome(bookingAgent)
+      ? Effect.fail(new AgentBookingProfileRequiredError({}))
+      : contacts.completeProfile(
+          session,
+          getReservationCustomerProfile(
+            input.reservation,
+            defaultPhoneRegion(input.locale)
+          )
+        );
+  const contact = yield* Match.value(standing).pipe(
+    Match.discriminatorsExhaustive("kind")({
+      "signed-out": () => Effect.succeed(null),
+      "deletion-pending": () => Effect.succeed(null),
+      unverified: () =>
+        Effect.fail(
+          new CustomerAccountAccessError({ reason: "unverified-email" })
+        ),
+      unlinked: completeProfile,
+      // A review account has no link, so it reads as unlinked; the section
+      // books it in the review sandbox before this read.
+      review: completeProfile,
+      linked: ({ account, session }) =>
+        contacts.linkedContact({ ...account, email: session.email }),
+      unavailable: ({ failure }) => Effect.fail(failure),
+    })
+  );
+  if (!contact) {
+    return yield* standing.kind === "linked" && Option.isSome(bookingAgent)
+      ? new AgentBookingProfileRequiredError({})
+      : new CustomerAccountAccessError({ reason: "unauthenticated" });
+  }
+  if (!contact.phone && Option.isSome(bookingAgent)) {
+    return yield* new AgentBookingProfileRequiredError({});
+  }
+
+  return {
+    dotyposCustomerId: contact.dotyposCustomerId,
+    contact: {
+      name: contact.name,
+      email: contact.email,
+      phone: contact.phone ?? input.reservation.phone,
+    },
+  };
+});
+
+class UndeliverableContactEmailError extends Data.TaggedError(
+  "UndeliverableContactEmailError"
+)<Record<string, never>> {}
+
+/**
+ * The confirmation and access link go to the contact email, so a domain that
+ * cannot receive mail would leave a paid customer without them. Rejects only a
+ * definitive DNS answer; an inconclusive lookup lets the booking continue.
+ */
+const ensureContactEmailAcceptsMail = Effect.fn(
+  "preparePayState.ensureContactEmailAcceptsMail"
+)(function* (email: string) {
+  const domains = yield* EmailRecipientDomainService;
+  const status = yield* domains.check(email);
+  if (status !== "rejects_mail") return;
+
+  yield* Effect.logWarning(
+    "Workspace reservation contact email cannot receive mail"
+  );
+  return yield* new UndeliverableContactEmailError({});
+});
+
+/**
+ * A review account's booking, priced like any other and held in its sandbox:
+ * no Dotypos customer or reservation, no availability check, no payment, and
+ * no hold cleanup. The sandbox keeps the advertised price.
+ */
+const prepareReviewSandboxHold = Effect.fn(
+  "preparePayState.prepareReviewSandboxHold"
+)(function* ({
+  input,
+  accountId,
+  bookingAgent,
+}: {
+  readonly input: PayStateSubmission;
+  readonly accountId: CustomerAccountId;
+  readonly bookingAgent: Option.Option<BookingAgent["Service"]>;
+}) {
+  const bookedAt = yield* currentInstant;
+  const advertisement = yield* prepareAdvertisement({ ...input, bookedAt });
+  const sandbox = yield* ReviewSandbox;
+  return yield* sandbox.prepareHold({
+    accountId,
+    locale: input.locale,
+    checkoutSessionId: input.checkoutSessionId,
+    selection: Option.match(bookingAgent, {
+      onNone: () => input.checkoutAttemptId,
+      onSome: (agent) => agent.selectionKey,
+    }),
+    agentClientId: Option.getOrUndefined(
+      Option.map(bookingAgent, (agent) => agent.clientId)
+    ),
+    reservation: advertisement.priced.reservation,
+    total: advertisement.priced.advertisedQuote.payment.expectedPrice,
+    bookedAt,
+  });
+});
+
+/** {@link ReservationBooking}'s `book`, with the services it was built with. */
+const bookSubmission = Effect.fn("prepareWorkspacePayState")(function* (
+  input: PayStateSubmission,
+  db: WorkspaceDatabaseClient | undefined
+) {
+  // A review account books in its sandbox, which captures no checkout
+  // analytics, whatever the outcome.
+  const inReviewSandbox = yield* Ref.make(false);
+  const checkoutAnalytics = yield* CheckoutAnalytics;
+  const captureOutcome = (outcome: ReservationPrePaymentOutcome) =>
+    checkoutAnalytics
+      .prePaymentOutcome({
+        checkoutAttemptId: input.checkoutAttemptId,
+        outcome,
+        timestamp: Temporal.Now.instant(),
+      })
+      .pipe(
+        Effect.when(
+          Ref.get(inReviewSandbox).pipe(Effect.map((sandboxed) => !sandboxed))
+        )
+      );
+
+  return yield* prepareSubmission(input, inReviewSandbox, db).pipe(
+    Effect.scoped,
+    Effect.tap((result) =>
+      Match.value(result).pipe(
+        Match.discriminatorsExhaustive("status")({
+          error: () => captureOutcome("reservation_conflict"),
+          pricing_changed: () => captureOutcome("pricing_changed"),
+          ready: () => captureOutcome("prepared"),
+        })
+      )
+    ),
+    Effect.tapError((error) =>
+      Match.value(error).pipe(
+        Match.tag("WorkspaceTableUnavailableError", () =>
+          captureOutcome("availability_changed")
+        ),
+        Match.tag("AdvertisedPriceMismatchError", () =>
+          captureOutcome("validation")
+        ),
+        Match.tag("UndeliverableContactEmailError", () =>
+          captureOutcome("validation")
+        ),
+        Match.tag("OfficePeopleRejectedError", () =>
+          captureOutcome("validation")
+        ),
+        Match.tag("EntryPackUnavailableError", () =>
+          captureOutcome("validation")
+        ),
+        Match.tag("CheckoutAttemptUnavailableError", () =>
+          captureOutcome("reservation_conflict")
+        ),
+        Match.tag("AgentBookingProfileRequiredError", () =>
+          captureOutcome("validation")
+        ),
+        Match.tag("AgentBookingPaymentInProgressError", () =>
+          captureOutcome("reservation_conflict")
+        ),
+        Match.orElse(() => captureOutcome("server_error"))
+      )
+    ),
+    Effect.annotateLogs({
+      locale: input.locale,
+      reservationKind: input.reservation.kind,
+    })
+  );
+});
+
+type AccountCustomer = Effect.Success<
+  ReturnType<typeof resolveAccountCustomer>
+>;
+
+/**
+ * What an account booking carries from the remembered referral, and what a
+ * booking for someone else prefills.
+ */
+const splitReferralForBooking = (referral: RememberedReferralForBooking) => ({
+  accountReferral: referral.kind === "carried" ? referral : undefined,
+  referralCodePrefill: referral.kind === "prefill" ? referral.code : undefined,
+});
+
+/**
+ * The Dotypos customer a reservation books: the account's linked customer,
+ * else the one the submitted contact finds or creates, its phone read in the
+ * region of the `locale` the submission was validated in.
+ */
+const resolveBookedCustomerId = Effect.fnUntraced(function* (
+  accountCustomer: AccountCustomer,
+  reservation: Pick<
+    PreparePayStateInput["reservation"],
+    "name" | "email" | "phone"
+  >,
+  locale: Locale
+) {
+  const dotypos = yield* DotyposService;
+  return (
+    accountCustomer?.dotyposCustomerId ??
+    (yield* dotypos
+      .findOrCreateCustomer(
+        {
+          ...splitCustomerName(reservation.name),
+          email: reservation.email,
+          phone: Option.getOrUndefined(
+            parsePhoneNumber(reservation.phone, defaultPhoneRegion(locale))
+          ),
+        },
+        { lookupFields: ["email"] }
+      )
+      .pipe(Effect.flatMap((customer) => getDotyposCustomerId(customer.id))))
+  );
+});
+
+/**
+ * Records a checked marketing box as an initial grant; an unchecked one
+ * records nothing, never a withdrawal.
+ */
+const recordCheckoutMarketingConsent = Effect.fnUntraced(function* ({
+  input,
+  bookingAgent,
+  dotyposCustomerId,
+}: {
+  readonly input: PayStateSubmission;
+  readonly bookingAgent: Option.Option<BookingAgent["Service"]>;
+  readonly dotyposCustomerId: DotyposCustomerId;
+}) {
+  if (input.marketingConsent !== true) return;
+  yield* Effect.gen(function* () {
+    const ledger = yield* MarketingConsentLedger;
+    yield* ledger.record({
+      customerId: dotyposCustomerId,
+      locale: input.locale,
+      choice: "grant",
+      mode: "initial",
+      channel: Option.isSome(bookingAgent)
+        ? "mcp_tool"
+        : (input.marketingConsentSource ?? "reservation_form"),
+    });
+  }).pipe(
+    Effect.tapError((cause) =>
+      Effect.logError("Customer marketing consent recording failed", {
+        cause,
+      })
+    )
+  );
+});
+
+/**
+ * Mirrors the booking device's analytics consent choice into the account's
+ * ledger. An agent's request carries no device choice, so it mirrors
+ * nothing. Any failure, a defect included, is logged and never blocks the
+ * booking.
+ */
+const mirrorBookingDeviceAnalyticsConsent = Effect.fnUntraced(
+  function* ({
+    locale,
+    bookingAgent,
+    accountId,
+  }: {
+    readonly locale: Locale;
+    readonly bookingAgent: Option.Option<BookingAgent["Service"]>;
+    readonly accountId: CustomerAccountId;
+  }) {
+    if (Option.isSome(bookingAgent)) return;
+    const headers = yield* currentRequestHeaders;
+    yield* mirrorDeviceAnalyticsConsent({
+      accountId,
+      cookieHeader: headers.get("cookie") ?? "",
+      locale,
+      source: "hydration_mirror",
+    });
+  },
+  catchRecoverableCause((cause) =>
+    Effect.logWarning(
+      "Analytics consent mirror failed; continuing the booking.",
+      { cause }
+    )
+  )
+);
+
+const prepareSubmission = Effect.fn("prepareWorkspacePayState.submission")(
+  function* (
+    input: PayStateSubmission,
+    inReviewSandbox: Ref.Ref<boolean>,
+    db: WorkspaceDatabaseClient | undefined
+  ) {
+    const bookingAgent = yield* Effect.serviceOption(BookingAgent);
+    const accountSections = yield* CustomerAccountSections;
+    const rememberedReferral = yield* RememberedReferral;
+    const bookedCustomer = yield* Ref.make<DotyposCustomerId | undefined>(
+      undefined
+    );
+    // Whether the account booking carries the remembered referral, which the
+    // account section evaluates once it knows the account's customer.
+    const carriesAccountReferral = yield* Ref.make(false);
+
+    const prepareForAccount = Effect.fn(
+      "prepareWorkspacePayState.prepareForAccount"
+    )(function* (accountId: CustomerAccountId | null) {
+      if (!accountId) {
+        return yield* new CustomerAccountAccessError({
+          reason: "unauthenticated",
+        });
+      }
+      yield* mirrorBookingDeviceAnalyticsConsent({
+        locale: input.locale,
+        bookingAgent,
+        accountId,
+      });
+      const reviewAccount = yield* ReviewAccounts.pipe(
+        Effect.flatMap((accounts) => accounts.isReviewAccount(accountId))
+      );
+      yield* Ref.set(inReviewSandbox, reviewAccount);
+      const { entryPackId } = input;
+      const entryPackBooking = yield* Effect.gen(function* () {
+        if (!entryPackId) return undefined;
+        const { reservation } = input;
+        if (
+          !db ||
+          reviewAccount ||
+          input.customer !== "account" ||
+          reservation.kind !== "cowork"
+        ) {
+          return yield* new EntryPackUnavailableError({});
+        }
+        const entryPack = yield* resolveEntryPackBooking({
+          db,
+          reservation,
+          passId: entryPackId,
+          holderAccountId: accountId,
+        });
+        return { entryPack, reservation };
+      });
+      yield* Match.value(input.reservation).pipe(
+        Match.discriminatorsExhaustive("kind")({
+          cowork: (cowork) =>
+            ensureCoworkStayOffered("stay" in cowork ? cowork.stay : undefined),
+          "meeting-room": () => Effect.void,
+          office: () => ensureOfficeReservationsEnabled,
+          table: () => Effect.void,
+        })
+      );
+      if (reviewAccount) {
+        return yield* prepareReviewSandboxHold({
+          input,
+          accountId,
+          bookingAgent,
+        });
+      }
+
+      const entryPackPrice = entryPackBooking
+        ? yield* quoteCoworkEntryPackForContinue({
+            ...entryPackBooking,
+            advertisedPriceToken: input.advertisedPriceToken,
+            locale: input.locale,
+            requireEntryPackQuote:
+              input.requireEntryPackQuote === true ||
+              Option.isSome(bookingAgent),
+          })
+        : undefined;
+      const accountCustomer = yield* resolveAccountCustomer({
+        input,
+        bookingAgent,
+      });
+      // An account booking carries the remembered referral into its first
+      // Pay state, so the first quote already prices the invitation; the
+      // attribution is recorded only when that order is paid. A booking for
+      // someone else gets a usable code as the code box prefill instead.
+      const { accountReferral, referralCodePrefill } = entryPackBooking
+        ? { accountReferral: undefined, referralCodePrefill: undefined }
+        : splitReferralForBooking(
+            yield* rememberedReferral.forBooking(
+              accountCustomer
+                ? {
+                    for: "account",
+                    customerId: accountCustomer.dotyposCustomerId,
+                  }
+                : { for: "someone-else" }
+            )
+          );
+      yield* Ref.set(carriesAccountReferral, accountReferral !== undefined);
+      // The customer whose invitation a carried referral prices, if any.
+      const referralCustomerFor = (pricedFor: DotyposCustomerId) =>
+        accountReferral === undefined ? undefined : pricedFor;
+
+      const reservation = accountCustomer
+        ? { ...input.reservation, ...accountCustomer.contact }
+        : input.reservation;
+      // The contact is final here, so the list is checked against the
+      // address the reservation books under.
+      const officePeople = yield* validateSubmittedOfficePeople(
+        input.people,
+        reservation
+      );
+      const advertiseAt = (at: Temporal.Instant) =>
+        prepareAdvertisement({ ...input, reservation, bookedAt: at });
+      // Submission locks the price: calendar sales are evaluated at this
+      // booking moment here and at every later checkout re-check.
+      const bookedAt = yield* currentInstant;
+      const checkoutPricing = entryPackPrice
+        ? { kind: "entry-pack" as const, price: entryPackPrice }
+        : {
+            kind: "card" as const,
+            advertisement: yield* advertiseAt(bookedAt),
+          };
+
+      const checkoutSessionKeys = yield* deriveCheckoutSessionKeys(
+        input.checkoutSessionId
+      );
+      const checkoutAttemptKeys = yield* deriveCheckoutAttemptKeys({
+        checkoutSessionId: input.checkoutSessionId,
+        checkoutAttemptId: input.checkoutAttemptId,
+        reservation,
+        people: officePeople,
+        ...(entryPackId && { entryPackId }),
+      });
+      yield* Effect.annotateLogsScoped({
+        locale: input.locale,
+        reservationKind: reservation.kind,
+        checkoutSessionKey: checkoutSessionKeys.current,
+        checkoutAttemptKey: checkoutAttemptKeys.current,
+      });
+      yield* Effect.logInfo("Workspace reservation submit started");
+
+      const holds = yield* ReservationHolds;
+
+      if (!accountCustomer) {
+        yield* ensureContactEmailAcceptsMail(reservation.email);
+      }
+
+      const dotyposCustomerId = yield* resolveBookedCustomerId(
+        accountCustomer,
+        reservation,
+        input.locale
+      );
+      yield* Effect.annotateLogsScoped({ dotyposCustomerId });
+      yield* Effect.logDebug("Workspace reservation Dotypos customer resolved");
+      yield* Ref.set(bookedCustomer, dotyposCustomerId);
+
+      const billing = reservation.billing ?? defaultReservationBillingSelection;
+      yield* recordCheckoutMarketingConsent({
+        input,
+        bookingAgent,
+        dotyposCustomerId,
+      });
+
+      const priceBooking = Effect.fnUntraced(function* (
+        customerId: DotyposCustomerId,
+        at: Temporal.Instant
+      ) {
+        if (checkoutPricing.kind === "entry-pack") {
+          const { price } = checkoutPricing;
+          return {
+            ...price,
+            reservation: {
+              ...price.reservation,
+              ...accountCustomer?.contact,
+            },
+          };
+        }
+        return yield* quotePreparedReservation({
+          advertisement: at.equals(bookedAt)
+            ? checkoutPricing.advertisement
+            : yield* advertiseAt(at),
+          displayedOfficePrice: input.displayedOfficePrice,
+          dotyposCustomerId: customerId,
+          locale: input.locale,
+          referralCodePrefill,
+          referralCode: accountReferral?.referralCode,
+        });
+      });
+      const prepared = yield* priceBooking(dotyposCustomerId, bookedAt);
+      yield* Effect.annotateLogsScoped({
+        quoteFingerprint: prepared.quote.fingerprint,
+      });
+      yield* Effect.logDebug("Workspace reservation quote built");
+
+      // An agent's hold is anchored at its booking instant, and a repeated
+      // request rebuilds its Pay state as of that instant, so the request
+      // gets the same Pay link back for as long as the hold lasts.
+      const toHeldResult = Effect.fn("preparePayState.toHeldResult")(
+        function* (held: {
+          readonly reservation: WorkspaceReservation;
+          readonly holdExpiresAt: Temporal.Instant;
+          readonly checkoutSessionId: CheckoutSessionId;
+          readonly prepared: typeof prepared;
+        }) {
+          const holdBookedAt = Option.isSome(bookingAgent)
+            ? getAgentHoldBookedAt(held.reservation)
+            : null;
+          if (!holdBookedAt) {
+            return yield* toReadyResult({
+              locale: input.locale,
+              prepared: held.prepared,
+              reservationId: held.reservation.id,
+              checkoutSessionId: held.checkoutSessionId,
+              bookedAt,
+              holdExpiresAt: held.holdExpiresAt,
+              changedKeys: held.prepared.changedKeys,
+              referralCustomer: referralCustomerFor(dotyposCustomerId),
+            });
+          }
+
+          const anchored = holdBookedAt.equals(bookedAt)
+            ? { prepared: held.prepared, pricedFor: dotyposCustomerId }
+            : yield* getDotyposCustomerId(
+                held.reservation.dotyposCustomerId
+              ).pipe(
+                Effect.flatMap((pricedFor) =>
+                  priceBooking(pricedFor, holdBookedAt).pipe(
+                    Effect.map((prepared) => ({ prepared, pricedFor }))
+                  )
+                )
+              );
+          return yield* toReadyResult({
+            locale: input.locale,
+            prepared: anchored.prepared,
+            reservationId: held.reservation.id,
+            checkoutSessionId: held.checkoutSessionId,
+            bookedAt: holdBookedAt,
+            holdExpiresAt: held.holdExpiresAt,
+            changedKeys: anchored.prepared.changedKeys,
+            referralCustomer: referralCustomerFor(anchored.pricedFor),
+            stableLink: true,
+          });
+        }
+      );
+
+      const keepPendingPayment = Effect.fnUntraced(function* (
+        pending: Extract<ReservationHold, { readonly kind: "payment_pending" }>
+      ) {
+        yield* Effect.logInfo(
+          "Workspace reservation with a pending payment kept for a repeated agent request",
+          { reservationId: pending.reservation.id }
+        );
+        const { reservationHoldExpiresAt } = pending.reservation;
+        // Payment never starts without a stored deadline; one missing
+        // leaves no hold to link to.
+        if (reservationHoldExpiresAt === null) {
+          return yield* new AgentBookingPaymentInProgressError({
+            reservationId: pending.reservation.id,
+          });
+        }
+        const pendingResult = yield* toHeldResult({
+          reservation: pending.reservation,
+          holdExpiresAt: reservationHoldExpiresAt,
+          checkoutSessionId: pending.checkoutSessionId,
+          prepared,
+        });
+        // Re-quoting at the anchor may have outlasted the link.
+        if (
+          Date.parse(pendingResult.expiresAt) <=
+          Temporal.Now.instant().epochMilliseconds
+        ) {
+          return yield* new AgentBookingPaymentInProgressError({
+            reservationId: pending.reservation.id,
+          });
+        }
+        return pendingResult;
+      });
+      /**
+       * The Pay state of a reused hold, quoted for the customer it holds
+       * when another request created it.
+       */
+      const toReusedResult = (
+        reused: Extract<ReservationHold, { readonly kind: "reused" }>
+      ) =>
+        (reused.pricedFor === undefined
+          ? Effect.succeed(prepared)
+          : priceBooking(reused.pricedFor, bookedAt)
+        ).pipe(
+          Effect.flatMap((reusedPrepared) =>
+            toHeldResult({
+              reservation: reused.reservation,
+              holdExpiresAt: reused.reservation.reservationHoldExpiresAt,
+              checkoutSessionId: reused.checkoutSessionId,
+              prepared: reusedPrepared,
+            })
+          )
+        );
+
+      const peopleEndsAt = Match.value(reservation).pipe(
+        Match.discriminatorsExhaustive("kind")({
+          cowork: () => undefined,
+          "meeting-room": () => undefined,
+          office: getOfficeAccessEndsAt,
+          table: ({ endsAt }) => Temporal.Instant.from(endsAt),
+        })
+      );
+      const sealedOfficePeople =
+        officePeople && peopleEndsAt
+          ? {
+              valid: officePeople,
+              sealed: yield* sealOfficePeople(officePeople, peopleEndsAt).pipe(
+                Effect.provide(ReservationInviteeEmailKeys.Live)
+              ),
+            }
+          : undefined;
+      const completeHold = Effect.gen(function* () {
+        const hold = yield* holds.holdForAttempt({
+          ...(sealedOfficePeople && { officePeople: sealedOfficePeople }),
+          ...(reservation.kind === "table" && {
+            recheckTeamTableAuthority: accountSections.withActiveAccount(
+              accountId,
+              Effect.void
+            ),
+          }),
+          ...(entryPackBooking && { entryPack: entryPackBooking.entryPack }),
+          checkout: {
+            sessionId: input.checkoutSessionId,
+            attemptId: input.checkoutAttemptId,
+          },
+          reservation,
+          booking: {
+            author: accountId,
+            customer: dotyposCustomerId,
+            locale: input.locale,
+            purpose: billing.purpose,
+            bookedAt,
+            ...Option.match(bookingAgent, {
+              onNone: () => ({}),
+              onSome: (agent) => ({ agent }),
+            }),
+          },
+          checkoutDetails: getCheckoutDetails({
+            locale: input.locale,
+            priced: prepared,
+            legalEvidence: emptyLegalEvidence,
+          }),
+        });
+        return yield* Match.value(hold).pipe(
+          Match.discriminatorsExhaustive("kind")({
+            payment_pending: keepPendingPayment,
+            reused: toReusedResult,
+            contended: () =>
+              Effect.succeed({
+                status: "error" as const,
+                message: m.reservationErrorMessage(
+                  {},
+                  { locale: input.locale }
+                ),
+              }),
+            created: (created) =>
+              toReadyResult({
+                locale: input.locale,
+                prepared,
+                reservationId: created.reservationId,
+                checkoutSessionId: created.checkoutSessionId,
+                bookedAt,
+                holdExpiresAt: created.reservationHoldExpiresAt,
+                changedKeys: prepared.changedKeys,
+                referralCustomer: referralCustomerFor(dotyposCustomerId),
+                stableLink: Option.isSome(bookingAgent),
+              }),
+          })
+        );
+      });
+      return reservation.kind === "table"
+        ? { completeTeamTableHold: completeHold }
+        : yield* completeHold;
+    });
+
+    // Contact and price preparation finish before the hold service acquires
+    // order and date keys. The hold service rechecks this account inside its
+    // combined section before it can cancel a hold or write a new one.
+    const prepareTable = Effect.fn("prepareWorkspacePayState.teamTable")(
+      function* (reservation: TableReservationDetails) {
+        yield* ensureTeamTableReservationsEnabled;
+        const now = yield* currentInstant;
+        if (!isTableReservationBookable(reservation, now)) {
+          return yield* new WorkspaceTableUnavailableError({
+            date: getWorkspaceDate(
+              Temporal.Instant.from(reservation.startsAt)
+            ).toString(),
+            reservation: { kind: "table" },
+          });
+        }
+
+        const authorAccountId = yield* accountSections.currentAccountId;
+        if (!authorAccountId) {
+          return yield* new CustomerAccountAccessError({
+            reason: "unauthenticated",
+          });
+        }
+        const prepared = yield* accountSections.withActiveAccount(
+          authorAccountId,
+          prepareForAccount(authorAccountId),
+          { recheck: "active" }
+        );
+        return "completeTeamTableHold" in prepared
+          ? yield* prepared.completeTeamTableHold
+          : prepared;
+      }
+    );
+    const prepared = yield* input.reservation.kind === "table"
+      ? prepareTable(input.reservation)
+      : accountSections.withOptionalAccount(prepareForAccount);
+    const result =
+      "completeTeamTableHold" in prepared
+        ? yield* prepared.completeTeamTableHold
+        : prepared;
+
+    // Checked after the account lock is released. Booking for someone else
+    // checks the booker, never the friend.
+    const settlingCustomer = yield* Ref.get(bookedCustomer);
+    if (settlingCustomer) {
+      yield* rememberedReferral.forgetIfSettled({
+        kind: "order",
+        paid: false,
+        bookedCustomerId: settlingCustomer,
+      });
+    }
+
+    if (
+      !(yield* Ref.get(carriesAccountReferral)) ||
+      result.status === "error"
+    ) {
+      return result;
+    }
+    return {
+      ...result,
+      redirectUrl:
+        addCheckoutReferralAppliedMarker(result.redirectUrl, input.locale) ??
+        result.redirectUrl,
+    };
+  }
+);
